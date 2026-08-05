@@ -1,0 +1,36 @@
+# Build outputs
+[Xx]64/
+[Dd]ebug/
+[Rr]elease/
+*.obj
+*.pdb
+*.ilk
+*.exe
+*.idb
+*.log
+*.tlog
+*.recipe
+*.iobj
+*.ipdb
+
+# vcpkg installed packages -- reproducible from Game Mng/vcpkg.json via
+# `vcpkg install` (or MSBuild's own vcpkg integration), too large to commit.
+vcpkg_installed/
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.sdf
+*.opensdf
+
+# Player data -- save files and local settings are per-player, not source.
+saves/
+settings.cfg
+
+# Packaged/zipped builds (see the "release a new version" workflow) --
+# built from source, not source themselves.
+dist/
+
+# Claude Code project-local config
+.claude/

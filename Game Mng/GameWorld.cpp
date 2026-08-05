@@ -1,0 +1,4068 @@
+#include "GameWorld.h"
+#include "Localization.h"
+#include "Format.h"
+#include "Version.h"
+#include "UpdateChecker.h"
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX // windows.h's min/max macros would otherwise break every std::min/std::max call below
+#endif
+#include <windows.h>
+#include <shellapi.h>
+#pragma comment(lib, "shell32.lib")
+// windows.h's legacy 16-bit near/far macros collide with this file's own use
+// of "near" as a perfectly ordinary local variable name (see the nearby-
+// building lookups throughout) -- neutralize them right after the include.
+#undef near
+#undef far
+#endif
+#include <cmath>
+#include <cstdlib>
+#include <cstdint>
+#include <iostream>
+#include <sstream>
+#include <iomanip>
+#include <algorithm>
+#include <optional>
+#include <unordered_map>
+
+namespace {
+    constexpr float kPlayerSize = 26.f;
+    constexpr float kInteractRadius = 55.f;
+    constexpr float kMoveSpeed = 220.f;
+    constexpr float kSprintMultiplier = 1.8f; // Shift held -> this much faster than the default walk speed
+    constexpr float kMinigameIndicatorSpeed = 2.5f; // radians/sec -- how fast the timing-bar marker sweeps
+    constexpr float kMinigameCooldownSeconds = 25.f; // shared by the fishing and mining timing-bar cooldowns
+    constexpr float kLumberCooldownSeconds = 25.f;
+
+    // Per-activity flavor for the shared timing-bar overlay: title/hint/
+    // button text and an accent color, keyed by which building triggered it.
+    struct MinigameFlavor { const char* titleKey; const char* buttonKey; sf::Color accent; };
+    MinigameFlavor minigameFlavorFor(const std::string& businessId) {
+        if (businessId == "mine" || businessId == "goldmine") {
+            return { "mining_title", "mining_catch_button", sf::Color(200, 170, 110) };
+        }
+        return { "fishing_title", "fishing_catch_button", sf::Color(90, 200, 230) };
+    }
+    constexpr float kTreeRadius = 16.f;
+    constexpr float kEdgeMargin = 24.f; // how far from the entry edge a player lands after a zone transition
+    constexpr float kHistorySampleInterval = 2.f; // seconds between net-worth sparkline samples
+    constexpr size_t kMaxHistorySamples = 150;     // 2s * 150 = 5 minutes of visible history
+    constexpr float kDayNightCycleSeconds = 180.f; // one full day/night cycle every 3 real minutes
+    constexpr int kRainDropCount = 60;
+
+    // Windowed size presets for the Settings overlay (see Settings::
+    // resolutionIndex) -- all share the logical 1280x820 canvas's ~1.561
+    // aspect ratio, so the letterbox view (see GameWorld::applyVideoMode)
+    // never has to add bars around a windowed mode, only around Fullscreen.
+    const sf::Vector2u kResolutionPresets[] = { {1280u, 820u}, {1600u, 1025u}, {1920u, 1230u} };
+    constexpr int kResolutionPresetCount = 3;
+
+    sf::Color darken(sf::Color c, float factor) {
+        return sf::Color(
+            static_cast<std::uint8_t>(c.r * factor),
+            static_cast<std::uint8_t>(c.g * factor),
+            static_cast<std::uint8_t>(c.b * factor));
+    }
+
+    float randRange(float lo, float hi) {
+        return lo + static_cast<float>(std::rand()) / static_cast<float>(RAND_MAX) * (hi - lo);
+    }
+
+    // sf::String's implicit conversion from std::string assumes the local ANSI
+    // code page, which mangles our UTF-8-encoded Chinese text. Every string
+    // handed to SFML (window title, sf::Text) must go through this instead.
+    sf::String toSfString(const std::string& utf8) {
+        return sf::String::fromUtf8(utf8.begin(), utf8.end());
+    }
+
+    bool smokesFrom(const std::string& id) {
+        return id == "bakery" || id == "smelter" || id == "blacksmith" || id == "gemshop" || id == "smokehouse";
+    }
+
+    const char* seasonKey(Season s) {
+        switch (s) {
+        case Season::Spring: return "season_spring";
+        case Season::Summer: return "season_summer";
+        case Season::Autumn: return "season_autumn";
+        default:             return "season_winter";
+        }
+    }
+
+    // Short parenthetical naming the current season's life/economy nudge
+    // (see Game.h's k*Multiplier constants) -- shown right next to the
+    // season name in the HUD so the effect isn't invisible unless the
+    // player goes and rereads How to Play.
+    const char* seasonEffectKey(Season s) {
+        switch (s) {
+        case Season::Spring: return "season_effect_spring";
+        case Season::Summer: return "season_effect_summer";
+        case Season::Autumn: return "season_effect_autumn";
+        default:             return "season_effect_winter";
+        }
+    }
+
+    // Display name for a rebindable key -- covers letters/digits/arrows plus
+    // whatever else a player might press while the Settings overlay is
+    // waiting for a new binding (see awaitingRebind_); anything obscure
+    // falls back to a numbered placeholder rather than showing nothing.
+    std::string keyName(sf::Keyboard::Key key) {
+        using Key = sf::Keyboard::Key;
+        if (key >= Key::A && key <= Key::Z) {
+            return std::string(1, static_cast<char>('A' + (static_cast<int>(key) - static_cast<int>(Key::A))));
+        }
+        if (key >= Key::Num0 && key <= Key::Num9) {
+            return std::string(1, static_cast<char>('0' + (static_cast<int>(key) - static_cast<int>(Key::Num0))));
+        }
+        switch (key) {
+        case Key::Up:       return "Up";
+        case Key::Down:     return "Down";
+        case Key::Left:     return "Left";
+        case Key::Right:    return "Right";
+        case Key::Space:    return "Space";
+        case Key::Enter:    return "Enter";
+        case Key::Tab:      return "Tab";
+        case Key::LShift:   case Key::RShift:   return "Shift";
+        case Key::LControl: case Key::RControl: return "Ctrl";
+        case Key::LAlt:     case Key::RAlt:     return "Alt";
+        default:            return "Key#" + std::to_string(static_cast<int>(key));
+        }
+    }
+
+    // Small geometric "accent glyph" kinds drawn by drawAccentGlyph, reused
+    // across the Field/Workshop/Dock/ServiceHall archetypes so buildings
+    // sharing a base shape (there are too many production/service buildings
+    // to hand-author a fully bespoke shape for every one) still read as
+    // visually distinct from their neighbors. Plain ints (not an enum class)
+    // so GameWorld.h's method declarations don't need to know about this —
+    // it's purely a GameWorld.cpp rendering detail.
+    constexpr int kAccentCircle = 0;
+    constexpr int kAccentDiamond = 1;
+    constexpr int kAccentTriangle = 2;
+    constexpr int kAccentCross = 3;
+    constexpr int kAccentDoubleDot = 4;
+    constexpr int kAccentBar = 5;
+
+    bool isDockId(const std::string& id) {
+        return id == "fishing" || id == "shipyard" || id == "cannery";
+    }
+    bool isFieldId(const std::string& id) {
+        return id == "dairyfarm" || id == "beehive" || id == "trapper" || id == "teafield" ||
+               id == "flaxfield" || id == "seasalt" || id == "pearlfarm";
+    }
+    bool isServiceHallId(const std::string& id) {
+        return id == "storefront" || id == "market" || id == "staff" || id == "bank" ||
+               id == "warehouse" || id == "townhall";
+    }
+    // Every other production business not covered by a dedicated shape or
+    // the archetypes above (bakery, smelter, ... plus the 6 new processors)
+    // falls through to the Workshop archetype in drawBuilding — no separate
+    // membership check needed here since it's the catch-all before Cottage.
+
+    // Per-id accent glyph kind + color for the archetype-shared buildings.
+    // Not exhaustive by construction (falls back to a plain grey circle) --
+    // every id actually reachable through isFieldId/isServiceHallId/isDockId
+    // or the Workshop catch-all in drawBuilding is listed here.
+    struct BuildingAccent { int kind; sf::Color color; };
+    BuildingAccent accentFor(const std::string& id) {
+        static const std::unordered_map<std::string, BuildingAccent> table = {
+            // Field
+            { "dairyfarm", { kAccentCircle,   sf::Color(240, 240, 235) } },
+            { "beehive",   { kAccentDiamond,  sf::Color(230, 180, 60) } },
+            { "trapper",   { kAccentTriangle, sf::Color(120, 90, 70) } },
+            { "teafield",  { kAccentDoubleDot,sf::Color(90, 140, 70) } },
+            { "flaxfield", { kAccentBar,      sf::Color(150, 170, 210) } },
+            { "seasalt",   { kAccentDiamond,  sf::Color(235, 235, 240) } },
+            { "pearlfarm", { kAccentCircle,   sf::Color(220, 230, 235) } },
+            // Workshop
+            { "bakery",       { kAccentCircle,    sf::Color(210, 160, 80) } },
+            { "smelter",      { kAccentTriangle,  sf::Color(230, 110, 40) } },
+            { "mason",        { kAccentBar,       sf::Color(150, 150, 150) } },
+            { "gemshop",      { kAccentDiamond,   sf::Color(110, 210, 220) } },
+            { "blacksmith",   { kAccentCross,     sf::Color(80, 80, 90) } },
+            { "carpenter",    { kAccentBar,       sf::Color(170, 120, 70) } },
+            { "sawmill",      { kAccentBar,       sf::Color(170, 120, 70) } },
+            { "textile",      { kAccentDoubleDot, sf::Color(170, 120, 190) } },
+            { "smokehouse",   { kAccentTriangle,  sf::Color(140, 140, 140) } },
+            { "tailor",       { kAccentDoubleDot, sf::Color(190, 140, 170) } },
+            { "preserve",     { kAccentCircle,    sf::Color(190, 70, 70) } },
+            { "apothecary",   { kAccentCross,     sf::Color(110, 160, 90) } },
+            { "goldsmith",    { kAccentDiamond,   sf::Color(220, 180, 60) } },
+            { "winery",       { kAccentCircle,    sf::Color(120, 50, 60) } },
+            { "alchemist",    { kAccentCross,     sf::Color(140, 90, 190) } },
+            { "jeweler",      { kAccentDiamond,   sf::Color(220, 140, 180) } },
+            { "creamery",     { kAccentCircle,    sf::Color(235, 225, 200) } },
+            { "meadery",      { kAccentDiamond,   sf::Color(220, 160, 50) } },
+            { "tannery",      { kAccentTriangle,  sf::Color(140, 100, 70) } },
+            { "teahouse",     { kAccentCircle,    sf::Color(120, 150, 90) } },
+            { "linenmill",    { kAccentBar,       sf::Color(220, 215, 195) } },
+            { "pearlatelier", { kAccentCircle,    sf::Color(225, 225, 230) } },
+            { "jamkitchen",     { kAccentCircle,   sf::Color(200, 90, 110) } },
+            { "popcornstand",   { kAccentTriangle, sf::Color(230, 210, 120) } },
+            { "juicebar",       { kAccentCircle,   sf::Color(200, 60, 70) } },
+            { "pieshop",        { kAccentDiamond,  sf::Color(210, 170, 110) } },
+            { "roaststand",     { kAccentTriangle, sf::Color(200, 120, 60) } },
+            { "picklinghouse",  { kAccentBar,      sf::Color(140, 170, 90) } },
+            // Dock
+            { "fishing",  { kAccentCircle,   sf::Color(90, 140, 190) } },
+            { "shipyard", { kAccentTriangle, sf::Color(230, 230, 235) } },
+            { "cannery",  { kAccentBar,      sf::Color(160, 160, 170) } },
+            // ServiceHall
+            { "storefront", { kAccentBar,     sf::Color(200, 80, 80) } },
+            { "market",     { kAccentDiamond, sf::Color(220, 190, 90) } },
+            { "staff",      { kAccentCross,   sf::Color(90, 120, 180) } },
+            { "bank",       { kAccentCircle,  sf::Color(215, 180, 70) } },
+            { "warehouse",  { kAccentBar,     sf::Color(150, 110, 70) } },
+            { "townhall",   { kAccentCross,   sf::Color(150, 110, 190) } },
+        };
+        auto it = table.find(id);
+        return it != table.end() ? it->second : BuildingAccent{ kAccentCircle, sf::Color(180, 180, 180) };
+    }
+
+    // Groups the (growing) achievement list into a handful of categories for
+    // the Achievements overlay -- a color-coded dot per row plus a header
+    // whenever the category changes, rather than one flat undifferentiated
+    // list. Fixed display order (not alphabetical): roughly "how the game
+    // teaches you these systems", economy first since that's the earliest one.
+    struct AchievementCategory { const char* labelKey; sf::Color color; };
+    AchievementCategory achievementCategoryFor(const std::string& id) {
+        static const std::unordered_map<std::string, AchievementCategory> table = {
+            { "thousandaire",      { "ach_cat_economy", sf::Color(220, 190, 90) } },
+            { "ten_thousandaire",  { "ach_cat_economy", sf::Color(220, 190, 90) } },
+            { "trader",            { "ach_cat_economy", sf::Color(220, 190, 90) } },
+            { "tycoon",            { "ach_cat_economy", sf::Color(220, 190, 90) } },
+            { "first_business",    { "ach_cat_business", sf::Color(150, 180, 220) } },
+            { "diversified",       { "ach_cat_business", sf::Color(150, 180, 220) } },
+            { "well_staffed",      { "ach_cat_business", sf::Color(150, 180, 220) } },
+            { "supply_chain",      { "ach_cat_business", sf::Color(150, 180, 220) } },
+            { "craftsman",         { "ach_cat_business", sf::Color(150, 180, 220) } },
+            { "full_crew",         { "ach_cat_business", sf::Color(150, 180, 220) } },
+            { "harbor_pioneer",    { "ach_cat_business", sf::Color(150, 180, 220) } },
+            { "highlands_settler", { "ach_cat_business", sf::Color(150, 180, 220) } },
+            { "quarter_century",   { "ach_cat_life", sf::Color(200, 150, 200) } },
+            { "half_century",      { "ach_cat_life", sf::Color(200, 150, 200) } },
+            { "centenarian",       { "ach_cat_life", sf::Color(200, 150, 200) } },
+            { "good_timing",       { "ach_cat_season", sf::Color(140, 200, 150) } },
+            { "crop_rotator",      { "ach_cat_season", sf::Color(140, 200, 150) } },
+            { "season_cycle",      { "ach_cat_season", sf::Color(140, 200, 150) } },
+            { "master_farmer",     { "ach_cat_season", sf::Color(140, 200, 150) } },
+            { "minigame_pro",      { "ach_cat_minigame", sf::Color(230, 150, 90) } },
+        };
+        auto it = table.find(id);
+        return it != table.end() ? it->second : AchievementCategory{ "ach_cat_business", sf::Color(180, 180, 180) };
+    }
+    // Fixed display order for the categories above.
+    const char* const kAchievementCategoryOrder[] = { "ach_cat_economy", "ach_cat_business", "ach_cat_life", "ach_cat_season", "ach_cat_minigame" };
+
+    // Tier label colors — the single source of truth for "what color means
+    // what tier", now applied to name text rather than the building's shape.
+    const sf::Color kTier1(120, 200, 120);
+    const sf::Color kTier2(226, 166, 82);
+    const sf::Color kTier3(180, 130, 220);
+    const sf::Color kService(120, 160, 220);
+}
+
+GameWorld::GameWorld(Game& game) : game_(game) {}
+
+void GameWorld::initAudio() {
+    constexpr unsigned int kSampleRate = 44100;
+    auto makeTone = [](sf::SoundBuffer& buffer, const std::vector<float>& freqsHz, float durationEach) {
+        std::vector<std::int16_t> samples;
+        for (float freq : freqsHz) {
+            std::size_t n = static_cast<std::size_t>(durationEach * static_cast<float>(kSampleRate));
+            for (std::size_t i = 0; i < n; ++i) {
+                float t = static_cast<float>(i) / static_cast<float>(kSampleRate);
+                float envelope = 1.f - static_cast<float>(i) / static_cast<float>(n); // linear fade-out, avoids a click at the end
+                float sample = std::sin(2.f * 3.14159265f * freq * t) * envelope * 0.3f;
+                samples.push_back(static_cast<std::int16_t>(sample * 32767.f));
+            }
+        }
+        if (!buffer.loadFromSamples(samples.data(), samples.size(), 1, kSampleRate, { sf::SoundChannel::Mono })) {
+            std::cout << "[GameWorld] Failed to synthesize a sound effect; that sound will just stay silent.\n";
+        }
+    };
+
+    makeTone(footstepBuffer_, { 140.f }, 0.05f);
+    makeTone(interactBuffer_, { 700.f, 1050.f }, 0.07f);
+    makeTone(achievementBuffer_, { 520.f, 660.f, 780.f, 1040.f }, 0.10f);
+    makeTone(upgradeBuffer_, { 900.f, 1300.f }, 0.055f);
+
+    footstepSound_.emplace(footstepBuffer_);
+    interactSound_.emplace(interactBuffer_);
+    achievementSound_.emplace(achievementBuffer_);
+    upgradeSound_.emplace(upgradeBuffer_);
+
+    // ---- Ambient rain/snow noise: plain white noise (no tone/pitch, unlike
+    // every other synthesized sound here) looped underneath drawWeather's
+    // rain-or-snow visual -- see the raining_ check in updateDayNightAndWeather. ----
+    {
+        constexpr float kNoiseDurationSeconds = 2.0f;
+        constexpr float kNoiseAmplitude = 0.18f;
+        std::vector<std::int16_t> noiseSamples;
+        std::size_t n = static_cast<std::size_t>(kNoiseDurationSeconds * static_cast<float>(kSampleRate));
+        noiseSamples.reserve(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            float sample = (static_cast<float>(std::rand()) / static_cast<float>(RAND_MAX) * 2.f - 1.f) * kNoiseAmplitude;
+            noiseSamples.push_back(static_cast<std::int16_t>(sample * 32767.f));
+        }
+        if (!ambientRainBuffer_.loadFromSamples(noiseSamples.data(), noiseSamples.size(), 1, kSampleRate, { sf::SoundChannel::Mono })) {
+            std::cout << "[GameWorld] Failed to synthesize ambient rain noise; it will just stay silent.\n";
+        }
+        ambientRainSound_.emplace(ambientRainBuffer_);
+        ambientRainSound_->setLooping(true);
+    }
+
+    applySfxVolume(); // sets each Sound's actual volume from its baseline * settings_.sfxVolumePercent
+
+    // ---- Background music: one short looping "music box" phrase per season,
+    // same makeTone synthesis as the SFX above (no asset files) -- each
+    // note's own linear fade-out gives a plucked/bell character rather than
+    // a sustained tone, so the notes stay distinct instead of blurring
+    // together. Mood differs by register/tempo/note choice, not just tint:
+    // Spring bright and major, Summer brighter and faster, Autumn warmer and
+    // slower, Winter sparse and cold. ----
+    makeTone(musicBuffers_[static_cast<int>(Season::Spring)],
+        { 261.63f, 329.63f, 392.00f, 523.25f, 293.66f, 392.00f, 329.63f, 261.63f }, 0.35f);
+    makeTone(musicBuffers_[static_cast<int>(Season::Summer)],
+        { 329.63f, 392.00f, 493.88f, 659.25f, 587.33f, 493.88f, 392.00f, 329.63f }, 0.25f);
+    makeTone(musicBuffers_[static_cast<int>(Season::Autumn)],
+        { 220.00f, 261.63f, 329.63f, 440.00f, 392.00f, 329.63f, 261.63f, 220.00f }, 0.45f);
+    makeTone(musicBuffers_[static_cast<int>(Season::Winter)],
+        { 220.00f, 329.63f, 220.00f, 293.66f }, 0.9f);
+
+    musicSounds_[0].emplace(musicBuffers_[static_cast<int>(game_.currentSeason())]);
+    musicSounds_[1].emplace(musicBuffers_[static_cast<int>(game_.currentSeason())]); // same buffer, stays silent/stopped until the first crossfade needs it
+    musicActiveIndex_ = 0;
+    musicSounds_[0]->setLooping(true);
+    applyMusicVolume();
+    musicSounds_[0]->play();
+}
+
+void GameWorld::playMusicForSeason(Season season) {
+    if (!musicSounds_[0] || !musicSounds_[1]) return;
+    int nextIndex = 1 - musicActiveIndex_;
+    musicSounds_[nextIndex]->setBuffer(musicBuffers_[static_cast<int>(season)]);
+    musicSounds_[nextIndex]->setLooping(true);
+    musicSounds_[nextIndex]->setVolume(0.f); // ramped up by updateMusicCrossfade
+    musicSounds_[nextIndex]->play();
+    musicCrossfadeFromIndex_ = musicActiveIndex_;
+    musicActiveIndex_ = nextIndex;
+    musicCrossfadeActive_ = true;
+    musicCrossfadeTimer_ = 0.f;
+}
+
+void GameWorld::updateMusicCrossfade(float dt) {
+    if (!musicCrossfadeActive_) return;
+    musicCrossfadeTimer_ += dt;
+    float t = std::clamp(musicCrossfadeTimer_ / kMusicCrossfadeDuration, 0.f, 1.f);
+    float base = 45.f * std::clamp(settings_.musicVolumePercent, 0.f, 100.f) / 100.f;
+    if (musicSounds_[musicActiveIndex_]) musicSounds_[musicActiveIndex_]->setVolume(base * t);
+    if (musicSounds_[musicCrossfadeFromIndex_]) musicSounds_[musicCrossfadeFromIndex_]->setVolume(base * (1.f - t));
+    if (t >= 1.f) {
+        if (musicCrossfadeFromIndex_ != musicActiveIndex_ && musicSounds_[musicCrossfadeFromIndex_]) {
+            musicSounds_[musicCrossfadeFromIndex_]->stop();
+        }
+        musicCrossfadeActive_ = false;
+    }
+}
+
+void GameWorld::applyMusicVolume() {
+    // Mid-crossfade, updateMusicCrossfade already recomputes both tracks'
+    // volume from settings_.musicVolumePercent every frame -- touching just
+    // the active one here would fight that ramp, so leave it alone until
+    // the crossfade finishes.
+    if (musicCrossfadeActive_) return;
+    if (musicSounds_[musicActiveIndex_]) {
+        musicSounds_[musicActiveIndex_]->setVolume(45.f * std::clamp(settings_.musicVolumePercent, 0.f, 100.f) / 100.f);
+    }
+}
+
+void GameWorld::applySfxVolume() {
+    // Each sound's own baseline (its relative loudness against the others,
+    // tuned by ear) scaled by the player's master SFX volume setting.
+    float scale = std::clamp(settings_.sfxVolumePercent, 0.f, 100.f) / 100.f;
+    if (footstepSound_) footstepSound_->setVolume(30.f * scale);
+    if (interactSound_) interactSound_->setVolume(55.f * scale);
+    if (achievementSound_) achievementSound_->setVolume(60.f * scale);
+    if (upgradeSound_) upgradeSound_->setVolume(50.f * scale);
+    if (ambientRainSound_) ambientRainSound_->setVolume(40.f * scale);
+}
+
+void GameWorld::applyVideoMode(sf::RenderWindow& window) {
+    sf::VideoMode mode = sf::VideoMode(kResolutionPresets[0]);
+    std::uint32_t style = sf::Style::Titlebar | sf::Style::Close;
+    sf::State state = sf::State::Windowed;
+    if (settings_.fullscreen) {
+        mode = sf::VideoMode::getDesktopMode();
+        style = sf::Style::None;
+        state = sf::State::Fullscreen;
+    } else {
+        int idx = std::clamp(settings_.resolutionIndex, 0, kResolutionPresetCount - 1);
+        mode = sf::VideoMode(kResolutionPresets[idx]);
+    }
+    window.create(mode, toSfString(Localization::t("window_title") + " v" + Version::kGameVersion), style, state);
+    window.setFramerateLimit(60);
+    actualWindowSize_ = window.getSize();
+
+    // Letterbox: fit the fixed logical windowSize_ inside actualWindowSize_
+    // preserving its aspect ratio (bars, not stretch/distortion), so every
+    // existing pixel-coordinate draw/click call in this file stays correct
+    // regardless of the real window/fullscreen size chosen here.
+    float logicalAspect = static_cast<float>(windowSize_.x) / static_cast<float>(windowSize_.y);
+    float actualAspect = static_cast<float>(actualWindowSize_.x) / static_cast<float>(actualWindowSize_.y);
+    sf::FloatRect viewport(sf::Vector2f(0.f, 0.f), sf::Vector2f(1.f, 1.f));
+    if (actualAspect > logicalAspect) {
+        float widthFrac = logicalAspect / actualAspect; // window is relatively wider -> bars left/right
+        viewport = sf::FloatRect(sf::Vector2f((1.f - widthFrac) / 2.f, 0.f), sf::Vector2f(widthFrac, 1.f));
+    } else if (actualAspect < logicalAspect) {
+        float heightFrac = actualAspect / logicalAspect; // window is relatively taller -> bars top/bottom
+        viewport = sf::FloatRect(sf::Vector2f(0.f, (1.f - heightFrac) / 2.f), sf::Vector2f(1.f, heightFrac));
+    }
+    gameView_ = sf::View(sf::FloatRect(sf::Vector2f(0.f, 0.f), sf::Vector2f(static_cast<float>(windowSize_.x), static_cast<float>(windowSize_.y))));
+    gameView_.setViewport(viewport);
+    window.setView(gameView_);
+}
+
+void GameWorld::buildZones() {
+    zones_.clear();
+    zones_.resize(6); // 0 = Town Square, 1 = Farmlands, 2 = Mining District, 3 = Valley District,
+                       // 4 = Harbor District, 5 = Highlands District
+
+    const sf::Vector2f bSize(110.f, 80.f);
+    auto addBuilding = [](Zone& z, const std::string& id, sf::Vector2f pos, sf::Color labelColor, sf::Vector2f size) {
+        WorldBuilding b;
+        b.id = id;
+        b.labelKey = id;
+        b.position = pos;
+        b.size = size;
+        b.labelColor = labelColor;
+        z.buildings.push_back(b);
+    };
+    auto addTree = [](Zone& z, sf::Vector2f pos) {
+        z.decorations.push_back(Decoration{ Decoration::Kind::Tree, pos, {} });
+    };
+    auto addBush = [](Zone& z, sf::Vector2f pos) {
+        z.decorations.push_back(Decoration{ Decoration::Kind::Bush, pos, {} });
+    };
+    auto addPatch = [](Zone& z, sf::Vector2f pos, sf::Vector2f size) {
+        z.decorations.push_back(Decoration{ Decoration::Kind::GrassPatch, pos, size });
+    };
+    auto addPath = [](Zone& z, sf::Vector2f pos, sf::Vector2f size) {
+        z.decorations.push_back(Decoration{ Decoration::Kind::Path, pos, size });
+    };
+    auto addWater = [](Zone& z, sf::Vector2f pos, sf::Vector2f size) {
+        z.decorations.push_back(Decoration{ Decoration::Kind::Water, pos, size });
+    };
+    auto addForageable = [](Zone& z, sf::Vector2f pos) {
+        z.forageables.push_back(Forageable{ pos, true, 0.f });
+    };
+    auto addNpc = [](Zone& z, const std::string& nameKey, sf::Vector2f home, sf::Color color,
+        std::vector<std::string> en, std::vector<std::string> zh) {
+        Npc npc;
+        npc.nameKey = nameKey;
+        npc.home = home;
+        npc.pos = home;
+        npc.target = home;
+        npc.color = color;
+        npc.linesEn = std::move(en);
+        npc.linesZh = std::move(zh);
+        z.npcs.push_back(npc);
+    };
+
+    // ---------------- Zone 0: Town Square ----------------
+    {
+        Zone& z = zones_[0];
+        z.nameKey = "zone_town_square";
+        z.east = 1;  // -> Farmlands
+        z.north = 2; // -> Mining District
+        z.west = 3;  // -> Valley District
+        z.south = 4; // -> Harbor District
+
+        addBuilding(z, "market",     { 585.f, 130.f }, kService, bSize);
+        addBuilding(z, "townhall",   { 585.f, 610.f }, kService, bSize);
+        addBuilding(z, "staff",      { 220.f, 300.f }, kService, bSize);
+        addBuilding(z, "doctor",     { 950.f, 300.f }, kService, bSize);
+        addBuilding(z, "sleep",      { 330.f, 470.f }, kService, bSize);
+        addBuilding(z, "eat",        { 500.f, 470.f }, kService, bSize);
+        addBuilding(z, "storefront", { 750.f, 470.f }, kService, bSize);
+        addBuilding(z, "bank",       { 220.f, 610.f }, kService, bSize);
+        addBuilding(z, "warehouse",  { 950.f, 610.f }, kService, bSize);
+
+        addPath(z, { 600.f, 40.f }, { 40.f, 740.f }); // north-south spine (toward Mining District)
+        addPath(z, { 0.f, 390.f }, { 1280.f, 40.f }); // east-west spine (toward Farmlands / Valley District)
+
+        for (float x = 20.f; x < 1260.f; x += 70.f) {
+            if (x > 540.f && x < 780.f) continue; // north gap
+            addTree(z, { x, 15.f });
+            addTree(z, { x, 800.f });
+        }
+        for (float y = 90.f; y < 800.f; y += 70.f) {
+            bool gapRange = (y > 330.f && y < 490.f);
+            if (!gapRange) addTree(z, { 15.f, y });   // west wall, gap -> Valley District
+            if (!gapRange) addTree(z, { 1260.f, y }); // east wall, gap -> Farmlands
+        }
+        for (int i = 0; i < 10; ++i) addBush(z, { randRange(120.f, 1160.f), randRange(120.f, 760.f) });
+        for (int i = 0; i < 14; ++i) addPatch(z, { randRange(0.f, 1260.f), randRange(0.f, 800.f) }, { 46.f, 30.f });
+
+        addNpc(z, "npc_merchant", { 430.f, 360.f }, sf::Color(210, 80, 80),
+            { "Welcome to town! Start with a Wheat Farm out in the Farmlands.",
+              "Ore turns into Iron Ingots at the Smelter, you know.",
+              "Don't forget to eat and sleep, or your work will suffer.",
+              "I hear prices swing wildly some days. Buy low, sell high!" },
+            { "欢迎来到小镇!去农田那边先建个麦田农场吧。",
+              "矿石在冶炼厂能炼成铁锭,你知道吗。",
+              "别忘了吃饭睡觉,不然干活效率会掉的。",
+              "听说市场价格有时候波动很大,低买高卖啊!" });
+        addNpc(z, "npc_mayor", { 830.f, 380.f }, sf::Color(220, 180, 60),
+            { "As mayor, I hereby declare this town open for business!",
+              "Check the Town Hall for the Production Tree and your Achievements.",
+              "Every generation leaves something behind for the next.",
+              "A hundred years is a long life. Take care of yourself." },
+            { "身为镇长,我在此宣布本镇正式开业!",
+              "去市政厅可以查看产业树和成就哦。",
+              "每一代人都会给下一代留下点什么。",
+              "活到一百岁可不容易,好好照顾自己。" });
+        addNpc(z, "npc_trader", { 620.f, 550.f }, sf::Color(90, 170, 200),
+            { "Prices go up when you buy a lot at once, and down when you sell a lot. Spread it out!",
+              "I travel between towns, but this one has the best deals lately." },
+            { "一次买太多价格会涨,一次卖太多价格会跌,分批来比较划算。",
+              "我在各个镇子之间跑生意,最近这镇子的行情最好。" });
+        addNpc(z, "npc_guard", { 960.f, 550.f }, sf::Color(120, 120, 130),
+            { "All quiet in town today. Good weather for business.",
+              "Mind the trees on the way out -- can't walk through those." },
+            { "今天镇上很太平,是做生意的好天气。",
+              "出去的时候小心树,那个是走不过去的。" });
+    }
+
+    // ---------------- Zone 1: Farmlands ----------------
+    {
+        Zone& z = zones_[1];
+        z.nameKey = "zone_farmlands";
+        z.west = 0; // -> Town Square
+
+        // 5-column grid (same 240px spacing as Valley District) -- needed
+        // once the Farm's 6 new crop-processor buildings joined the
+        // original 8, which no longer fit the old 3-column layout.
+        addBuilding(z, "lumber",       { 130.f, 180.f }, kTier1, bSize);
+        addBuilding(z, "sawmill",      { 370.f, 180.f }, kTier2, bSize);
+        addBuilding(z, "farm",         { 610.f, 180.f }, kTier1, bSize);
+        addBuilding(z, "jamkitchen",   { 850.f, 180.f }, kTier2, bSize);
+        addBuilding(z, "popcornstand", { 1090.f, 180.f }, kTier2, bSize);
+        addBuilding(z, "quarry",       { 130.f, 480.f }, kTier1, bSize);
+        addBuilding(z, "mason",        { 370.f, 480.f }, kTier2, bSize);
+        addBuilding(z, "bakery",       { 610.f, 480.f }, kTier2, bSize);
+        addBuilding(z, "juicebar",     { 850.f, 480.f }, kTier2, bSize);
+        addBuilding(z, "pieshop",      { 1090.f, 480.f }, kTier2, bSize);
+        addBuilding(z, "sheep",        { 130.f, 650.f }, kTier1, bSize);
+        addBuilding(z, "textile",      { 370.f, 650.f }, kTier2, bSize);
+        addBuilding(z, "roaststand",   { 610.f, 650.f }, kTier2, bSize);
+        addBuilding(z, "picklinghouse",{ 850.f, 650.f }, kTier2, bSize);
+
+        addPath(z, { 0.f, 390.f }, { 1280.f, 40.f });
+        addPath(z, { 590.f, 40.f }, { 40.f, 740.f });
+
+        for (float x = 20.f; x < 1260.f; x += 70.f) { addTree(z, { x, 15.f }); addTree(z, { x, 800.f }); }
+        for (float y = 90.f; y < 800.f; y += 70.f) {
+            if (y > 330.f && y < 490.f) continue; // west gap (back to Town Square)
+            addTree(z, { 15.f, y });
+            addTree(z, { 1260.f, y });
+        }
+        for (int i = 0; i < 12; ++i) addBush(z, { randRange(120.f, 1160.f), randRange(120.f, 760.f) });
+        for (int i = 0; i < 16; ++i) addPatch(z, { randRange(0.f, 1260.f), randRange(0.f, 800.f) }, { 50.f, 34.f });
+
+        addNpc(z, "npc_farmer", { 570.f, 330.f }, sf::Color(120, 180, 90),
+            { "These fields grow the finest wheat in the land.",
+              "The Bakery turns my wheat into bread -- smells wonderful.",
+              "Lumber and stone come from further out here too." },
+            { "这片地里种出的小麦是全镇最好的。",
+              "面包坊会把我的小麦做成面包,可香了。",
+              "木材和石头在这附近也能找到。" });
+        addNpc(z, "npc_child", { 950.f, 330.f }, sf::Color(230, 190, 210),
+            { "Have you seen how tall the wheat gets? Taller than me!",
+              "Mom says the Bakery bread is best right after it's made." },
+            { "你看小麦长得比我还高呢!",
+              "妈妈说面包坊刚出炉的面包最好吃。" });
+    }
+
+    // ---------------- Zone 2: Mining District ----------------
+    {
+        Zone& z = zones_[2];
+        z.nameKey = "zone_mining";
+        z.south = 0; // -> Town Square
+        z.north = 5; // -> Highlands District
+
+        addBuilding(z, "mine",       { 280.f, 180.f }, kTier1, bSize);
+        addBuilding(z, "smelter",    { 600.f, 180.f }, kTier2, bSize);
+        addBuilding(z, "gemshop",    { 920.f, 180.f }, kTier2, bSize);
+        addBuilding(z, "blacksmith", { 440.f, 480.f }, kTier3, bSize);
+        addBuilding(z, "carpenter",  { 760.f, 480.f }, kTier3, bSize);
+        addBuilding(z, "smokehouse", { 280.f, 650.f }, kTier2, bSize);
+        addBuilding(z, "tailor",     { 920.f, 650.f }, kTier3, bSize);
+
+        addPath(z, { 590.f, 0.f }, { 40.f, 780.f });
+
+        for (float x = 20.f; x < 1260.f; x += 70.f) {
+            if (x > 540.f && x < 780.f) continue; // north gap (-> Highlands District) and south gap (-> Town Square)
+            addTree(z, { x, 15.f });
+            addTree(z, { x, 800.f });
+        }
+        for (float y = 90.f; y < 800.f; y += 70.f) { addTree(z, { 15.f, y }); addTree(z, { 1260.f, y }); }
+        for (int i = 0; i < 10; ++i) addBush(z, { randRange(120.f, 1160.f), randRange(120.f, 760.f) });
+        for (int i = 0; i < 14; ++i) addPatch(z, { randRange(0.f, 1260.f), randRange(0.f, 800.f) }, { 44.f, 28.f });
+
+        addNpc(z, "npc_miner", { 600.f, 340.f }, sf::Color(150, 150, 160),
+            { "Watch your step, these tunnels run deep.",
+              "The Smelter and Gem Workshop both want my ore.",
+              "A Blacksmith can turn iron into fine tools, if you build one." },
+            { "小心脚下,这些坑道很深的。",
+              "冶炼厂和宝石工坊都缺我挖的矿石。",
+              "铁匠铺能把铁锭打成趁手的工具,你可以去建一个。" });
+        addNpc(z, "npc_prospector", { 780.f, 330.f }, sf::Color(200, 170, 90),
+            { "Fifty years I've dug these hills. Found a gem or two along the way.",
+              "A Carpenter can turn planks into fine furniture -- worth a good price." },
+            { "我在这片山里挖了五十年,也算挖到过几颗宝石。",
+              "木匠坊能把木板做成家具,能卖不少钱。" });
+    }
+
+    // ---------------- Zone 3: Valley District ----------------
+    {
+        Zone& z = zones_[3];
+        z.nameKey = "zone_valley";
+        z.east = 0; // -> Town Square
+
+        addBuilding(z, "orchard",    { 130.f, 180.f }, kTier1, bSize);
+        addBuilding(z, "preserve",   { 370.f, 180.f }, kTier2, bSize);
+        addBuilding(z, "herbgarden", { 610.f, 180.f }, kTier1, bSize);
+        addBuilding(z, "apothecary", { 850.f, 180.f }, kTier2, bSize);
+        addBuilding(z, "alchemist",  { 1090.f, 180.f }, kTier3, bSize);
+        addBuilding(z, "goldmine",   { 130.f, 480.f }, kTier1, bSize);
+        addBuilding(z, "goldsmith",  { 370.f, 480.f }, kTier2, bSize);
+        addBuilding(z, "jeweler",    { 610.f, 480.f }, kTier3, bSize);
+        addBuilding(z, "vineyard",   { 850.f, 480.f }, kTier1, bSize);
+        addBuilding(z, "winery",     { 1090.f, 480.f }, kTier2, bSize);
+
+        addPath(z, { 0.f, 390.f }, { 1280.f, 40.f });
+
+        for (float x = 20.f; x < 1260.f; x += 70.f) { addTree(z, { x, 15.f }); addTree(z, { x, 800.f }); }
+        for (float y = 90.f; y < 800.f; y += 70.f) {
+            addTree(z, { 15.f, y }); // west wall, no gap -- this is the far edge of town
+            if (y > 330.f && y < 490.f) continue; // east gap (back to Town Square)
+            addTree(z, { 1260.f, y });
+        }
+        for (int i = 0; i < 12; ++i) addBush(z, { randRange(120.f, 1160.f), randRange(120.f, 760.f) });
+        for (int i = 0; i < 16; ++i) addPatch(z, { randRange(0.f, 1260.f), randRange(0.f, 800.f) }, { 48.f, 32.f });
+
+        addNpc(z, "npc_orchardist", { 400.f, 330.f }, sf::Color(200, 120, 90),
+            { "Sweetest fruit in the valley, straight off the tree.",
+              "The Preserve turns my fruit into jars that keep for months." },
+            { "整个山谷里最甜的水果,刚从树上摘的。",
+              "果酱坊会把我的水果做成能存好几个月的果酱。" });
+        addNpc(z, "npc_herbalist", { 850.f, 330.f }, sf::Color(140, 190, 110),
+            { "These herbs can cure most anything, if you know how to prepare them.",
+              "An Alchemist can turn medicine into something far more potent." },
+            { "这些草药如果炮制得当,几乎什么病都能治。",
+              "炼金坊能把药剂炼成威力大得多的灵药。" });
+        addNpc(z, "npc_prospector2", { 250.f, 550.f }, sf::Color(212, 175, 55),
+            { "Gold runs deep under this valley -- slow going, but worth every ounce.",
+              "A Jeweler can set gold bars into pieces worth a small fortune." },
+            { "这山谷底下藏着金子,挖得慢,但每一两都值。",
+              "珠宝坊能把金条打造成价值不菲的珠宝。" });
+        addNpc(z, "npc_vintner", { 950.f, 550.f }, sf::Color(120, 60, 90),
+            { "A good vineyard takes patience -- but the Winery makes it all worthwhile.",
+              "Wine only gets more valuable as the town grows." },
+            { "种葡萄急不得,不过酒庄酿出来的酒绝对值得等待。",
+              "镇子越发展,葡萄酒就越值钱。" });
+    }
+
+    // ---------------- Zone 4: Harbor District ----------------
+    {
+        Zone& z = zones_[4];
+        z.nameKey = "zone_harbor";
+        z.north = 0; // -> Town Square
+
+        addBuilding(z, "seasalt",      { 250.f, 180.f }, kTier1, bSize);
+        addBuilding(z, "fishing",      { 570.f, 180.f }, kTier1, bSize);
+        addBuilding(z, "pearlfarm",    { 890.f, 180.f }, kTier1, bSize);
+        addBuilding(z, "shipyard",     { 250.f, 480.f }, kTier2, bSize);
+        addBuilding(z, "cannery",      { 570.f, 480.f }, kTier2, bSize);
+        addBuilding(z, "pearlatelier", { 890.f, 480.f }, kTier2, bSize);
+
+        addPath(z, { 590.f, 0.f }, { 40.f, 260.f }); // spine leading down from the Town Square gap
+
+        for (float x = 20.f; x < 1260.f; x += 70.f) {
+            if (x > 540.f && x < 780.f) continue; // north gap (-> Town Square)
+            addTree(z, { x, 15.f });
+            addTree(z, { x, 800.f });
+        }
+        for (float y = 90.f; y < 800.f; y += 70.f) { addTree(z, { 15.f, y }); addTree(z, { 1260.f, y }); }
+        for (int i = 0; i < 10; ++i) addBush(z, { randRange(120.f, 1160.f), randRange(120.f, 760.f) });
+        for (int i = 0; i < 14; ++i) addPatch(z, { randRange(0.f, 1260.f), randRange(0.f, 800.f) }, { 46.f, 30.f });
+        // A band of animated water along the south edge, ties the dock
+        // buildings to the shoreline (see Decoration::Kind::Water in drawZone).
+        addWater(z, { 0.f, 700.f }, { 1280.f, 120.f });
+
+        addNpc(z, "npc_shipwright", { 340.f, 380.f }, sf::Color(90, 110, 140),
+            { "Give me enough planks and I'll build you a ship worth sailing.",
+              "The Fishing Dock keeps me in steady work -- always something to haul." },
+            { "只要木板给够,我就能造出一艘经得起出海的船。",
+              "渔港一直有活给我干,总有东西要装卸。" });
+        addNpc(z, "npc_pearldiver", { 780.f, 620.f }, sf::Color(80, 160, 170),
+            { "Deep water, cold water -- but a good pearl makes it worth the dive.",
+              "The Pearl Atelier pays well for a clean, unblemished pearl." },
+            { "水又深又冷,但捞到一颗好珍珠就都值了。",
+              "珍珠工坊对干净无瑕的珍珠出价很高。" });
+    }
+
+    // ---------------- Zone 5: Highlands District ----------------
+    {
+        Zone& z = zones_[5];
+        z.nameKey = "zone_highlands";
+        z.south = 2; // -> Mining District
+
+        addBuilding(z, "dairyfarm", { 130.f, 180.f }, kTier1, bSize);
+        addBuilding(z, "creamery",  { 370.f, 180.f }, kTier2, bSize);
+        addBuilding(z, "beehive",   { 610.f, 180.f }, kTier1, bSize);
+        addBuilding(z, "meadery",   { 850.f, 180.f }, kTier2, bSize);
+        addBuilding(z, "trapper",   { 1090.f, 180.f }, kTier1, bSize);
+        addBuilding(z, "tannery",   { 130.f, 480.f }, kTier2, bSize);
+        addBuilding(z, "teafield",  { 370.f, 480.f }, kTier1, bSize);
+        addBuilding(z, "teahouse",  { 610.f, 480.f }, kTier2, bSize);
+        addBuilding(z, "flaxfield", { 850.f, 480.f }, kTier1, bSize);
+        addBuilding(z, "linenmill", { 1090.f, 480.f }, kTier2, bSize);
+
+        addPath(z, { 590.f, 540.f }, { 40.f, 260.f }); // spine leading up to the Mining District gap
+
+        for (float x = 20.f; x < 1260.f; x += 70.f) {
+            addTree(z, { x, 15.f }); // north wall, no gap -- far edge of the map
+            if (x > 540.f && x < 780.f) continue; // south gap (-> Mining District)
+            addTree(z, { x, 800.f });
+        }
+        for (float y = 90.f; y < 800.f; y += 70.f) {
+            addTree(z, { 15.f, y }); // west wall, no gap -- far edge of the map
+            addTree(z, { 1260.f, y }); // east wall, no gap -- far edge of the map
+        }
+        for (int i = 0; i < 12; ++i) addBush(z, { randRange(120.f, 1160.f), randRange(120.f, 760.f) });
+        for (int i = 0; i < 16; ++i) addPatch(z, { randRange(0.f, 1260.f), randRange(0.f, 800.f) }, { 48.f, 32.f });
+
+        addNpc(z, "npc_dairymaid", { 250.f, 330.f }, sf::Color(230, 210, 180),
+            { "Fresh milk every morning -- the Creamery turns it into cheese by noon.",
+              "These highland pastures make for the creamiest milk in the region." },
+            { "每天早上都有新鲜牛奶——乳品厂中午前就能做成奶酪。",
+              "这片高原牧场产的牛奶是这一带最浓郁的。" });
+        addNpc(z, "npc_beekeeper", { 730.f, 330.f }, sf::Color(230, 180, 60),
+            { "Mind the bees, but don't mind them too much -- the honey's worth it.",
+              "The Meadery turns my honey into something with a real kick." },
+            { "小心蜜蜂,但也别太紧张——蜂蜜是值得的。",
+              "蜂蜜酒坊会把我的蜂蜜酿成后劲十足的酒。" });
+        addNpc(z, "npc_trapper", { 970.f, 630.f }, sf::Color(120, 90, 70),
+            { "A good pelt takes patience to trap and skill to skin.",
+              "The Tannery pays fair for clean leather, no questions asked." },
+            { "捕到一张好兽皮需要耐心,剥皮则需要手艺。",
+              "制革厂对干净的皮革出价公道,不多问。" });
+
+        // Wild berries scattered in the open ground between the two rows of
+        // buildings -- walk up and press E (see findNearbyForageable) for a
+        // small bonus of a random Highlands good; each respawns on its own
+        // timer a while after being picked.
+        addForageable(z, { 280.f, 400.f });
+        addForageable(z, { 520.f, 350.f });
+        addForageable(z, { 760.f, 420.f });
+        addForageable(z, { 1000.f, 380.f });
+        addForageable(z, { 400.f, 600.f });
+        addForageable(z, { 830.f, 610.f });
+    }
+}
+
+bool GameWorld::collidesWithBuilding(sf::Vector2f pos, float size) const {
+    sf::FloatRect testRect(pos, sf::Vector2f(size, size));
+    for (const auto& b : zones_[currentZone_].buildings) {
+        if (sf::FloatRect(b.position, b.size).findIntersection(testRect)) return true;
+    }
+    return false;
+}
+
+bool GameWorld::collidesWithTree(sf::Vector2f pos, float size) const {
+    sf::Vector2f center = pos + sf::Vector2f(size / 2.f, size / 2.f);
+    for (const auto& d : zones_[currentZone_].decorations) {
+        if (d.kind != Decoration::Kind::Tree) continue;
+        sf::Vector2f diff = center - d.position;
+        float distSq = diff.x * diff.x + diff.y * diff.y;
+        float minDist = kTreeRadius + size / 2.f - 6.f;
+        if (distSq < minDist * minDist) return true;
+    }
+    return false;
+}
+
+sf::FloatRect GameWorld::achievementsButtonBounds() const {
+    return sf::FloatRect({ static_cast<float>(windowSize_.x) - 168.f, 10.f }, { 158.f, 34.f });
+}
+
+sf::FloatRect GameWorld::howToPlayButtonBounds() const {
+    // Sits just left of the Achievements button, same size, same row.
+    return sf::FloatRect({ static_cast<float>(windowSize_.x) - 168.f - 158.f - 10.f, 10.f }, { 158.f, 34.f });
+}
+
+void GameWorld::handleInteraction(const WorldBuilding& building) {
+    if (interactSound_) interactSound_->play();
+
+    // Map the building id straight to its overlay. The 12 production-tree
+    // business ids all share the Businesses overlay type, but each opens it
+    // focused on just that one building (focusedBusinessId_) -- walking up to
+    // the Lumber Camp should only let you manage the Lumber Camp, not scroll
+    // over and upgrade the Wheat Farm from the same screen.
+    if (building.id == "market") { openOverlay(OverlayKind::Market); return; }
+    if (building.id == "staff") { openOverlay(OverlayKind::Staff); return; }
+    if (building.id == "sleep") { openOverlay(OverlayKind::Sleep); return; }
+    if (building.id == "eat") { openOverlay(OverlayKind::Eat); return; }
+    if (building.id == "doctor") { openOverlay(OverlayKind::Doctor); return; }
+    if (building.id == "townhall") { openOverlay(OverlayKind::Tree); return; }
+    if (building.id == "bank") { openOverlay(OverlayKind::Bank); return; }
+    if (building.id == "warehouse") { openOverlay(OverlayKind::Warehouse); return; }
+
+    // A locked production building still opening the full Businesses screen
+    // (just to show that one row greyed out) reads as "I can still interact
+    // with a locked building" -- a quick world-view hint pointing at the Town
+    // Hall's production tree is more useful than the whole management screen.
+    if (game_.isBusinessLocked(building.id)) {
+        setFeedback(Localization::t("world_locked_hint"), false);
+        return;
+    }
+    focusedBusinessId_ = building.id;
+    openOverlay(OverlayKind::Businesses);
+}
+
+namespace {
+    // Key-fragment (not translated itself) for building the npc_*_season_*
+    // localization keys below -- distinct from seasonKey(), which returns a
+    // translatable "season_spring"-style key for display text.
+    const char* seasonKeyFragment(Season s) {
+        switch (s) {
+        case Season::Spring: return "spring";
+        case Season::Summer: return "summer";
+        case Season::Autumn: return "autumn";
+        default:             return "winter";
+        }
+    }
+    // NPCs (besides Farmer Nell, who gets her own crop-aware line -- see
+    // farmerSeasonLine) that comment on the current season every other visit.
+    const std::vector<std::string> kSeasonalCommentNpcs = { "npc_orchardist", "npc_beekeeper", "npc_trapper", "npc_mayor" };
+
+    // Localization key for a rebindable action's display name -- shared by
+    // drawSettingsOverlay's key rows and the rebind-collision toast below.
+    const char* rebindActionLabelKey(RebindAction action) {
+        switch (action) {
+        case RebindAction::MoveUp:       return "key_move_up";
+        case RebindAction::MoveDown:     return "key_move_down";
+        case RebindAction::MoveLeft:     return "key_move_left";
+        case RebindAction::MoveRight:    return "key_move_right";
+        case RebindAction::Interact:     return "key_interact";
+        case RebindAction::QuickUpgrade: return "key_quick_upgrade";
+        case RebindAction::Minimap:      return "key_minimap";
+        case RebindAction::Minigame:     return "key_minigame";
+        default:                         return "";
+        }
+    }
+}
+
+std::string GameWorld::farmerSeasonLine() const {
+    Season season = game_.currentSeason();
+    std::string cropId = "wheat";
+    for (const auto& info : game_.businessInfos()) {
+        if (info.id == "farm") { cropId = info.cropId; break; }
+    }
+    const CropType* crop = nullptr;
+    for (const auto& c : game_.cropOptions()) {
+        if (c.id == cropId) { crop = &c; break; }
+    }
+    std::string line = Localization::t("farmer_season_line_prefix") + Localization::t(seasonKey(season)) +
+        Localization::t("farmer_season_line_mid") + Localization::t(cropId);
+    if (crop && crop->favoriteSeason == season) {
+        line += Localization::t("farmer_season_line_in_season");
+    } else if (crop) {
+        line += Localization::t("farmer_season_line_off_prefix") + Localization::t(seasonKey(crop->favoriteSeason)) +
+            Localization::t("farmer_season_line_off_suffix");
+    } else {
+        line += ".";
+    }
+    return line;
+}
+
+void GameWorld::handleNpcTalk(Npc& npc) {
+    if (interactSound_) interactSound_->play();
+    dialogueSpeaker_ = Localization::t(npc.nameKey);
+
+    if (npc.hasQuest) {
+        std::ostringstream oss;
+        oss << Localization::t("quest_intro_prefix") << formatNumber(npc.questQty) << " " << Localization::t(npc.questGoodId)
+            << Localization::t("quest_reward_prefix") << formatNumber(npc.questReward) << Localization::t("quest_reward_suffix");
+        dialogueText_ = oss.str();
+        dialogueNpc_ = &npc;
+        std::cout << "\n" << dialogueSpeaker_ << ": " << dialogueText_ << "\n";
+    } else if (npc.hasDeal) {
+        std::ostringstream oss;
+        oss << Localization::t("deal_intro_prefix") << formatNumber(npc.dealQty) << " " << Localization::t(npc.dealGoodId)
+            << Localization::t("deal_price_prefix") << formatNumber(npc.dealTotalPrice) << Localization::t("deal_price_suffix");
+        dialogueText_ = oss.str();
+        dialogueNpc_ = &npc;
+        std::cout << "\n" << dialogueSpeaker_ << ": " << dialogueText_ << "\n";
+    } else {
+        dialogueNpc_ = nullptr;
+        std::string line;
+        // Farmer Nell comments on the season/crop every other visit instead
+        // of pulling from her fixed lines that time -- lineIndex still
+        // advances every visit either way, so the static lines keep cycling
+        // normally on the visits that do use them.
+        if (npc.nameKey == "npc_farmer" && npc.lineIndex % 2 == 1) {
+            line = farmerSeasonLine();
+        } else if (npc.lineIndex % 2 == 1 &&
+            std::find(kSeasonalCommentNpcs.begin(), kSeasonalCommentNpcs.end(), npc.nameKey) != kSeasonalCommentNpcs.end()) {
+            line = Localization::t(npc.nameKey + "_season_" + seasonKeyFragment(game_.currentSeason()));
+        } else {
+            auto& lines = Localization::current == Language::English ? npc.linesEn : npc.linesZh;
+            if (lines.empty()) return;
+            line = lines[static_cast<size_t>(npc.lineIndex) % lines.size()];
+        }
+        // Also printed to the console for a persistent log, but that's not
+        // where a player actually looking at the game window would see it --
+        // the Dialogue overlay is the real, in-window way to read this.
+        std::cout << "\n" << dialogueSpeaker_ << ": " << line << "\n";
+        npc.lineIndex++;
+        dialogueText_ = line;
+    }
+
+    openOverlay(OverlayKind::Dialogue);
+}
+
+void GameWorld::openOverlay(OverlayKind kind) {
+    currentOverlay_ = kind;
+    overlayFeedback_.clear();
+    overlayFeedbackTimer_ = 0.f;
+    // Contracts is only reachable via a button inside the Market overlay, and
+    // deliberately signs a contract for whichever good was selected there --
+    // resetting the selection here would always fall back to good #0.
+    if (kind != OverlayKind::Contracts) selectedGoodIndex_ = 0;
+    overlayScrollOffset_ = 0.f;
+}
+
+void GameWorld::closeOverlay() {
+    currentOverlay_ = OverlayKind::None;
+    overlayFeedback_.clear();
+}
+
+void GameWorld::setFeedback(const std::string& text, bool success) {
+    overlayFeedback_ = text;
+    overlayFeedbackColor_ = success ? sf::Color(140, 220, 140) : sf::Color(230, 120, 110);
+    overlayFeedbackTimer_ = 2.5f;
+}
+
+void GameWorld::handleTickOutcome(const TickOutcome& outcome) {
+    if (!outcome.died) return;
+    deathNoticeMessage_ = outcome.deathMessage;
+    deathNoticeGeneration_ = outcome.generation;
+    currentOverlay_ = OverlayKind::DeathNotice;
+    if (achievementSound_) achievementSound_->play(); // reuse the fanfare tone as a simple "something happened" cue
+}
+
+const WorldBuilding* GameWorld::findNearbyBuilding(float radius) const {
+    sf::Vector2f center = playerPos_ + sf::Vector2f(kPlayerSize / 2.f, kPlayerSize / 2.f);
+    const WorldBuilding* closest = nullptr;
+    float bestDistSq = radius * radius;
+    for (const auto& b : zones_[currentZone_].buildings) {
+        // Distance to the closest point ON the building's rectangle, not to
+        // its center -- buildings are 110x80, so measuring from the center
+        // made the effective reach wildly inconsistent depending on approach
+        // angle (dead-on to an edge worked, near a corner often didn't, even
+        // though collision already puts the player right at the wall either way).
+        float closestX = std::clamp(center.x, b.position.x, b.position.x + b.size.x);
+        float closestY = std::clamp(center.y, b.position.y, b.position.y + b.size.y);
+        sf::Vector2f d = center - sf::Vector2f(closestX, closestY);
+        float distSq = d.x * d.x + d.y * d.y;
+        if (distSq < bestDistSq) { bestDistSq = distSq; closest = &b; }
+    }
+    return closest;
+}
+
+Npc* GameWorld::findNearbyNpc(float radius) {
+    sf::Vector2f center = playerPos_ + sf::Vector2f(kPlayerSize / 2.f, kPlayerSize / 2.f);
+    Npc* closest = nullptr;
+    float bestDistSq = radius * radius;
+    for (auto& npc : zones_[currentZone_].npcs) {
+        sf::Vector2f d = center - npc.pos;
+        float distSq = d.x * d.x + d.y * d.y;
+        if (distSq < bestDistSq) { bestDistSq = distSq; closest = &npc; }
+    }
+    return closest;
+}
+
+Forageable* GameWorld::findNearbyForageable(float radius) {
+    sf::Vector2f center = playerPos_ + sf::Vector2f(kPlayerSize / 2.f, kPlayerSize / 2.f);
+    Forageable* closest = nullptr;
+    float bestDistSq = radius * radius;
+    for (auto& f : zones_[currentZone_].forageables) {
+        if (!f.active) continue;
+        sf::Vector2f d = center - f.home;
+        float distSq = d.x * d.x + d.y * d.y;
+        if (distSq < bestDistSq) { bestDistSq = distSq; closest = &f; }
+    }
+    return closest;
+}
+
+void GameWorld::updateForaging(float dt) {
+    for (auto& zone : zones_) {
+        for (auto& f : zone.forageables) {
+            if (f.active) continue;
+            f.respawnTimer -= dt;
+            if (f.respawnTimer <= 0.f) f.active = true;
+        }
+    }
+}
+
+void GameWorld::drawForageable(sf::RenderWindow& window, const Forageable& f) {
+    if (!f.active) return;
+    // A small cluster of berries -- deliberately simple/bright so it reads
+    // as "walk over and press E" at a glance against the Highlands' pasture
+    // greens, distinct from the Bush decoration's flat single circle.
+    const sf::Vector2f dots[] = { { -5.f, 0.f }, { 5.f, 0.f }, { 0.f, -7.f } };
+    for (const auto& d : dots) {
+        sf::CircleShape berry(5.f);
+        berry.setPosition(f.home + d - sf::Vector2f(5.f, 5.f));
+        berry.setFillColor(sf::Color(210, 60, 90));
+        berry.setOutlineThickness(1.f);
+        berry.setOutlineColor(sf::Color(25, 20, 15));
+        window.draw(berry);
+    }
+}
+
+void GameWorld::updateNpcs(float dt) {
+    for (auto& npc : zones_[currentZone_].npcs) {
+        npc.wanderTimer -= dt;
+        if (npc.wanderTimer <= 0.f) {
+            npc.target = npc.home + sf::Vector2f(randRange(-50.f, 50.f), randRange(-50.f, 50.f));
+            npc.wanderTimer = randRange(2.5f, 5.f);
+        }
+        sf::Vector2f toTarget = npc.target - npc.pos;
+        float dist = std::sqrt(toTarget.x * toTarget.x + toTarget.y * toTarget.y);
+        if (dist > 2.f) {
+            sf::Vector2f step = toTarget / dist * 40.f * dt;
+            // Same per-axis collision the player uses (see run()'s movement
+            // block) so NPCs no longer walk through buildings/trees -- if a
+            // step is blocked it's just skipped for this frame rather than
+            // pathed around; the wander-retarget timer above picks a new
+            // nearby target every 2.5-5s regardless, so an NPC never stays
+            // stuck for long. Doesn't touch the player's own collision or
+            // the E/click interaction radius (findNearbyBuilding), which are
+            // both unrelated to this.
+            sf::Vector2f tryX = npc.pos + sf::Vector2f(step.x, 0.f);
+            if (!collidesWithBuilding(tryX, kPlayerSize) && !collidesWithTree(tryX, kPlayerSize)) npc.pos.x = tryX.x;
+            sf::Vector2f tryY = npc.pos + sf::Vector2f(0.f, step.y);
+            if (!collidesWithBuilding(tryY, kPlayerSize) && !collidesWithTree(tryY, kPlayerSize)) npc.pos.y = tryY.y;
+        }
+
+        // The Traveling Trader rolls bundle deals instead of fetch quests;
+        // everyone else is the other way around (see the Npc::hasDeal doc
+        // comment in GameWorld.h).
+        if (npc.nameKey == "npc_trader") {
+            if (!npc.hasDeal) {
+                npc.dealRollTimer -= dt;
+                if (npc.dealRollTimer <= 0.f) {
+                    npc.dealRollTimer = randRange(25.f, 45.f);
+                    if (randRange(0.f, 1.f) < 0.25f) generateDealFor(npc);
+                }
+            }
+        } else if (!npc.hasQuest) {
+            // Slow, low-probability roll for a new fetch quest whenever this
+            // NPC doesn't already have one active.
+            npc.questRollTimer -= dt;
+            if (npc.questRollTimer <= 0.f) {
+                npc.questRollTimer = randRange(20.f, 40.f);
+                if (randRange(0.f, 1.f) < 0.15f) generateQuestFor(npc);
+            }
+        }
+    }
+}
+
+void GameWorld::generateQuestFor(Npc& npc) {
+    auto goods = game_.goodInfos();
+    if (goods.empty()) return;
+    size_t idx = static_cast<size_t>(randRange(0.f, static_cast<float>(goods.size())));
+    if (idx >= goods.size()) idx = goods.size() - 1;
+    const auto& g = goods[idx];
+
+    npc.hasQuest = true;
+    npc.questGoodId = g.id;
+    npc.questQty = std::floor(randRange(5.f, 20.f));
+    npc.questReward = g.price * npc.questQty * 1.3; // a markup over just selling it normally, to make accepting worthwhile
+}
+
+void GameWorld::generateDealFor(Npc& npc) {
+    auto goods = game_.goodInfos();
+    if (goods.empty()) return;
+    size_t idx = static_cast<size_t>(randRange(0.f, static_cast<float>(goods.size())));
+    if (idx >= goods.size()) idx = goods.size() - 1;
+    const auto& g = goods[idx];
+
+    npc.hasDeal = true;
+    npc.dealGoodId = g.id;
+    npc.dealQty = std::floor(randRange(10.f, 30.f));
+    // A genuine discount (60% of the normal buy cost) rather than a markup --
+    // this is the trader offloading stock cheap, the mirror image of a fetch
+    // quest's markup for bringing stock TO an NPC.
+    npc.dealTotalPrice = g.price * npc.dealQty * 0.6;
+}
+
+void GameWorld::drawCottageShape(sf::RenderWindow& window, const WorldBuilding& b) {
+    float roofH = b.size.y * 0.38f;
+    sf::Color roofColor = darken(b.labelColor, 0.55f);
+    sf::Color bodyColor = darken(b.labelColor, 0.85f);
+
+    sf::RectangleShape body(sf::Vector2f(b.size.x, b.size.y - roofH));
+    body.setPosition(sf::Vector2f(b.position.x, b.position.y + roofH));
+    body.setFillColor(bodyColor);
+    body.setOutlineThickness(2.f);
+    body.setOutlineColor(sf::Color(25, 20, 15));
+    window.draw(body);
+
+    sf::ConvexShape roof(3);
+    roof.setPoint(0, sf::Vector2f(b.position.x - 8.f, b.position.y + roofH));
+    roof.setPoint(1, sf::Vector2f(b.position.x + b.size.x / 2.f, b.position.y - 10.f));
+    roof.setPoint(2, sf::Vector2f(b.position.x + b.size.x + 8.f, b.position.y + roofH));
+    roof.setFillColor(roofColor);
+    roof.setOutlineThickness(2.f);
+    roof.setOutlineColor(sf::Color(25, 20, 15));
+    window.draw(roof);
+
+    sf::Vector2f doorSize(b.size.x * 0.22f, (b.size.y - roofH) * 0.55f);
+    sf::RectangleShape door(doorSize);
+    door.setPosition(sf::Vector2f(b.position.x + b.size.x / 2.f - doorSize.x / 2.f, b.position.y + b.size.y - doorSize.y));
+    door.setFillColor(sf::Color(60, 42, 24));
+    window.draw(door);
+
+    sf::Vector2f winSize(b.size.x * 0.16f, b.size.x * 0.16f);
+    sf::RectangleShape win(winSize);
+    win.setPosition(sf::Vector2f(b.position.x + b.size.x * 0.7f, b.position.y + b.size.y - roofH - winSize.y - 8.f + roofH));
+    win.setFillColor(sf::Color(205, 228, 250));
+    win.setOutlineThickness(1.5f);
+    win.setOutlineColor(sf::Color(25, 20, 15));
+    window.draw(win);
+
+    if (smokesFrom(b.id)) {
+        sf::RectangleShape chimney(sf::Vector2f(10.f, 20.f));
+        chimney.setPosition(sf::Vector2f(b.position.x + b.size.x * 0.72f, b.position.y - 24.f));
+        chimney.setFillColor(sf::Color(96, 80, 70));
+        chimney.setOutlineThickness(1.5f);
+        chimney.setOutlineColor(sf::Color(25, 20, 15));
+        window.draw(chimney);
+    }
+}
+
+void GameWorld::drawFarmShape(sf::RenderWindow& window, const WorldBuilding& b) {
+    sf::RectangleShape soil(b.size);
+    soil.setPosition(b.position);
+    soil.setFillColor(sf::Color(107, 84, 48));
+    soil.setOutlineThickness(2.f);
+    soil.setOutlineColor(sf::Color(25, 20, 15));
+    window.draw(soil);
+
+    constexpr int rows = 5;
+    float gap = b.size.x / static_cast<float>(rows);
+    for (int i = 0; i < rows; ++i) {
+        sf::RectangleShape row(sf::Vector2f(gap * 0.55f, b.size.y - 10.f));
+        row.setPosition(sf::Vector2f(b.position.x + gap * static_cast<float>(i) + gap * 0.2f, b.position.y + 5.f));
+        row.setFillColor(sf::Color(198, 182, 68));
+        window.draw(row);
+    }
+}
+
+void GameWorld::drawMineShape(sf::RenderWindow& window, const WorldBuilding& b) {
+    sf::ConvexShape mound(4);
+    mound.setPoint(0, sf::Vector2f(b.position.x, b.position.y + b.size.y));
+    mound.setPoint(1, sf::Vector2f(b.position.x + b.size.x * 0.18f, b.position.y));
+    mound.setPoint(2, sf::Vector2f(b.position.x + b.size.x * 0.82f, b.position.y));
+    mound.setPoint(3, sf::Vector2f(b.position.x + b.size.x, b.position.y + b.size.y));
+    mound.setFillColor(sf::Color(114, 106, 100));
+    mound.setOutlineThickness(2.f);
+    mound.setOutlineColor(sf::Color(25, 20, 15));
+    window.draw(mound);
+
+    float archW = b.size.x * 0.34f, archH = b.size.y * 0.6f;
+    sf::Vector2f archPos(b.position.x + b.size.x / 2.f - archW / 2.f, b.position.y + b.size.y - archH);
+
+    sf::RectangleShape frameL(sf::Vector2f(7.f, archH + 4.f));
+    frameL.setPosition(sf::Vector2f(archPos.x - 7.f, archPos.y - 4.f));
+    frameL.setFillColor(sf::Color(94, 62, 32));
+    window.draw(frameL);
+    sf::RectangleShape frameR(frameL);
+    frameR.setPosition(sf::Vector2f(archPos.x + archW, archPos.y - 4.f));
+    window.draw(frameR);
+
+    sf::RectangleShape entrance(sf::Vector2f(archW, archH));
+    entrance.setPosition(archPos);
+    entrance.setFillColor(sf::Color(18, 18, 20));
+    window.draw(entrance);
+}
+
+void GameWorld::drawLumberShape(sf::RenderWindow& window, const WorldBuilding& b) {
+    sf::RectangleShape ground(b.size);
+    ground.setPosition(b.position);
+    ground.setFillColor(sf::Color(96, 124, 60));
+    ground.setOutlineThickness(2.f);
+    ground.setOutlineColor(sf::Color(25, 20, 15));
+    window.draw(ground);
+
+    for (int i = 0; i < 3; ++i) {
+        float y = b.position.y + b.size.y * 0.24f + static_cast<float>(i) * 15.f;
+        sf::RectangleShape log(sf::Vector2f(b.size.x * 0.62f, 11.f));
+        log.setPosition(sf::Vector2f(b.position.x + b.size.x * 0.2f, y));
+        log.setFillColor(sf::Color(124, 84, 44));
+        log.setOutlineThickness(1.f);
+        log.setOutlineColor(sf::Color(70, 45, 20));
+        window.draw(log);
+
+        sf::CircleShape ring(6.f);
+        ring.setPosition(sf::Vector2f(b.position.x + b.size.x * 0.2f - 5.f, y - 1.f));
+        ring.setFillColor(sf::Color(172, 134, 88));
+        ring.setOutlineThickness(1.f);
+        ring.setOutlineColor(sf::Color(70, 45, 20));
+        window.draw(ring);
+    }
+}
+
+void GameWorld::drawQuarryShape(sf::RenderWindow& window, const WorldBuilding& b) {
+    sf::RectangleShape pit(b.size);
+    pit.setPosition(b.position);
+    pit.setFillColor(sf::Color(98, 98, 102));
+    pit.setOutlineThickness(2.f);
+    pit.setOutlineColor(sf::Color(25, 20, 15));
+    window.draw(pit);
+
+    const sf::Vector2f offsets[] = {
+        { b.size.x * 0.18f, b.size.y * 0.28f },
+        { b.size.x * 0.55f, b.size.y * 0.48f },
+        { b.size.x * 0.32f, b.size.y * 0.62f },
+        { b.size.x * 0.70f, b.size.y * 0.22f },
+    };
+    for (const auto& off : offsets) {
+        sf::RectangleShape chunk(sf::Vector2f(16.f, 12.f));
+        chunk.setPosition(b.position + off);
+        chunk.setFillColor(sf::Color(152, 152, 156));
+        chunk.setOutlineThickness(1.f);
+        chunk.setOutlineColor(sf::Color(70, 70, 74));
+        window.draw(chunk);
+    }
+}
+
+void GameWorld::drawPastureShape(sf::RenderWindow& window, const WorldBuilding& b) {
+    sf::RectangleShape grass(b.size);
+    grass.setPosition(b.position);
+    grass.setFillColor(sf::Color(102, 140, 70));
+    grass.setOutlineThickness(2.f);
+    grass.setOutlineColor(sf::Color(25, 20, 15));
+    window.draw(grass);
+
+    for (float x = b.position.x + 4.f; x < b.position.x + b.size.x - 2.f; x += 16.f) {
+        sf::RectangleShape post(sf::Vector2f(4.f, 16.f));
+        post.setPosition(sf::Vector2f(x, b.position.y + b.size.y - 16.f));
+        post.setFillColor(sf::Color(150, 118, 76));
+        window.draw(post);
+    }
+    sf::RectangleShape rail(sf::Vector2f(b.size.x - 8.f, 4.f));
+    rail.setPosition(sf::Vector2f(b.position.x + 4.f, b.position.y + b.size.y - 22.f));
+    rail.setFillColor(sf::Color(150, 118, 76));
+    window.draw(rail);
+
+    // A few grazing "sheep" -- a wool-white puff with a small dark head.
+    const sf::Vector2f puffs[] = { { 0.30f, 0.35f }, { 0.55f, 0.50f }, { 0.72f, 0.30f } };
+    for (const auto& pf : puffs) {
+        sf::Vector2f p = b.position + sf::Vector2f(b.size.x * pf.x, b.size.y * pf.y);
+        sf::CircleShape wool(9.f);
+        wool.setPosition(sf::Vector2f(p.x - 9.f, p.y - 9.f));
+        wool.setFillColor(sf::Color(240, 240, 235));
+        wool.setOutlineThickness(1.5f);
+        wool.setOutlineColor(sf::Color(25, 20, 15));
+        window.draw(wool);
+        sf::CircleShape head(4.f);
+        head.setPosition(sf::Vector2f(p.x - 13.f, p.y - 5.f));
+        head.setFillColor(sf::Color(60, 50, 45));
+        window.draw(head);
+    }
+}
+
+void GameWorld::drawOrchardShape(sf::RenderWindow& window, const WorldBuilding& b) {
+    sf::RectangleShape ground(b.size);
+    ground.setPosition(b.position);
+    ground.setFillColor(sf::Color(90, 130, 66));
+    ground.setOutlineThickness(2.f);
+    ground.setOutlineColor(sf::Color(25, 20, 15));
+    window.draw(ground);
+
+    for (int row = 0; row < 2; ++row) {
+        for (int col = 0; col < 3; ++col) {
+            sf::Vector2f p = b.position + sf::Vector2f(
+                b.size.x * (0.2f + 0.3f * static_cast<float>(col)),
+                b.size.y * (0.35f + 0.4f * static_cast<float>(row)));
+            sf::RectangleShape trunk(sf::Vector2f(4.f, 10.f));
+            trunk.setPosition(sf::Vector2f(p.x - 2.f, p.y));
+            trunk.setFillColor(sf::Color(96, 64, 32));
+            window.draw(trunk);
+            sf::CircleShape canopy(9.f);
+            canopy.setPosition(sf::Vector2f(p.x - 9.f, p.y - 14.f));
+            canopy.setFillColor(sf::Color(200, 90, 70)); // fruit-red canopy -- distinct from the world's plain green trees
+            canopy.setOutlineThickness(1.f);
+            canopy.setOutlineColor(sf::Color(25, 20, 15));
+            window.draw(canopy);
+        }
+    }
+}
+
+void GameWorld::drawHerbGardenShape(sf::RenderWindow& window, const WorldBuilding& b) {
+    sf::RectangleShape soil(b.size);
+    soil.setPosition(b.position);
+    soil.setFillColor(sf::Color(74, 58, 40));
+    soil.setOutlineThickness(2.f);
+    soil.setOutlineColor(sf::Color(25, 20, 15));
+    window.draw(soil);
+
+    const sf::Vector2f offsets[] = {
+        { b.size.x * 0.15f, b.size.y * 0.25f }, { b.size.x * 0.35f, b.size.y * 0.55f },
+        { b.size.x * 0.55f, b.size.y * 0.30f }, { b.size.x * 0.75f, b.size.y * 0.60f },
+        { b.size.x * 0.25f, b.size.y * 0.75f }, { b.size.x * 0.65f, b.size.y * 0.20f },
+        { b.size.x * 0.85f, b.size.y * 0.40f }, { b.size.x * 0.45f, b.size.y * 0.80f },
+    };
+    for (const auto& off : offsets) {
+        sf::CircleShape tuft(5.f);
+        tuft.setPosition(b.position + off);
+        tuft.setFillColor(sf::Color(110, 160, 80));
+        tuft.setOutlineThickness(1.f);
+        tuft.setOutlineColor(sf::Color(25, 20, 15));
+        window.draw(tuft);
+    }
+}
+
+void GameWorld::drawVineyardShape(sf::RenderWindow& window, const WorldBuilding& b) {
+    sf::RectangleShape soil(b.size);
+    soil.setPosition(b.position);
+    soil.setFillColor(sf::Color(107, 84, 48));
+    soil.setOutlineThickness(2.f);
+    soil.setOutlineColor(sf::Color(25, 20, 15));
+    window.draw(soil);
+
+    constexpr int rows = 4;
+    float gap = b.size.x / static_cast<float>(rows);
+    for (int i = 0; i < rows; ++i) {
+        float x = b.position.x + gap * static_cast<float>(i) + gap * 0.5f;
+        sf::RectangleShape post(sf::Vector2f(3.f, b.size.y - 10.f));
+        post.setPosition(sf::Vector2f(x, b.position.y + 5.f));
+        post.setFillColor(sf::Color(120, 90, 55));
+        window.draw(post);
+
+        for (int j = 0; j < 3; ++j) {
+            sf::CircleShape grape(3.5f);
+            grape.setPosition(sf::Vector2f(x - 3.5f, b.position.y + 12.f + static_cast<float>(j) * 16.f));
+            grape.setFillColor(sf::Color(110, 60, 130));
+            window.draw(grape);
+        }
+    }
+}
+
+void GameWorld::drawGoldMineShape(sf::RenderWindow& window, const WorldBuilding& b) {
+    sf::ConvexShape mound(4);
+    mound.setPoint(0, sf::Vector2f(b.position.x, b.position.y + b.size.y));
+    mound.setPoint(1, sf::Vector2f(b.position.x + b.size.x * 0.18f, b.position.y));
+    mound.setPoint(2, sf::Vector2f(b.position.x + b.size.x * 0.82f, b.position.y));
+    mound.setPoint(3, sf::Vector2f(b.position.x + b.size.x, b.position.y + b.size.y));
+    mound.setFillColor(sf::Color(150, 130, 80)); // gold-tinted rock -- distinct from the Ore Mine's grey mound
+    mound.setOutlineThickness(2.f);
+    mound.setOutlineColor(sf::Color(25, 20, 15));
+    window.draw(mound);
+
+    float archW = b.size.x * 0.34f, archH = b.size.y * 0.6f;
+    sf::Vector2f archPos(b.position.x + b.size.x / 2.f - archW / 2.f, b.position.y + b.size.y - archH);
+
+    sf::RectangleShape frameL(sf::Vector2f(7.f, archH + 4.f));
+    frameL.setPosition(sf::Vector2f(archPos.x - 7.f, archPos.y - 4.f));
+    frameL.setFillColor(sf::Color(94, 62, 32));
+    window.draw(frameL);
+    sf::RectangleShape frameR(frameL);
+    frameR.setPosition(sf::Vector2f(archPos.x + archW, archPos.y - 4.f));
+    window.draw(frameR);
+
+    sf::RectangleShape entrance(sf::Vector2f(archW, archH));
+    entrance.setPosition(archPos);
+    entrance.setFillColor(sf::Color(18, 18, 20));
+    window.draw(entrance);
+
+    const sf::Vector2f sparkles[] = { { b.size.x * 0.28f, b.size.y * 0.55f }, { b.size.x * 0.68f, b.size.y * 0.45f } };
+    for (const auto& s : sparkles) {
+        sf::Vector2f p = b.position + s;
+        sf::ConvexShape spark(4);
+        spark.setPoint(0, sf::Vector2f(p.x, p.y - 6.f));
+        spark.setPoint(1, sf::Vector2f(p.x + 4.f, p.y));
+        spark.setPoint(2, sf::Vector2f(p.x, p.y + 6.f));
+        spark.setPoint(3, sf::Vector2f(p.x - 4.f, p.y));
+        spark.setFillColor(sf::Color(255, 215, 90));
+        window.draw(spark);
+    }
+}
+
+// Small geometric glyph scattered a few times across a building's face --
+// shared by the Field/Workshop/Dock/ServiceHall archetypes so buildings that
+// share a base shape still read as visually distinct from one another. See
+// the kAccent* constants and accentFor() above for how each id picks one.
+void GameWorld::drawAccentGlyph(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color color) {
+    const sf::Vector2f spots[] = {
+        { b.size.x * 0.28f, b.size.y * 0.42f },
+        { b.size.x * 0.55f, b.size.y * 0.62f },
+        { b.size.x * 0.75f, b.size.y * 0.38f },
+    };
+    for (const auto& s : spots) {
+        sf::Vector2f p = b.position + s;
+        switch (accentKind) {
+        case kAccentCircle: {
+            sf::CircleShape c(6.f);
+            c.setPosition(sf::Vector2f(p.x - 6.f, p.y - 6.f));
+            c.setFillColor(color);
+            c.setOutlineThickness(1.f);
+            c.setOutlineColor(sf::Color(25, 20, 15));
+            window.draw(c);
+            break;
+        }
+        case kAccentDiamond: {
+            sf::ConvexShape d(4);
+            d.setPoint(0, sf::Vector2f(p.x, p.y - 7.f));
+            d.setPoint(1, sf::Vector2f(p.x + 7.f, p.y));
+            d.setPoint(2, sf::Vector2f(p.x, p.y + 7.f));
+            d.setPoint(3, sf::Vector2f(p.x - 7.f, p.y));
+            d.setFillColor(color);
+            d.setOutlineThickness(1.f);
+            d.setOutlineColor(sf::Color(25, 20, 15));
+            window.draw(d);
+            break;
+        }
+        case kAccentTriangle: {
+            sf::ConvexShape t(3);
+            t.setPoint(0, sf::Vector2f(p.x, p.y - 7.f));
+            t.setPoint(1, sf::Vector2f(p.x + 7.f, p.y + 6.f));
+            t.setPoint(2, sf::Vector2f(p.x - 7.f, p.y + 6.f));
+            t.setFillColor(color);
+            t.setOutlineThickness(1.f);
+            t.setOutlineColor(sf::Color(25, 20, 15));
+            window.draw(t);
+            break;
+        }
+        case kAccentCross: {
+            sf::RectangleShape h(sf::Vector2f(12.f, 4.f));
+            h.setPosition(sf::Vector2f(p.x - 6.f, p.y - 2.f));
+            h.setFillColor(color);
+            window.draw(h);
+            sf::RectangleShape v(sf::Vector2f(4.f, 12.f));
+            v.setPosition(sf::Vector2f(p.x - 2.f, p.y - 6.f));
+            v.setFillColor(color);
+            window.draw(v);
+            break;
+        }
+        case kAccentDoubleDot: {
+            sf::CircleShape c1(3.5f);
+            c1.setPosition(sf::Vector2f(p.x - 6.f, p.y - 3.f));
+            c1.setFillColor(color);
+            window.draw(c1);
+            sf::CircleShape c2(3.5f);
+            c2.setPosition(sf::Vector2f(p.x + 2.f, p.y - 3.f));
+            c2.setFillColor(color);
+            window.draw(c2);
+            break;
+        }
+        default: { // kAccentBar
+            sf::RectangleShape bar(sf::Vector2f(14.f, 5.f));
+            bar.setPosition(sf::Vector2f(p.x - 7.f, p.y - 2.5f));
+            bar.setFillColor(color);
+            window.draw(bar);
+            break;
+        }
+        }
+    }
+}
+
+void GameWorld::drawFieldShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor) {
+    sf::RectangleShape plot(b.size);
+    plot.setPosition(b.position);
+    plot.setFillColor(sf::Color(92, 112, 58));
+    plot.setOutlineThickness(2.f);
+    plot.setOutlineColor(sf::Color(25, 20, 15));
+    window.draw(plot);
+
+    for (float x = b.position.x + 6.f; x < b.position.x + b.size.x - 4.f; x += 18.f) {
+        sf::RectangleShape post(sf::Vector2f(4.f, 14.f));
+        post.setPosition(sf::Vector2f(x, b.position.y + b.size.y - 14.f));
+        post.setFillColor(sf::Color(140, 110, 70));
+        window.draw(post);
+    }
+
+    drawAccentGlyph(window, b, accentKind, accentColor);
+}
+
+void GameWorld::drawWorkshopShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor) {
+    float roofH = b.size.y * 0.22f; // flatter lean-to roof, boxier than the Cottage's peaked 0.38
+    sf::Color roofColor = darken(b.labelColor, 0.5f);
+    sf::Color bodyColor = darken(b.labelColor, 0.8f);
+
+    sf::RectangleShape body(sf::Vector2f(b.size.x, b.size.y - roofH));
+    body.setPosition(sf::Vector2f(b.position.x, b.position.y + roofH));
+    body.setFillColor(bodyColor);
+    body.setOutlineThickness(2.f);
+    body.setOutlineColor(sf::Color(25, 20, 15));
+    window.draw(body);
+
+    sf::RectangleShape roof(sf::Vector2f(b.size.x + 12.f, roofH + 6.f));
+    roof.setPosition(sf::Vector2f(b.position.x - 6.f, b.position.y));
+    roof.setFillColor(roofColor);
+    roof.setOutlineThickness(2.f);
+    roof.setOutlineColor(sf::Color(25, 20, 15));
+    window.draw(roof);
+
+    if (smokesFrom(b.id)) {
+        sf::RectangleShape chimney(sf::Vector2f(10.f, 20.f));
+        chimney.setPosition(sf::Vector2f(b.position.x + b.size.x * 0.72f, b.position.y - 20.f));
+        chimney.setFillColor(sf::Color(96, 80, 70));
+        chimney.setOutlineThickness(1.5f);
+        chimney.setOutlineColor(sf::Color(25, 20, 15));
+        window.draw(chimney);
+    }
+
+    drawAccentGlyph(window, b, accentKind, accentColor);
+}
+
+void GameWorld::drawDockShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor) {
+    sf::RectangleShape deck(sf::Vector2f(b.size.x, b.size.y * 0.72f));
+    deck.setPosition(b.position);
+    deck.setFillColor(sf::Color(126, 92, 56));
+    deck.setOutlineThickness(2.f);
+    deck.setOutlineColor(sf::Color(25, 20, 15));
+    window.draw(deck);
+
+    for (float x = b.position.x + 8.f; x < b.position.x + b.size.x - 4.f; x += 14.f) {
+        sf::RectangleShape plank(sf::Vector2f(2.f, b.size.y * 0.72f - 6.f));
+        plank.setPosition(sf::Vector2f(x, b.position.y + 3.f));
+        plank.setFillColor(sf::Color(100, 72, 42));
+        window.draw(plank);
+    }
+
+    sf::RectangleShape water(sf::Vector2f(b.size.x, b.size.y * 0.28f));
+    water.setPosition(sf::Vector2f(b.position.x, b.position.y + b.size.y * 0.72f));
+    water.setFillColor(sf::Color(60, 110, 150));
+    water.setOutlineThickness(2.f);
+    water.setOutlineColor(sf::Color(25, 20, 15));
+    window.draw(water);
+
+    drawAccentGlyph(window, b, accentKind, accentColor);
+}
+
+void GameWorld::drawServiceHallShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor) {
+    sf::Color bodyColor = darken(b.labelColor, 0.82f);
+    sf::RectangleShape body(b.size);
+    body.setPosition(b.position);
+    body.setFillColor(bodyColor);
+    body.setOutlineThickness(2.f);
+    body.setOutlineColor(sf::Color(25, 20, 15));
+    window.draw(body);
+
+    // A row of pillars along the front, civic-hall style.
+    for (int i = 0; i < 4; ++i) {
+        float x = b.position.x + b.size.x * (0.15f + 0.23f * static_cast<float>(i));
+        sf::RectangleShape pillar(sf::Vector2f(8.f, b.size.y - 10.f));
+        pillar.setPosition(sf::Vector2f(x, b.position.y + 6.f));
+        pillar.setFillColor(b.labelColor);
+        window.draw(pillar);
+    }
+
+    // Flagpole + small flag up top.
+    sf::RectangleShape pole(sf::Vector2f(3.f, 22.f));
+    pole.setPosition(sf::Vector2f(b.position.x + b.size.x * 0.5f, b.position.y - 20.f));
+    pole.setFillColor(sf::Color(80, 70, 60));
+    window.draw(pole);
+    sf::ConvexShape flag(3);
+    sf::Vector2f fp(b.position.x + b.size.x * 0.5f + 3.f, b.position.y - 20.f);
+    flag.setPoint(0, fp);
+    flag.setPoint(1, sf::Vector2f(fp.x + 14.f, fp.y + 4.f));
+    flag.setPoint(2, sf::Vector2f(fp.x, fp.y + 8.f));
+    flag.setFillColor(accentColor);
+    window.draw(flag);
+}
+
+void GameWorld::drawLockOverlay(sf::RenderWindow& window, const WorldBuilding& b) {
+    sf::RectangleShape dim(b.size);
+    dim.setPosition(b.position);
+    dim.setFillColor(sf::Color(10, 10, 15, 150));
+    window.draw(dim);
+
+    sf::Vector2f center = b.position + b.size / 2.f;
+    sf::RectangleShape lockBody(sf::Vector2f(20.f, 16.f));
+    lockBody.setPosition(sf::Vector2f(center.x - 10.f, center.y - 2.f));
+    lockBody.setFillColor(sf::Color(225, 205, 110));
+    lockBody.setOutlineThickness(1.5f);
+    lockBody.setOutlineColor(sf::Color(40, 30, 10));
+    window.draw(lockBody);
+
+    sf::CircleShape shackle(8.f);
+    shackle.setFillColor(sf::Color::Transparent);
+    shackle.setOutlineThickness(3.f);
+    shackle.setOutlineColor(sf::Color(225, 205, 110));
+    shackle.setPosition(sf::Vector2f(center.x - 8.f, center.y - 18.f));
+    window.draw(shackle);
+}
+
+void GameWorld::drawBuilding(sf::RenderWindow& window, const WorldBuilding& b) {
+    if (b.id == "farm") drawFarmShape(window, b);
+    else if (b.id == "mine") drawMineShape(window, b);
+    else if (b.id == "lumber") drawLumberShape(window, b);
+    else if (b.id == "quarry") drawQuarryShape(window, b);
+    else if (b.id == "sheep") drawPastureShape(window, b);
+    else if (b.id == "orchard") drawOrchardShape(window, b);
+    else if (b.id == "herbgarden") drawHerbGardenShape(window, b);
+    else if (b.id == "vineyard") drawVineyardShape(window, b);
+    else if (b.id == "goldmine") drawGoldMineShape(window, b);
+    else if (isDockId(b.id)) { BuildingAccent a = accentFor(b.id); drawDockShape(window, b, a.kind, a.color); }
+    else if (isFieldId(b.id)) { BuildingAccent a = accentFor(b.id); drawFieldShape(window, b, a.kind, a.color); }
+    else if (isServiceHallId(b.id)) { BuildingAccent a = accentFor(b.id); drawServiceHallShape(window, b, a.kind, a.color); }
+    else if (b.id == "sleep" || b.id == "eat" || b.id == "doctor") drawCottageShape(window, b);
+    else { BuildingAccent a = accentFor(b.id); drawWorkshopShape(window, b, a.kind, a.color); } // every remaining tier-2/3 processor
+
+    if (game_.isBusinessLocked(b.id)) drawLockOverlay(window, b);
+
+    if (fontLoaded_) {
+        sf::Text text(font_, toSfString(Localization::t(b.labelKey)), 13);
+        sf::FloatRect bounds = text.getLocalBounds();
+        text.setPosition(sf::Vector2f(b.position.x + b.size.x / 2.f - bounds.size.x / 2.f, b.position.y - 26.f));
+        text.setFillColor(b.labelColor);
+        text.setOutlineColor(sf::Color::Black);
+        text.setOutlineThickness(2.f);
+        text.setStyle(sf::Text::Bold);
+        window.draw(text);
+    }
+}
+
+void GameWorld::drawTree(sf::RenderWindow& window, sf::Vector2f pos) {
+    sf::RectangleShape trunk(sf::Vector2f(8.f, 14.f));
+    trunk.setPosition(sf::Vector2f(pos.x - 4.f, pos.y));
+    trunk.setFillColor(sf::Color(96, 64, 32));
+    window.draw(trunk);
+
+    // Canopy color follows the season -- fresh light green in Spring, the
+    // original deep green as Summer's full-bloom baseline, warm orange/red
+    // in Autumn, pale/bare in Winter. Same flat-shape look, just a different
+    // fill/outline pair per season (no gradients).
+    sf::Color canopyFill, canopyOutline;
+    switch (game_.currentSeason()) {
+    case Season::Spring: canopyFill = sf::Color(96, 178, 98);  canopyOutline = sf::Color(50, 130, 52);  break;
+    case Season::Autumn: canopyFill = sf::Color(198, 122, 42); canopyOutline = sf::Color(140, 80, 20);  break;
+    case Season::Winter: canopyFill = sf::Color(222, 226, 230); canopyOutline = sf::Color(150, 150, 160); break;
+    default:             canopyFill = sf::Color(34, 104, 44);  canopyOutline = sf::Color(16, 60, 24);   break; // Summer
+    }
+    sf::CircleShape canopy(kTreeRadius);
+    canopy.setPosition(sf::Vector2f(pos.x - kTreeRadius, pos.y - kTreeRadius * 1.6f));
+    canopy.setFillColor(canopyFill);
+    canopy.setOutlineThickness(1.5f);
+    canopy.setOutlineColor(canopyOutline);
+    window.draw(canopy);
+}
+
+void GameWorld::drawBush(sf::RenderWindow& window, sf::Vector2f pos) {
+    sf::Color fill;
+    switch (game_.currentSeason()) {
+    case Season::Spring: fill = sf::Color(122, 192, 112); break;
+    case Season::Autumn: fill = sf::Color(172, 112, 50);  break;
+    case Season::Winter: fill = sf::Color(202, 206, 212); break;
+    default:             fill = sf::Color(54, 132, 62);   break; // Summer
+    }
+    sf::CircleShape bush(9.f);
+    bush.setPosition(pos);
+    bush.setFillColor(fill);
+    window.draw(bush);
+}
+
+void GameWorld::drawNpc(sf::RenderWindow& window, const Npc& npc) {
+    sf::CircleShape body(kPlayerSize / 2.f);
+    body.setPosition(npc.pos - sf::Vector2f(kPlayerSize / 2.f, kPlayerSize / 2.f));
+    body.setFillColor(npc.color);
+    body.setOutlineThickness(2.f);
+    body.setOutlineColor(sf::Color(25, 20, 15));
+    window.draw(body);
+
+    if (fontLoaded_) {
+        sf::Text text(font_, toSfString(Localization::t(npc.nameKey)), 12);
+        sf::FloatRect bounds = text.getLocalBounds();
+        text.setPosition(sf::Vector2f(npc.pos.x - bounds.size.x / 2.f, npc.pos.y - kPlayerSize));
+        text.setFillColor(sf::Color::White);
+        text.setOutlineColor(sf::Color::Black);
+        text.setOutlineThickness(2.f);
+        window.draw(text);
+    }
+}
+
+void GameWorld::drawZone(sf::RenderWindow& window) {
+    const Zone& z = zones_[currentZone_];
+
+    for (const auto& d : z.decorations) {
+        if (d.kind == Decoration::Kind::GrassPatch) {
+            sf::RectangleShape patch(d.size);
+            patch.setPosition(d.position);
+            patch.setFillColor(sf::Color(40, 122, 50, 120));
+            window.draw(patch);
+        } else if (d.kind == Decoration::Kind::Path) {
+            sf::RectangleShape path(d.size);
+            path.setPosition(d.position);
+            path.setFillColor(sf::Color(176, 152, 104));
+            window.draw(path);
+        } else if (d.kind == Decoration::Kind::Water) {
+            sf::RectangleShape water(d.size);
+            water.setPosition(d.position);
+            water.setFillColor(sf::Color(48, 92, 130));
+            window.draw(water);
+
+            // A few slow, phase-offset sine "ripples" -- purely cosmetic,
+            // driven by waterWaveTimer_ (see run()'s per-frame update).
+            constexpr int kWaveLines = 4;
+            for (int i = 0; i < kWaveLines; ++i) {
+                float rowY = d.position.y + d.size.y * (0.25f + 0.2f * static_cast<float>(i));
+                float phase = waterWaveTimer_ * 1.2f + static_cast<float>(i) * 1.7f;
+                std::vector<sf::Vertex> verts;
+                for (float x = d.position.x; x <= d.position.x + d.size.x; x += 24.f) {
+                    float wobble = std::sin(phase + x * 0.02f) * 3.f;
+                    verts.push_back(sf::Vertex{ sf::Vector2f(x, rowY + wobble), sf::Color(120, 170, 200, 160) });
+                }
+                if (verts.size() >= 2) window.draw(verts.data(), verts.size(), sf::PrimitiveType::LineStrip);
+            }
+        }
+    }
+    for (const auto& d : z.decorations) if (d.kind == Decoration::Kind::Bush) drawBush(window, d.position);
+    for (const auto& f : z.forageables) drawForageable(window, f);
+    for (const auto& b : z.buildings) drawBuilding(window, b);
+    for (const auto& npc : z.npcs) drawNpc(window, npc);
+    for (const auto& d : z.decorations) if (d.kind == Decoration::Kind::Tree) drawTree(window, d.position);
+}
+
+void GameWorld::drawLegend(sf::RenderWindow& window) {
+    if (!fontLoaded_) return;
+    struct Row { sf::Color color; std::string key; };
+    const Row rows[] = {
+        { kTier1, "legend_tier1" },
+        { kTier2, "legend_tier2" },
+        { kTier3, "legend_tier3" },
+        { kService, "legend_service" },
+        { sf::Color(210, 80, 80), "legend_npc" },
+    };
+
+    float panelW = 230.f;
+    float panelH = 22.f + 5 * 22.f;
+    sf::RectangleShape bg(sf::Vector2f(panelW, panelH));
+    bg.setPosition(sf::Vector2f(10.f, 10.f));
+    bg.setFillColor(sf::Color(0, 0, 0, 150));
+    window.draw(bg);
+
+    sf::Text title(font_, toSfString(Localization::t("legend_title")), 14);
+    title.setPosition(sf::Vector2f(18.f, 14.f));
+    title.setFillColor(sf::Color::White);
+    window.draw(title);
+
+    float y = 38.f;
+    for (const auto& row : rows) {
+        sf::RectangleShape swatch(sf::Vector2f(14.f, 14.f));
+        swatch.setPosition(sf::Vector2f(18.f, y));
+        swatch.setFillColor(row.color);
+        swatch.setOutlineThickness(1.f);
+        swatch.setOutlineColor(sf::Color(20, 20, 20));
+        window.draw(swatch);
+
+        sf::Text label(font_, toSfString(Localization::t(row.key)), 13);
+        label.setPosition(sf::Vector2f(38.f, y - 2.f));
+        label.setFillColor(sf::Color::White);
+        window.draw(label);
+        y += 22.f;
+    }
+}
+
+void GameWorld::drawMinimap(sf::RenderWindow& window) {
+    // Fixed layout matching the zones' actual relationship: Mining District
+    // is north of Town Square, Farmlands is east of it, Valley District is
+    // west of it, Harbor District is south of it, and Highlands District is
+    // further north beyond Mining. Positioned below the Legend panel (which
+    // occupies roughly (10,10)-(240,142)) so the two never overlap -- only
+    // drawn at all while showMinimap_ is true (toggled with M).
+    constexpr float panelX = 10.f, panelY = 152.f;
+    constexpr float panelW = 290.f, panelH = 292.f;
+    sf::RectangleShape bg(sf::Vector2f(panelW, panelH));
+    bg.setPosition(sf::Vector2f(panelX, panelY));
+    bg.setFillColor(sf::Color(0, 0, 0, 150));
+    window.draw(bg);
+
+    const sf::Vector2f boxSize(60.f, 44.f);
+    const sf::Vector2f highlandsPos(panelX + 148.f, panelY + 14.f);
+    const sf::Vector2f miningPos(panelX + 148.f, panelY + 76.f);
+    const sf::Vector2f townPos(panelX + 148.f, panelY + 138.f);
+    const sf::Vector2f farmPos(panelX + 220.f, panelY + 138.f);
+    const sf::Vector2f valleyPos(panelX + 76.f, panelY + 138.f);
+    const sf::Vector2f harborPos(panelX + 148.f, panelY + 200.f);
+
+    sf::Vertex vline[] = {
+        sf::Vertex{ sf::Vector2f(townPos.x + boxSize.x / 2.f, townPos.y), sf::Color(210, 210, 210) },
+        sf::Vertex{ sf::Vector2f(miningPos.x + boxSize.x / 2.f, miningPos.y + boxSize.y), sf::Color(210, 210, 210) },
+    };
+    window.draw(vline, 2, sf::PrimitiveType::Lines);
+
+    sf::Vertex vlineNorth[] = {
+        sf::Vertex{ sf::Vector2f(miningPos.x + boxSize.x / 2.f, miningPos.y), sf::Color(210, 210, 210) },
+        sf::Vertex{ sf::Vector2f(highlandsPos.x + boxSize.x / 2.f, highlandsPos.y + boxSize.y), sf::Color(210, 210, 210) },
+    };
+    window.draw(vlineNorth, 2, sf::PrimitiveType::Lines);
+
+    sf::Vertex vlineSouth[] = {
+        sf::Vertex{ sf::Vector2f(townPos.x + boxSize.x / 2.f, townPos.y + boxSize.y), sf::Color(210, 210, 210) },
+        sf::Vertex{ sf::Vector2f(harborPos.x + boxSize.x / 2.f, harborPos.y), sf::Color(210, 210, 210) },
+    };
+    window.draw(vlineSouth, 2, sf::PrimitiveType::Lines);
+
+    sf::Vertex hlineEast[] = {
+        sf::Vertex{ sf::Vector2f(townPos.x + boxSize.x, townPos.y + boxSize.y / 2.f), sf::Color(210, 210, 210) },
+        sf::Vertex{ sf::Vector2f(farmPos.x, farmPos.y + boxSize.y / 2.f), sf::Color(210, 210, 210) },
+    };
+    window.draw(hlineEast, 2, sf::PrimitiveType::Lines);
+
+    sf::Vertex hlineWest[] = {
+        sf::Vertex{ sf::Vector2f(valleyPos.x + boxSize.x, valleyPos.y + boxSize.y / 2.f), sf::Color(210, 210, 210) },
+        sf::Vertex{ sf::Vector2f(townPos.x, townPos.y + boxSize.y / 2.f), sf::Color(210, 210, 210) },
+    };
+    window.draw(hlineWest, 2, sf::PrimitiveType::Lines);
+
+    // Non-current boxes are outlined in a subtle per-zone theme color instead
+    // of a flat grey, so the map reads at a glance even before walking there;
+    // the current zone still always overrides to the same gold highlight.
+    auto drawZoneBox = [&](sf::Vector2f pos, int zoneIndex, const char* labelKey, sf::Color themeColor) {
+        bool isCurrent = zoneIndex == currentZone_;
+        sf::RectangleShape box(boxSize);
+        box.setPosition(pos);
+        box.setFillColor(isCurrent ? sf::Color(90, 150, 90) : sf::Color(65, 65, 75));
+        box.setOutlineThickness(isCurrent ? 3.f : 1.5f);
+        box.setOutlineColor(isCurrent ? sf::Color(232, 212, 120) : themeColor);
+        window.draw(box);
+        if (fontLoaded_) {
+            sf::Text label(font_, toSfString(Localization::t(labelKey)), 10);
+            sf::FloatRect b = label.getLocalBounds();
+            label.setPosition(sf::Vector2f(pos.x + boxSize.x / 2.f - b.size.x / 2.f, pos.y + boxSize.y / 2.f - 8.f));
+            label.setFillColor(sf::Color::White);
+            window.draw(label);
+        }
+    };
+
+    drawZoneBox(highlandsPos, 5, "zone_highlands", sf::Color(110, 190, 120));   // pastoral green
+    drawZoneBox(miningPos, 2, "zone_mining", sf::Color(160, 140, 120));         // rock/ore brown
+    drawZoneBox(townPos, 0, "zone_town_square", sf::Color(200, 190, 160));     // neutral civic tan
+    drawZoneBox(farmPos, 1, "zone_farmlands", sf::Color(200, 190, 100));       // wheat gold
+    drawZoneBox(valleyPos, 3, "zone_valley", sf::Color(180, 140, 200));        // orchard/vineyard purple
+    drawZoneBox(harborPos, 4, "zone_harbor", sf::Color(100, 160, 210));        // marine blue
+}
+
+void GameWorld::drawHud(sf::RenderWindow& window) {
+    sf::Vector2u winSize = window.getSize();
+    sf::RectangleShape bg(sf::Vector2f(static_cast<float>(winSize.x), 54.f));
+    bg.setPosition(sf::Vector2f(0.f, static_cast<float>(winSize.y) - 54.f));
+    bg.setFillColor(sf::Color(0, 0, 0, 150));
+    window.draw(bg);
+
+    if (!fontLoaded_) return;
+
+    std::ostringstream oss;
+    oss << Localization::t("hud_generation") << " " << game_.generation()
+        << "   " << Localization::t("hud_cash") << ": $" << std::fixed << std::setprecision(2) << game_.money()
+        << "   " << Localization::t("hud_age") << ": " << std::fixed << std::setprecision(1) << game_.ageYears() << " " << Localization::t("hud_years")
+        << "   " << Localization::t("hud_season_prefix") << Localization::t(seasonKey(game_.currentSeason()))
+        << " " << Localization::t(seasonEffectKey(game_.currentSeason()))
+        << Localization::t("hud_days_until_season_prefix") << game_.daysUntilNextSeason() << Localization::t("hud_days_until_season_suffix")
+        << "   |   " << Localization::t(zones_[currentZone_].nameKey);
+    if (double upkeep = game_.upkeepPerSecond(); upkeep > 0.0) {
+        oss << "   " << Localization::t("status_upkeep_prefix") << std::fixed << std::setprecision(3) << upkeep << "/s";
+    }
+    oss << "\n" << applyKeyPlaceholders(Localization::t("hud_help"));
+
+    sf::Text hud(font_, toSfString(oss.str()), 14);
+    hud.setPosition(sf::Vector2f(10.f, static_cast<float>(winSize.y) - 46.f));
+    hud.setFillColor(sf::Color::White);
+    window.draw(hud);
+
+    // World-view toast (e.g. the locked-building hint) for feedback set
+    // while no overlay is open. Overlays render overlayFeedback_ themselves
+    // at the bottom of their own panel, so only show it here when there's no
+    // overlay to have already done that -- otherwise it'd render twice.
+    if (currentOverlay_ == OverlayKind::None && !overlayFeedback_.empty()) {
+        sf::Text toast(font_, toSfString(overlayFeedback_), 16);
+        toast.setStyle(sf::Text::Bold);
+        sf::FloatRect bounds = toast.getLocalBounds();
+        toast.setPosition(sf::Vector2f(static_cast<float>(winSize.x) / 2.f - bounds.size.x / 2.f - bounds.position.x,
+            static_cast<float>(winSize.y) - 96.f));
+        toast.setFillColor(overlayFeedbackColor_);
+        toast.setOutlineColor(sf::Color::Black);
+        toast.setOutlineThickness(2.f);
+        window.draw(toast);
+    }
+}
+
+void GameWorld::drawNetWorthPanel(sf::RenderWindow& window) {
+    constexpr float panelW = 220.f, panelH = 120.f;
+    float panelX = static_cast<float>(windowSize_.x) - panelW - 10.f;
+    float panelY = static_cast<float>(windowSize_.y) - 54.f - panelH - 10.f; // just above the HUD bar
+
+    sf::RectangleShape bg(sf::Vector2f(panelW, panelH));
+    bg.setPosition(sf::Vector2f(panelX, panelY));
+    bg.setFillColor(sf::Color(0, 0, 0, 150));
+    window.draw(bg);
+
+    if (!fontLoaded_) return;
+
+    sf::Text title(font_, toSfString(Localization::t("networth_panel_title")), 13);
+    title.setPosition(sf::Vector2f(panelX + 10.f, panelY + 8.f));
+    title.setFillColor(sf::Color::White);
+    window.draw(title);
+
+    if (moneyHistory_.size() >= 2) {
+        float minV = *std::min_element(moneyHistory_.begin(), moneyHistory_.end());
+        float maxV = *std::max_element(moneyHistory_.begin(), moneyHistory_.end());
+        if (maxV - minV < 1.f) maxV = minV + 1.f; // flat history -- avoid a divide-by-zero, draw a flat line instead
+
+        float graphX = panelX + 10.f, graphY = panelY + 32.f;
+        float graphW = panelW - 20.f, graphH = panelH - 60.f;
+
+        std::vector<sf::Vertex> verts;
+        verts.reserve(moneyHistory_.size());
+        for (size_t i = 0; i < moneyHistory_.size(); ++i) {
+            float t = static_cast<float>(i) / static_cast<float>(moneyHistory_.size() - 1);
+            float norm = (moneyHistory_[i] - minV) / (maxV - minV);
+            verts.push_back(sf::Vertex{
+                sf::Vector2f(graphX + t * graphW, graphY + graphH - norm * graphH),
+                sf::Color(130, 220, 150) });
+        }
+        window.draw(verts.data(), verts.size(), sf::PrimitiveType::LineStrip);
+    }
+
+    sf::Text current(font_, toSfString("$" + formatNumber(game_.money())), 14);
+    current.setStyle(sf::Text::Bold);
+    current.setPosition(sf::Vector2f(panelX + 10.f, panelY + panelH - 24.f));
+    current.setFillColor(sf::Color(150, 230, 150));
+    window.draw(current);
+}
+
+void GameWorld::updateDayNightAndWeather(float dt) {
+    dayNightTimer_ += dt;
+    if (dayNightTimer_ >= kDayNightCycleSeconds) dayNightTimer_ -= kDayNightCycleSeconds;
+
+    if (raining_) rainTime_ += dt;
+    seasonalAmbientTimer_ += dt; // drives drawSeasonalAmbient -- its own accumulator, independent of rainTime_
+
+    weatherCheckTimer_ -= dt;
+    if (weatherCheckTimer_ <= 0.f) {
+        if (raining_) {
+            raining_ = false;
+            weatherCheckTimer_ = randRange(60.f, 140.f); // clear spell before the next roll
+            if (ambientRainSound_) ambientRainSound_->stop();
+        } else if (randRange(0.f, 1.f) < 0.35f) {
+            raining_ = true;
+            weatherCheckTimer_ = randRange(20.f, 45.f); // rain duration
+            if (ambientRainSound_) ambientRainSound_->play();
+        } else {
+            weatherCheckTimer_ = randRange(30.f, 60.f); // try again soon
+        }
+    }
+}
+
+sf::Color GameWorld::dayNightTint() const {
+    // Four flat-color keyframes cycled through smoothly: dawn -> day (no
+    // tint) -> dusk -> night -> back to dawn. Deliberately just a linear
+    // blend between two RGBA keyframes, no gradients/glow, to match the
+    // rest of the world's plain-shape look.
+    struct Key { float t; std::uint8_t r, g, b, a; };
+    static const Key keys[] = {
+        { 0.00f, 255, 200, 150, 55 },  // dawn
+        { 0.25f, 255, 255, 255, 0 },   // day
+        { 0.50f, 255, 150, 90, 60 },   // dusk
+        { 0.75f, 25, 35, 80, 130 },    // night
+        { 1.00f, 255, 200, 150, 55 },  // wraps back to dawn
+    };
+    float t = dayNightTimer_ / kDayNightCycleSeconds;
+    for (int i = 0; i < 4; ++i) {
+        if (t < keys[i].t || t > keys[i + 1].t) continue;
+        float span = keys[i + 1].t - keys[i].t;
+        float local = span > 0.f ? (t - keys[i].t) / span : 0.f;
+        auto lerp = [&](std::uint8_t a, std::uint8_t b) {
+            return static_cast<std::uint8_t>(static_cast<float>(a) + (static_cast<float>(b) - static_cast<float>(a)) * local);
+        };
+        return sf::Color(lerp(keys[i].r, keys[i + 1].r), lerp(keys[i].g, keys[i + 1].g), lerp(keys[i].b, keys[i + 1].b), lerp(keys[i].a, keys[i + 1].a));
+    }
+    return sf::Color(255, 255, 255, 0);
+}
+
+sf::Color GameWorld::seasonTint() const {
+    // Deliberately very low alpha (14-26) -- a hint of color, not a filter
+    // over the whole scene; layered on top of the day/night tint below.
+    switch (game_.currentSeason()) {
+    case Season::Spring: return sf::Color(140, 220, 150, 18);
+    case Season::Summer: return sf::Color(255, 230, 120, 14);
+    case Season::Autumn: return sf::Color(210, 140, 60, 22);
+    default:             return sf::Color(150, 190, 230, 26); // Winter
+    }
+}
+
+void GameWorld::drawDayNightOverlay(sf::RenderWindow& window) {
+    sf::RectangleShape tint(sf::Vector2f(static_cast<float>(windowSize_.x), static_cast<float>(windowSize_.y)));
+    tint.setFillColor(dayNightTint());
+    window.draw(tint);
+
+    sf::RectangleShape season(sf::Vector2f(static_cast<float>(windowSize_.x), static_cast<float>(windowSize_.y)));
+    season.setFillColor(seasonTint());
+    window.draw(season);
+}
+
+void GameWorld::drawWeather(sf::RenderWindow& window) {
+    if (!raining_) return;
+    // Winter re-skins the same rain roll as snow instead of adding a
+    // separate precipitation system -- still just "raining_ is true"
+    // underneath, only how it's drawn changes.
+    bool snowing = (game_.currentSeason() == Season::Winter);
+
+    if (snowing) {
+        for (int i = 0; i < kRainDropCount; ++i) {
+            float laneX = std::fmod(static_cast<float>(i) * 137.f, static_cast<float>(windowSize_.x));
+            float fallSpeed = 70.f;
+            float y = std::fmod(rainTime_ * fallSpeed + static_cast<float>(i) * 53.f, static_cast<float>(windowSize_.y) + 20.f) - 20.f;
+            float drift = std::sin(rainTime_ * 0.6f + static_cast<float>(i)) * 18.f;
+            sf::CircleShape flake(2.5f);
+            flake.setPosition(sf::Vector2f(laneX + drift, y));
+            flake.setFillColor(sf::Color(255, 255, 255, 190));
+            window.draw(flake);
+        }
+        return;
+    }
+
+    // Deterministic pseudo-scatter (no stored per-drop state): each drop's
+    // lane and phase come from its index, so this needs only one accumulator.
+    std::vector<sf::Vertex> verts;
+    verts.reserve(kRainDropCount * 2);
+    sf::Color dropColor(170, 190, 215, 130);
+    for (int i = 0; i < kRainDropCount; ++i) {
+        float laneX = std::fmod(static_cast<float>(i) * 137.f, static_cast<float>(windowSize_.x));
+        float fallSpeed = 500.f;
+        float y = std::fmod(rainTime_ * fallSpeed + static_cast<float>(i) * 53.f, static_cast<float>(windowSize_.y) + 20.f) - 20.f;
+        verts.push_back(sf::Vertex{ sf::Vector2f(laneX, y), dropColor });
+        verts.push_back(sf::Vertex{ sf::Vector2f(laneX - 5.f, y + 16.f), dropColor });
+    }
+    window.draw(verts.data(), verts.size(), sf::PrimitiveType::Lines);
+}
+
+void GameWorld::drawSeasonalAmbient(sf::RenderWindow& window) {
+    // Always-on, deliberately sparse per-season ambience -- distinct from
+    // drawWeather's occasional rain/snow "event" above: this runs every
+    // frame regardless of raining_, using the same deterministic
+    // index-driven fmod trick (own accumulator, seasonalAmbientTimer_, so it
+    // never shares a timeline with actual rain/snow).
+    float w = static_cast<float>(windowSize_.x);
+    float h = static_cast<float>(windowSize_.y);
+
+    switch (game_.currentSeason()) {
+    case Season::Winter: {
+        constexpr int kCount = 24;
+        for (int i = 0; i < kCount; ++i) {
+            float laneX = std::fmod(static_cast<float>(i) * 149.f, w);
+            float y = std::fmod(seasonalAmbientTimer_ * 34.f + static_cast<float>(i) * 61.f, h + 20.f) - 20.f;
+            float drift = std::sin(seasonalAmbientTimer_ * 0.5f + static_cast<float>(i)) * 14.f;
+            sf::RectangleShape flake(sf::Vector2f(4.f, 4.f));
+            flake.setPosition(sf::Vector2f(laneX + drift, y));
+            flake.setFillColor(sf::Color(255, 255, 255, 170));
+            window.draw(flake);
+        }
+        break;
+    }
+    case Season::Autumn: {
+        constexpr int kCount = 24;
+        const sf::Color leafColors[3] = { sf::Color(200, 110, 40, 205), sf::Color(190, 60, 40, 205), sf::Color(212, 172, 50, 205) };
+        for (int i = 0; i < kCount; ++i) {
+            float laneX = std::fmod(static_cast<float>(i) * 163.f, w);
+            float y = std::fmod(seasonalAmbientTimer_ * 22.f + static_cast<float>(i) * 71.f, h + 20.f) - 20.f;
+            float drift = std::sin(seasonalAmbientTimer_ * 0.8f + static_cast<float>(i) * 1.3f) * 36.f; // wider sway -- tumbling, not just falling
+            sf::RectangleShape leaf(sf::Vector2f(6.f, 6.f));
+            leaf.setPosition(sf::Vector2f(laneX + drift, y));
+            leaf.setFillColor(leafColors[i % 3]);
+            leaf.setRotation(sf::degrees(std::fmod(seasonalAmbientTimer_ * 40.f + static_cast<float>(i) * 30.f, 360.f)));
+            window.draw(leaf);
+        }
+        break;
+    }
+    case Season::Spring: {
+        constexpr int kCount = 20;
+        for (int i = 0; i < kCount; ++i) {
+            float laneX = std::fmod(static_cast<float>(i) * 173.f, w);
+            float y = std::fmod(seasonalAmbientTimer_ * 16.f + static_cast<float>(i) * 47.f, h + 20.f) - 20.f; // slowest fall of the four -- petals/pollen, not rain
+            float drift = std::sin(seasonalAmbientTimer_ * 0.4f + static_cast<float>(i) * 0.7f) * 22.f;
+            sf::RectangleShape petal(sf::Vector2f(4.f, 4.f));
+            petal.setPosition(sf::Vector2f(laneX + drift, y));
+            petal.setFillColor(sf::Color(250, 210, 225, 190));
+            window.draw(petal);
+        }
+        break;
+    }
+    case Season::Summer: {
+        // Rises instead of falls -- heat haze/dust, the one season that reads
+        // as "up" rather than "down" so all four are visually distinct at a glance.
+        constexpr int kCount = 18;
+        constexpr float kCycle = 860.f; // taller than the window so motes fully clear the top before wrapping
+        for (int i = 0; i < kCount; ++i) {
+            float laneX = std::fmod(static_cast<float>(i) * 181.f, w);
+            float progress = std::fmod(seasonalAmbientTimer_ * 18.f + static_cast<float>(i) * 59.f, kCycle);
+            float y = h - progress + 20.f;
+            float drift = std::sin(seasonalAmbientTimer_ * 0.6f + static_cast<float>(i) * 0.9f) * 10.f;
+            float tNorm = progress / kCycle;
+            std::uint8_t alpha = static_cast<std::uint8_t>(160.f * (1.f - std::fabs(2.f * tNorm - 1.f))); // fades in, peaks mid-screen, fades out
+            sf::RectangleShape mote(sf::Vector2f(3.f, 3.f));
+            mote.setPosition(sf::Vector2f(laneX + drift, y));
+            mote.setFillColor(sf::Color(250, 230, 140, alpha));
+            window.draw(mote);
+        }
+        break;
+    }
+    }
+}
+
+void GameWorld::updateSeasonTransition(float dt) {
+    if (!seasonTransitionActive_) return;
+    seasonTransitionTimer_ += dt;
+    if (seasonTransitionTimer_ >= kSeasonTransitionDuration) {
+        seasonTransitionActive_ = false;
+        seasonTransitionTimer_ = 0.f;
+    }
+}
+
+void GameWorld::drawSeasonTransitionOverlay(sf::RenderWindow& window) {
+    if (!seasonTransitionActive_) return;
+
+    // More saturated than seasonTint()'s barely-there wash -- this is meant
+    // to read clearly as "the season just changed", not blend into the scene.
+    auto transitionColor = [](Season s) {
+        switch (s) {
+        case Season::Spring: return sf::Color(90, 195, 115);
+        case Season::Summer: return sf::Color(245, 195, 60);
+        case Season::Autumn: return sf::Color(205, 105, 40);
+        default:             return sf::Color(105, 165, 225); // Winter
+        }
+    };
+
+    // Three color-block bars sweep down to fully cover the screen, hold with
+    // the season's name, then continue sweeping down and off -- staggered
+    // per bar (kStagger) so it reads as a cascade rather than one flat panel
+    // popping in/out. Linear interpolation throughout, no easing curves, to
+    // match the rest of the game's flat-shape/no-gradient look.
+    constexpr float kCoverDur = 0.5f, kHoldDur = 0.6f, kUncoverDur = 0.5f;
+    constexpr int kBars = 3;
+    constexpr float kStagger = 0.1f;
+    float w = static_cast<float>(windowSize_.x), h = static_cast<float>(windowSize_.y);
+    float barW = w / static_cast<float>(kBars);
+    float t = seasonTransitionTimer_;
+    sf::Color color = transitionColor(seasonTransitionTo_);
+
+    for (int i = 0; i < kBars; ++i) {
+        float y;
+        if (t < kCoverDur) {
+            float localDur = kCoverDur - static_cast<float>(kBars - 1) * kStagger;
+            float localT = std::clamp((t - static_cast<float>(i) * kStagger) / localDur, 0.f, 1.f);
+            y = -h + h * localT; // slides down from fully above the screen to y=0 (covering)
+        } else if (t < kCoverDur + kHoldDur) {
+            y = 0.f;
+        } else {
+            float localDur = kUncoverDur - static_cast<float>(kBars - 1) * kStagger;
+            float localT = std::clamp((t - (kCoverDur + kHoldDur) - static_cast<float>(i) * kStagger) / localDur, 0.f, 1.f);
+            y = h * localT; // continues down and off the bottom of the screen
+        }
+        sf::RectangleShape bar(sf::Vector2f(barW + 1.f, h)); // +1px overlap so adjacent bars never show a hairline seam
+        bar.setPosition(sf::Vector2f(static_cast<float>(i) * barW, y));
+        bar.setFillColor((i % 2 == 0) ? color : darken(color, 0.8f)); // alternating shade so it doesn't read as one flat rectangle
+        window.draw(bar);
+    }
+
+    if (t >= kCoverDur && t < kCoverDur + kHoldDur && fontLoaded_) {
+        sf::Text label(font_, toSfString(Localization::t(seasonKey(seasonTransitionTo_))), 42);
+        sf::FloatRect b = label.getLocalBounds();
+        label.setPosition(sf::Vector2f(w / 2.f - b.size.x / 2.f - b.position.x, h / 2.f - b.size.y / 2.f - b.position.y));
+        label.setFillColor(sf::Color(255, 255, 255, 235));
+        label.setStyle(sf::Text::Bold);
+        window.draw(label);
+    }
+}
+
+void GameWorld::drawAchievementsButton(sf::RenderWindow& window) {
+    sf::FloatRect rect = achievementsButtonBounds();
+    sf::RectangleShape btn(rect.size);
+    btn.setPosition(rect.position);
+    btn.setFillColor(sf::Color(72, 58, 112));
+    btn.setOutlineThickness(2.f);
+    btn.setOutlineColor(sf::Color(232, 212, 120));
+    window.draw(btn);
+
+    if (!fontLoaded_) return;
+    sf::Text label(font_, toSfString(Localization::t("achievements_button")), 15);
+    sf::FloatRect bounds = label.getLocalBounds();
+    label.setPosition(sf::Vector2f(rect.position.x + rect.size.x / 2.f - bounds.size.x / 2.f, rect.position.y + rect.size.y / 2.f - 11.f));
+    label.setFillColor(sf::Color(232, 212, 120));
+    window.draw(label);
+}
+
+void GameWorld::drawUpdateBanner(sf::RenderWindow& window) {
+    if (!updateAvailable_ || updateBannerDismissed_) return;
+
+    sf::Vector2f pos(10.f, static_cast<float>(windowSize_.y) - 54.f - 44.f), size(420.f, 36.f);
+    sf::RectangleShape bg(size);
+    bg.setPosition(pos);
+    bg.setFillColor(sf::Color(60, 90, 60, 235));
+    bg.setOutlineThickness(2.f);
+    bg.setOutlineColor(sf::Color(150, 220, 150));
+    window.draw(bg);
+
+    uiText(window, { pos.x + 10.f, pos.y + 9.f },
+        Localization::t("update_banner_prefix") + updateLatestVersion_, 13, sf::Color(220, 250, 220));
+
+    uiButton(window, { pos.x + size.x - 170.f, pos.y + 3.f }, { 100.f, 30.f }, Localization::t("update_banner_open_button"),
+        [this]() {
+#ifdef _WIN32
+            if (!updateReleaseUrl_.empty()) {
+                ShellExecuteW(nullptr, L"open", toSfString(updateReleaseUrl_).toWideString().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            }
+#endif
+        });
+    uiButton(window, { pos.x + size.x - 62.f, pos.y + 3.f }, { 52.f, 30.f }, Localization::t("update_banner_dismiss_button"),
+        [this]() { updateBannerDismissed_ = true; });
+}
+
+void GameWorld::drawHowToPlayButton(sf::RenderWindow& window) {
+    sf::FloatRect rect = howToPlayButtonBounds();
+    sf::RectangleShape btn(rect.size);
+    btn.setPosition(rect.position);
+    btn.setFillColor(sf::Color(72, 58, 112));
+    btn.setOutlineThickness(2.f);
+    btn.setOutlineColor(sf::Color(232, 212, 120));
+    window.draw(btn);
+
+    if (!fontLoaded_) return;
+    sf::Text label(font_, toSfString(Localization::t("howtoplay_button")), 15);
+    sf::FloatRect bounds = label.getLocalBounds();
+    label.setPosition(sf::Vector2f(rect.position.x + rect.size.x / 2.f - bounds.size.x / 2.f, rect.position.y + rect.size.y / 2.f - 11.f));
+    label.setFillColor(sf::Color(232, 212, 120));
+    window.draw(label);
+}
+
+void GameWorld::drawTutorial(sf::RenderWindow& window) {
+    window.clear(sf::Color(22, 24, 30));
+    if (!fontLoaded_) {
+        window.display();
+        return;
+    }
+
+    sf::Vector2u winSize = window.getSize();
+    sf::RectangleShape panel(sf::Vector2f(760.f, 340.f));
+    panel.setPosition(sf::Vector2f((static_cast<float>(winSize.x) - 760.f) / 2.f, (static_cast<float>(winSize.y) - 340.f) / 2.f));
+    panel.setFillColor(sf::Color(40, 44, 56));
+    panel.setOutlineThickness(3.f);
+    panel.setOutlineColor(sf::Color(232, 212, 120));
+    window.draw(panel);
+
+    sf::Text title(font_, toSfString(Localization::t("tutorial_title")), 26);
+    title.setStyle(sf::Text::Bold);
+    sf::FloatRect titleBounds = title.getLocalBounds();
+    title.setPosition(sf::Vector2f(panel.getPosition().x + panel.getSize().x / 2.f - titleBounds.size.x / 2.f, panel.getPosition().y + 26.f));
+    title.setFillColor(sf::Color(232, 212, 120));
+    window.draw(title);
+
+    sf::Text body(font_, toSfString(applyKeyPlaceholders(Localization::t("tutorial_body"))), 17);
+    body.setPosition(sf::Vector2f(panel.getPosition().x + 36.f, panel.getPosition().y + 90.f));
+    body.setFillColor(sf::Color::White);
+    body.setLineSpacing(1.35f);
+    window.draw(body);
+
+    sf::Text cont(font_, toSfString(Localization::t("tutorial_continue")), 15);
+    sf::FloatRect contBounds = cont.getLocalBounds();
+    cont.setPosition(sf::Vector2f(panel.getPosition().x + panel.getSize().x / 2.f - contBounds.size.x / 2.f, panel.getPosition().y + panel.getSize().y - 42.f));
+    cont.setFillColor(sf::Color(200, 200, 200));
+    window.draw(cont);
+
+    window.display();
+}
+
+sf::FloatRect GameWorld::uiPanelBg(sf::RenderWindow& window, sf::Vector2f pos, sf::Vector2f size) {
+    sf::RectangleShape bg(size);
+    bg.setPosition(pos);
+    bg.setFillColor(sf::Color(35, 38, 48, 235));
+    bg.setOutlineThickness(3.f);
+    bg.setOutlineColor(sf::Color(232, 212, 120));
+    window.draw(bg);
+    return sf::FloatRect(pos, size);
+}
+
+void GameWorld::uiText(sf::RenderWindow& window, sf::Vector2f pos, const std::string& text, unsigned int size, sf::Color color, bool bold) {
+    if (!fontLoaded_) return;
+    sf::Text t(font_, toSfString(text), size);
+    t.setPosition(pos);
+    t.setFillColor(color);
+    if (bold) t.setStyle(sf::Text::Bold);
+    window.draw(t);
+}
+
+std::string GameWorld::applyKeyPlaceholders(const std::string& text) const {
+    auto replaceAll = [](std::string s, const std::string& from, const std::string& to) {
+        size_t pos = 0;
+        while ((pos = s.find(from, pos)) != std::string::npos) {
+            s.replace(pos, from.length(), to);
+            pos += to.length();
+        }
+        return s;
+    };
+    std::string result = text;
+    result = replaceAll(result, "{MOVE}", keyName(settings_.keys.moveUp) + "/" + keyName(settings_.keys.moveLeft) + "/" +
+        keyName(settings_.keys.moveDown) + "/" + keyName(settings_.keys.moveRight));
+    result = replaceAll(result, "{E}", keyName(settings_.keys.interact));
+    result = replaceAll(result, "{U}", keyName(settings_.keys.quickUpgrade));
+    result = replaceAll(result, "{M}", keyName(settings_.keys.minimap));
+    result = replaceAll(result, "{F}", keyName(settings_.keys.minigame));
+    return result;
+}
+
+void GameWorld::uiButton(sf::RenderWindow& window, sf::Vector2f pos, sf::Vector2f size, const std::string& label,
+    std::function<void()> onClick, bool enabled) {
+    sf::RectangleShape btn(size);
+    btn.setPosition(pos);
+    btn.setFillColor(enabled ? sf::Color(72, 58, 112) : sf::Color(55, 55, 60));
+    btn.setOutlineThickness(2.f);
+    btn.setOutlineColor(enabled ? sf::Color(232, 212, 120) : sf::Color(110, 110, 110));
+    window.draw(btn);
+
+    if (fontLoaded_) {
+        sf::Text text(font_, toSfString(label), 14);
+        sf::FloatRect b = text.getLocalBounds();
+        text.setPosition(sf::Vector2f(pos.x + size.x / 2.f - b.size.x / 2.f - b.position.x, pos.y + size.y / 2.f - 10.f));
+        text.setFillColor(enabled ? sf::Color(232, 212, 120) : sf::Color(150, 150, 150));
+        window.draw(text);
+    }
+
+    if (enabled && onClick) {
+        overlayClickRegions_.push_back(ClickRegion{ sf::FloatRect(pos, size), onClick });
+    }
+}
+
+void GameWorld::performBuy(double qty) {
+    auto goods = game_.goodInfos();
+    if (selectedGoodIndex_ < 0 || selectedGoodIndex_ >= static_cast<int>(goods.size())) return;
+    const std::string id = goods[static_cast<size_t>(selectedGoodIndex_)].id;
+    double stockBefore = goods[static_cast<size_t>(selectedGoodIndex_)].stock;
+    ActionResult r = game_.tryBuyGood(id, qty);
+    if (r.success) {
+        // tryBuyGood silently clamps qty to warehouse room, so report what
+        // was actually bought (stock delta) rather than the requested amount.
+        double actualQty = qty;
+        for (const auto& g : game_.goodInfos()) {
+            if (g.id == id) { actualQty = g.stock - stockBefore; break; }
+        }
+        setFeedback(Localization::t("bought_prefix") + formatNumber(actualQty) + " " + Localization::t(id), true);
+    } else {
+        setFeedback(Localization::t(r.messageKey), false);
+    }
+}
+
+void GameWorld::performSell(double qty) {
+    auto goods = game_.goodInfos();
+    if (selectedGoodIndex_ < 0 || selectedGoodIndex_ >= static_cast<int>(goods.size())) return;
+    const std::string id = goods[static_cast<size_t>(selectedGoodIndex_)].id;
+    ActionResult r = game_.trySellGood(id, qty);
+    if (r.success) setFeedback(Localization::t("sold_prefix") + formatNumber(qty) + " " + Localization::t(id), true);
+    else setFeedback(Localization::t(r.messageKey), false);
+}
+
+void GameWorld::performEat(double qty) {
+    ActionResult r = game_.tryEat(qty);
+    if (r.success) setFeedback(Localization::t("ate_prefix") + formatNumber(qty), true);
+    else setFeedback(Localization::t(r.messageKey), false);
+}
+
+void GameWorld::handleUpgradeResult(const ActionResult& r, const std::string& businessId) {
+    if (r.success) {
+        if (upgradeSound_) upgradeSound_->play();
+        std::string msg = Localization::t("upgraded_prefix") + Localization::t(businessId);
+        if (r.count > 1) msg += " x" + std::to_string(r.count);
+        setFeedback(msg, true);
+    } else {
+        setFeedback(Localization::t(r.messageKey), false);
+    }
+}
+
+void GameWorld::drawOverlayRoot(sf::RenderWindow& window) {
+    if (currentOverlay_ == OverlayKind::None) return;
+
+    sf::RectangleShape dim(sf::Vector2f(static_cast<float>(windowSize_.x), static_cast<float>(windowSize_.y)));
+    dim.setFillColor(sf::Color(0, 0, 0, 150));
+    window.draw(dim);
+
+    overlayClickRegions_.clear();
+
+    switch (currentOverlay_) {
+        case OverlayKind::Businesses:   drawBusinessesOverlay(window); break;
+        case OverlayKind::Tree:         drawTreeOverlay(window); break;
+        case OverlayKind::Market:       drawMarketOverlay(window); break;
+        case OverlayKind::Staff:        drawStaffOverlay(window); break;
+        case OverlayKind::Sleep:        drawSleepOverlay(window); break;
+        case OverlayKind::Eat:          drawEatOverlay(window); break;
+        case OverlayKind::Doctor:       drawDoctorOverlay(window); break;
+        case OverlayKind::FastForward:  drawFastForwardOverlay(window); break;
+        case OverlayKind::Achievements: drawAchievementsOverlay(window); break;
+        case OverlayKind::DeathNotice:  drawDeathNoticeOverlay(window); break;
+        case OverlayKind::Legacy:       drawLegacyOverlay(window); break;
+        case OverlayKind::Dialogue:     drawDialogueOverlay(window); break;
+        case OverlayKind::Bank:         drawBankOverlay(window); break;
+        case OverlayKind::Warehouse:    drawWarehouseOverlay(window); break;
+        case OverlayKind::HowToPlay:    drawHowToPlayOverlay(window); break;
+        case OverlayKind::CropPicker:   drawCropPickerOverlay(window); break;
+        case OverlayKind::TimingMinigame: drawTimingMinigameOverlay(window); break;
+        case OverlayKind::Chopping:       drawChoppingOverlay(window); break;
+        case OverlayKind::Brewing:        drawBrewingOverlay(window); break;
+        case OverlayKind::Contracts:    drawContractsOverlay(window); break;
+        case OverlayKind::Pause:        drawPauseOverlay(window); break;
+        case OverlayKind::Settings:     drawSettingsOverlay(window); break;
+        default: break;
+    }
+}
+
+void GameWorld::drawBusinessesOverlay(sf::RenderWindow& window) {
+    // Focused on whichever single building was walked up to (see
+    // handleInteraction) -- not the full 12-row list, so upgrading here can
+    // only ever affect the one building the player actually approached.
+    // Keep the vector itself alive for the whole function -- businessInfos()
+    // returns by value, and a range-for over a temporary only lifetime-extends
+    // it for the loop itself, so `info` would otherwise dangle the moment the
+    // loop below ends (use-after-free once anything below reads through it).
+    const std::vector<BusinessInfo> infos = game_.businessInfos();
+    const BusinessInfo* info = nullptr;
+    for (const auto& b : infos) {
+        if (b.id == focusedBusinessId_) { info = &b; break; }
+    }
+    if (!info) { closeOverlay(); return; } // shouldn't happen, but don't render garbage if it does
+
+    sf::Vector2f pos(360.f, 230.f), size(600.f, 460.f);
+    uiPanelBg(window, pos, size);
+    uiButton(window, { pos.x + size.x - 120.f, pos.y + 14.f }, { 100.f, 34.f }, Localization::t("close_button"), [this]() { closeOverlay(); });
+
+    sf::Color tierColor = info->tier <= 1 ? kTier1 : (info->tier == 2 ? kTier2 : kTier3);
+    uiText(window, { pos.x + 24.f, pos.y + 16.f }, Localization::t(info->id), 22, tierColor, true);
+
+    float y = pos.y + 74.f;
+    uiText(window, { pos.x + 24.f, y }, Localization::t("col_level") + ": " + std::to_string(info->level), 16);
+    y += 32.f;
+
+    std::ostringstream rateOss;
+    rateOss << std::fixed << std::setprecision(3) << info->ratePerSecond;
+    uiText(window, { pos.x + 24.f, y }, Localization::t("col_rate") + ": " + rateOss.str(), 16);
+    y += 20.f;
+    uiText(window, { pos.x + 24.f, y }, Localization::t("rate_note"), 11, sf::Color(160, 160, 160));
+    y += 24.f;
+
+    if (!info->inputGoodId.empty()) {
+        std::ostringstream needsOss;
+        needsOss << std::fixed << std::setprecision(1) << info->inputPerOutput << " " << Localization::t(info->inputGoodId);
+        uiText(window, { pos.x + 24.f, y }, Localization::t("col_needs") + ": " + needsOss.str(), 16);
+        y += 32.f;
+    }
+    uiText(window, { pos.x + 24.f, y }, Localization::t("col_cost") + ": $" + formatNumber(info->nextCost), 16);
+    y += 40.f;
+
+    if (info->locked) {
+        // Not reachable in practice (handleInteraction filters locked
+        // buildings out before opening this overlay) -- kept as a fallback
+        // rather than assuming that check can never change.
+        uiText(window, { pos.x + 24.f, y }, Localization::t("locked_label"), 16, sf::Color(180, 120, 120));
+    } else {
+        uiText(window, { pos.x + 24.f, y - 20.f }, Localization::t("upgrade_button"), 13, sf::Color(200, 200, 200));
+        float btnW = 168.f, btnH = 46.f, gap = 12.f;
+        uiButton(window, { pos.x + 24.f, y }, { btnW, btnH }, Localization::t("qty_1"),
+            [this, id = info->id]() { handleUpgradeResult(game_.tryUpgradeBusinessBulk(id, 1), id); });
+        uiButton(window, { pos.x + 24.f + (btnW + gap), y }, { btnW, btnH }, Localization::t("qty_10"),
+            [this, id = info->id]() { handleUpgradeResult(game_.tryUpgradeBusinessBulk(id, 10), id); });
+        uiButton(window, { pos.x + 24.f + 2.f * (btnW + gap), y }, { btnW, btnH }, Localization::t("qty_all"),
+            [this, id = info->id]() { handleUpgradeResult(game_.tryUpgradeBusinessBulk(id, -1), id); });
+    }
+    y += 70.f;
+
+    // Per-business worker hiring (separate from the global Staff Office +
+    // foreman focus, see Game::tryHireWorker) -- only meaningful once the
+    // business is actually built.
+    if (info->level > 0) {
+        uiText(window, { pos.x + 24.f, y }, Localization::t("workers_label") + std::to_string(info->workers) +
+            "/" + std::to_string(Game::kMaxWorkersPerBusiness), 15, sf::Color(200, 200, 200));
+        y += 26.f;
+        bool canHire = info->workers < Game::kMaxWorkersPerBusiness;
+        std::string hireLabel = Localization::t("hire_worker_button");
+        if (canHire) hireLabel += " ($" + formatNumber(info->workerCost) + ")";
+        uiButton(window, { pos.x + 24.f, y }, { 240.f, 40.f }, hireLabel,
+            [this, id = info->id]() {
+                ActionResult r = game_.tryHireWorker(id);
+                if (r.success) {
+                    if (upgradeSound_) upgradeSound_->play();
+                    setFeedback(Localization::t("worker_hired_prefix") + Localization::t(id), true);
+                } else {
+                    setFeedback(Localization::t(r.messageKey), false);
+                }
+            }, canHire);
+
+        // The Farm alone also gets a crop picker (see Business::cropId) --
+        // shown beside the hire-worker button, plus a line naming the
+        // currently-active crop and whether it's in its favorite season.
+        if (info->id == "farm") {
+            uiButton(window, { pos.x + 24.f + 240.f + 16.f, y }, { 200.f, 40.f }, Localization::t("change_crop_button"),
+                [this]() { openOverlay(OverlayKind::CropPicker); });
+            y += 46.f;
+            std::string cropLabel = Localization::t("current_crop_label") + Localization::t(info->cropId);
+            if (info->seasonBonusActive) cropLabel += Localization::t("season_bonus_active");
+            uiText(window, { pos.x + 24.f, y }, cropLabel, 14, sf::Color(232, 212, 120));
+        }
+    }
+
+    if (!overlayFeedback_.empty()) {
+        uiText(window, { pos.x + 24.f, pos.y + size.y - 30.f }, overlayFeedback_, 15, overlayFeedbackColor_);
+    }
+}
+
+void GameWorld::drawTreeOverlay(sf::RenderWindow& window) {
+    sf::Vector2f pos(140.f, 40.f), size(1000.f, 740.f);
+    uiPanelBg(window, pos, size);
+    uiButton(window, { pos.x + size.x - 130.f, pos.y + 14.f }, { 110.f, 36.f }, Localization::t("close_button"), [this]() { closeOverlay(); });
+    uiButton(window, { pos.x + size.x - 250.f, pos.y + 14.f }, { 110.f, 36.f }, Localization::t("legacy_button"), [this]() { openOverlay(OverlayKind::Legacy); });
+
+    // The production tree has grown well past what fits in one screen (42
+    // businesses now, vs. the dozen or so this panel was originally sized
+    // for) -- scroll with the mouse wheel (see the MouseWheelScrolled
+    // handler in run()) instead of just letting lines run off the bottom.
+    constexpr float lineH = 24.f;
+    constexpr float contentTop = 60.f;   // offset from pos.y where the first line sits
+    constexpr float contentBottom = 20.f; // bottom margin reserved (also where the scroll hint sits)
+    float visibleH = size.y - contentTop - contentBottom;
+
+    std::vector<std::string> lines = game_.productionTreeLines();
+    float contentH = static_cast<float>(lines.size()) * lineH;
+    float maxScroll = std::max(0.f, contentH - visibleH);
+    overlayScrollOffset_ = std::clamp(overlayScrollOffset_, 0.f, maxScroll);
+
+    float y = pos.y + contentTop - overlayScrollOffset_;
+    for (const auto& line : lines) {
+        // Skip lines scrolled out of view instead of drawing them over the
+        // panel's own header/buttons above or past its bottom edge.
+        if (y >= pos.y + contentTop - lineH && y <= pos.y + size.y - contentBottom) {
+            // A small tier-colored square ahead of each real row (skips the
+            // title/separator lines, which don't contain " -> ") -- depth is
+            // just the leading-space count / 3, matching collectTreeLines'
+            // own indent step (Business.cpp).
+            if (line.find(" -> ") != std::string::npos) {
+                size_t leading = line.find_first_not_of(' ');
+                int depth = leading == std::string::npos ? 0 : static_cast<int>(leading / 3);
+                sf::Color tierColor = depth <= 0 ? kTier1 : (depth == 1 ? kTier2 : kTier3);
+                sf::RectangleShape icon(sf::Vector2f(9.f, 9.f));
+                icon.setPosition(sf::Vector2f(pos.x + 8.f, y + 5.f));
+                icon.setFillColor(tierColor);
+                window.draw(icon);
+            }
+            uiText(window, { pos.x + 24.f, y }, line, 15, sf::Color::White);
+        }
+        y += lineH;
+    }
+
+    if (maxScroll > 0.f) {
+        uiText(window, { pos.x + 24.f, pos.y + size.y - 18.f }, Localization::t("scroll_hint"), 12, sf::Color(160, 160, 160));
+    }
+}
+
+void GameWorld::drawMarketOverlay(sf::RenderWindow& window) {
+    sf::Vector2f pos(100.f, 40.f), size(1080.f, 740.f);
+    uiPanelBg(window, pos, size);
+    uiText(window, { pos.x + 24.f, pos.y + 16.f }, Localization::t("menu_market_header"), 20, sf::Color(232, 212, 120), true);
+    uiButton(window, { pos.x + size.x - 130.f, pos.y + 14.f }, { 110.f, 36.f }, Localization::t("close_button"), [this]() { closeOverlay(); });
+    uiButton(window, { pos.x + size.x - 260.f, pos.y + 14.f }, { 120.f, 36.f }, Localization::t("contracts_button"), [this]() { openOverlay(OverlayKind::Contracts); });
+
+    auto goods = game_.goodInfos();
+    if (selectedGoodIndex_ < 0 || selectedGoodIndex_ >= static_cast<int>(goods.size())) selectedGoodIndex_ = 0;
+
+    float colName = pos.x + 24.f, colPrice = pos.x + 400.f, colHold = pos.x + 600.f;
+    float headerY = pos.y + 64.f;
+    uiText(window, { colName, headerY }, Localization::t("col_good"), 13, sf::Color(200, 200, 200));
+    uiText(window, { colPrice, headerY }, Localization::t("col_price"), 13, sf::Color(200, 200, 200));
+    uiText(window, { colHold, headerY }, Localization::t("col_hold"), 13, sf::Color(200, 200, 200));
+
+    // The goods list has outgrown the panel (53 goods now, vs. the ~15 this
+    // was sized for) -- bound it above the fixed buy/sell panel below and
+    // scroll with the mouse wheel instead of drawing rows over top of it.
+    float listTop = headerY + 26.f, rowH = 34.f;
+    float actionY = pos.y + size.y - 130.f;
+    float listBottom = actionY - 10.f;
+    float contentH = static_cast<float>(goods.size()) * rowH;
+    float maxScroll = std::max(0.f, contentH - (listBottom - listTop));
+    overlayScrollOffset_ = std::clamp(overlayScrollOffset_, 0.f, maxScroll);
+
+    float rowY = listTop - overlayScrollOffset_;
+    for (size_t i = 0; i < goods.size(); ++i) {
+        if (rowY < listTop - rowH || rowY > listBottom) { rowY += rowH; continue; }
+        const auto& g = goods[i];
+        bool selected = static_cast<int>(i) == selectedGoodIndex_;
+        sf::RectangleShape rowBg(sf::Vector2f(size.x - 48.f, rowH - 4.f));
+        rowBg.setPosition(sf::Vector2f(pos.x + 24.f, rowY));
+        rowBg.setFillColor(selected ? sf::Color(90, 76, 130) : sf::Color(50, 52, 62));
+        window.draw(rowBg);
+        overlayClickRegions_.push_back(ClickRegion{
+            sf::FloatRect(sf::Vector2f(pos.x + 24.f, rowY), sf::Vector2f(size.x - 48.f, rowH - 4.f)),
+            [this, i]() { selectedGoodIndex_ = static_cast<int>(i); } });
+
+        uiText(window, { colName, rowY + 6.f }, Localization::t(g.id), 15, sf::Color::White);
+        uiText(window, { colPrice, rowY + 6.f }, "$" + formatNumber(g.price), 15);
+        uiText(window, { colHold, rowY + 6.f }, formatNumber(g.stock), 15);
+        rowY += rowH;
+    }
+    if (maxScroll > 0.f) {
+        uiText(window, { colHold + 120.f, headerY }, Localization::t("scroll_hint"), 12, sf::Color(160, 160, 160));
+    }
+
+    const GoodInfo& sel = goods[static_cast<size_t>(selectedGoodIndex_)];
+    uiText(window, { pos.x + 24.f, actionY },
+        Localization::t("selected_good_label") + Localization::t(sel.id) + "  ($" + formatNumber(sel.price) + ")",
+        16, sf::Color(232, 212, 120), true);
+
+    float btnY = actionY + 36.f, btnW = 90.f, btnH = 36.f, gap = 10.f;
+    uiText(window, { pos.x + 24.f, btnY - 20.f }, Localization::t("buy_button"), 13, sf::Color(200, 200, 200));
+    uiButton(window, { pos.x + 24.f, btnY }, { btnW, btnH }, Localization::t("qty_1"), [this]() { performBuy(1.0); });
+    uiButton(window, { pos.x + 24.f + (btnW + gap), btnY }, { btnW, btnH }, Localization::t("qty_10"), [this]() { performBuy(10.0); });
+    uiButton(window, { pos.x + 24.f + 2.f * (btnW + gap), btnY }, { btnW, btnH }, Localization::t("qty_100"), [this]() { performBuy(100.0); });
+
+    float sellX = pos.x + 24.f + 4.f * (btnW + gap);
+    uiText(window, { sellX, btnY - 20.f }, Localization::t("sell_button"), 13, sf::Color(200, 200, 200));
+    uiButton(window, { sellX, btnY }, { btnW, btnH }, Localization::t("qty_1"), [this]() { performSell(1.0); });
+    uiButton(window, { sellX + (btnW + gap), btnY }, { btnW, btnH }, Localization::t("qty_10"), [this]() { performSell(10.0); });
+    uiButton(window, { sellX + 2.f * (btnW + gap), btnY }, { btnW, btnH }, Localization::t("qty_100"), [this]() { performSell(100.0); });
+    double stockForAll = sel.stock;
+    uiButton(window, { sellX + 3.f * (btnW + gap), btnY }, { btnW, btnH }, Localization::t("qty_all"),
+        [this, stockForAll]() { performSell(stockForAll); }, stockForAll > 0.0);
+
+    if (!overlayFeedback_.empty()) {
+        uiText(window, { pos.x + 24.f, pos.y + size.y - 30.f }, overlayFeedback_, 15, overlayFeedbackColor_);
+    }
+}
+
+void GameWorld::drawStaffOverlay(sf::RenderWindow& window) {
+    sf::Vector2f pos(320.f, 170.f), size(640.f, 480.f);
+    uiPanelBg(window, pos, size);
+    uiText(window, { pos.x + 24.f, pos.y + 16.f }, Localization::t("menu_staff_header"), 20, sf::Color(232, 212, 120), true);
+    uiButton(window, { pos.x + size.x - 120.f, pos.y + 14.f }, { 100.f, 34.f }, Localization::t("close_button"), [this]() { closeOverlay(); });
+
+    std::ostringstream info;
+    info << Localization::t("staff_current_prefix") << game_.staffLevel()
+        << Localization::t("staff_current_suffix") << std::fixed << std::setprecision(2) << game_.staffMultiplier() << ")";
+    uiText(window, { pos.x + 24.f, pos.y + 70.f }, info.str(), 15);
+    uiText(window, { pos.x + 24.f, pos.y + 104.f }, Localization::t("staff_cost_prefix") + formatNumber(game_.staffNextCost()), 15);
+
+    uiButton(window, { pos.x + 24.f, pos.y + 140.f }, { 200.f, 44.f }, Localization::t("hire_button"), [this]() {
+        ActionResult r = game_.tryHireStaff();
+        if (r.success) setFeedback(Localization::t("staff_hired_prefix") + std::to_string(game_.staffLevel()), true);
+        else setFeedback(Localization::t(r.messageKey), false);
+    });
+
+    std::string focusName = game_.staffFocusBusinessId().empty()
+        ? Localization::t("staff_focus_none") : Localization::t(game_.staffFocusBusinessId());
+    std::ostringstream focusOss;
+    focusOss << Localization::t("staff_focus_label") << focusName
+        << Localization::t("staff_focus_suffix") << std::fixed << std::setprecision(0) << game_.staffFocusBonusPercentPerLevel() << "%/lvl)";
+    uiText(window, { pos.x + 24.f, pos.y + 208.f }, focusOss.str(), 15, sf::Color(232, 212, 120));
+
+    // Pick which owned business the foreman focuses on -- a compact wrapping
+    // grid of buttons. Collected into a list first (rather than placed
+    // as each is discovered) so the total count is known up front, needed
+    // to scroll it now that a maxed-out empire (43 businesses) meaningfully
+    // overruns the panel, which the original fixed 5-column grid didn't
+    // account for.
+    struct FocusOption { std::string label; std::function<void()> onClick; };
+    std::vector<FocusOption> options;
+    options.push_back({ Localization::t("staff_focus_none"), [this]() {
+        game_.trySetStaffFocus("");
+        setFeedback(Localization::t("staff_focus_cleared"), true);
+    } });
+    for (const auto& b : game_.businessInfos()) {
+        if (b.level <= 0) continue;
+        options.push_back({ Localization::t(b.id), [this, id = b.id]() {
+            ActionResult r = game_.trySetStaffFocus(id);
+            if (r.success) setFeedback(Localization::t("staff_focus_set_prefix") + Localization::t(id), true);
+            else setFeedback(Localization::t(r.messageKey), false);
+        } });
+    }
+
+    float startX = pos.x + 24.f;
+    float btnW = 108.f, btnH = 30.f, gapX = 8.f, gapY = 8.f;
+    constexpr int perRow = 5;
+    int totalRows = static_cast<int>((options.size() + perRow - 1) / static_cast<size_t>(perRow));
+    float gridTop = pos.y + 240.f;
+    float gridBottom = pos.y + size.y - 40.f; // leaves room for the feedback line below
+    float contentH = static_cast<float>(totalRows) * (btnH + gapY);
+    float maxScroll = std::max(0.f, contentH - (gridBottom - gridTop));
+    overlayScrollOffset_ = std::clamp(overlayScrollOffset_, 0.f, maxScroll);
+
+    for (size_t i = 0; i < options.size(); ++i) {
+        int row = static_cast<int>(i / static_cast<size_t>(perRow));
+        int col = static_cast<int>(i % static_cast<size_t>(perRow));
+        float rowY = gridTop + static_cast<float>(row) * (btnH + gapY) - overlayScrollOffset_;
+        if (rowY < gridTop - btnH || rowY > gridBottom) continue;
+        float colX = startX + static_cast<float>(col) * (btnW + gapX);
+        uiButton(window, { colX, rowY }, { btnW, btnH }, options[i].label, options[i].onClick, true);
+    }
+    if (maxScroll > 0.f) {
+        uiText(window, { pos.x + size.x - 210.f, pos.y + 210.f }, Localization::t("scroll_hint"), 12, sf::Color(160, 160, 160));
+    }
+
+    if (!overlayFeedback_.empty()) {
+        uiText(window, { pos.x + 24.f, pos.y + size.y - 34.f }, overlayFeedback_, 15, overlayFeedbackColor_);
+    }
+}
+
+void GameWorld::drawSleepOverlay(sf::RenderWindow& window) {
+    sf::Vector2f pos(360.f, 260.f), size(560.f, 300.f);
+    uiPanelBg(window, pos, size);
+    uiText(window, { pos.x + 24.f, pos.y + 16.f }, Localization::t("menu_sleep_header"), 20, sf::Color(232, 212, 120), true);
+    uiButton(window, { pos.x + size.x - 120.f, pos.y + 14.f }, { 100.f, 34.f }, Localization::t("close_button"), [this]() { closeOverlay(); });
+
+    uiText(window, { pos.x + 24.f, pos.y + 70.f }, Localization::t("sleep_desc_prefix"), 14);
+    uiText(window, { pos.x + 24.f, pos.y + 100.f }, Localization::t("sleep_desc_suffix"), 14);
+
+    uiButton(window, { pos.x + 24.f, pos.y + 160.f }, { 200.f, 44.f }, Localization::t("sleep_button"), [this]() {
+        TickOutcome outcome = game_.trySleep();
+        if (outcome.died) { handleTickOutcome(outcome); return; }
+        setFeedback(Localization::t("sleep_woke"), true);
+    });
+
+    if (!overlayFeedback_.empty()) {
+        uiText(window, { pos.x + 24.f, pos.y + size.y - 34.f }, overlayFeedback_, 15, overlayFeedbackColor_);
+    }
+}
+
+void GameWorld::drawEatOverlay(sf::RenderWindow& window) {
+    sf::Vector2f pos(360.f, 260.f), size(560.f, 300.f);
+    uiPanelBg(window, pos, size);
+    uiText(window, { pos.x + 24.f, pos.y + 16.f }, Localization::t("menu_eat_header"), 20, sf::Color(232, 212, 120), true);
+    uiButton(window, { pos.x + size.x - 120.f, pos.y + 14.f }, { 100.f, 34.f }, Localization::t("close_button"), [this]() { closeOverlay(); });
+
+    double wheatStock = 0.0;
+    for (const auto& g : game_.goodInfos()) {
+        if (g.id == "wheat") wheatStock = g.stock;
+    }
+
+    uiText(window, { pos.x + 24.f, pos.y + 70.f }, Localization::t("hunger_label") + std::to_string(static_cast<int>(game_.hunger())) + "/100", 15);
+    uiText(window, { pos.x + 24.f, pos.y + 100.f },
+        Localization::t("eat_have_prefix") + formatNumber(wheatStock) + Localization::t("eat_have_mid")
+        + std::to_string(static_cast<int>(game_.hungerRestorePerUnit())) + Localization::t("eat_have_suffix"), 14);
+
+    float btnY = pos.y + 150.f, btnW = 90.f, btnH = 44.f, gap = 12.f;
+    uiButton(window, { pos.x + 24.f, btnY }, { btnW, btnH }, Localization::t("qty_1"), [this]() { performEat(1.0); });
+    uiButton(window, { pos.x + 24.f + (btnW + gap), btnY }, { btnW, btnH }, Localization::t("qty_10"), [this]() { performEat(10.0); });
+    uiButton(window, { pos.x + 24.f + 2.f * (btnW + gap), btnY }, { btnW, btnH }, Localization::t("qty_all"),
+        [this, wheatStock]() { performEat(wheatStock); }, wheatStock > 0.0);
+
+    if (!overlayFeedback_.empty()) {
+        uiText(window, { pos.x + 24.f, pos.y + size.y - 34.f }, overlayFeedback_, 15, overlayFeedbackColor_);
+    }
+}
+
+void GameWorld::drawDoctorOverlay(sf::RenderWindow& window) {
+    sf::Vector2f pos(360.f, 260.f), size(560.f, 300.f);
+    uiPanelBg(window, pos, size);
+    uiText(window, { pos.x + 24.f, pos.y + 16.f }, Localization::t("menu_doctor_header"), 20, sf::Color(232, 212, 120), true);
+    uiButton(window, { pos.x + size.x - 120.f, pos.y + 14.f }, { 100.f, 34.f }, Localization::t("close_button"), [this]() { closeOverlay(); });
+
+    if (!game_.isSick()) {
+        uiText(window, { pos.x + 24.f, pos.y + 80.f }, Localization::t("not_sick"), 15);
+        return;
+    }
+
+    std::ostringstream info;
+    info << Localization::t("sick_for_prefix") << std::fixed << std::setprecision(1) << game_.sickDays()
+        << Localization::t("sick_for_suffix") << game_.sicknessDeathDays();
+    uiText(window, { pos.x + 24.f, pos.y + 70.f }, info.str(), 14);
+    uiText(window, { pos.x + 24.f, pos.y + 100.f }, Localization::t("treatment_cost_prefix") + formatNumber(game_.doctorTreatmentCost()), 15);
+
+    uiButton(window, { pos.x + 24.f, pos.y + 160.f }, { 200.f, 44.f }, Localization::t("treat_button"), [this]() {
+        ActionResult r = game_.tryVisitDoctor();
+        if (r.success) setFeedback(Localization::t("all_better"), true);
+        else setFeedback(Localization::t(r.messageKey), false);
+    });
+
+    if (!overlayFeedback_.empty()) {
+        uiText(window, { pos.x + 24.f, pos.y + size.y - 34.f }, overlayFeedback_, 15, overlayFeedbackColor_);
+    }
+}
+
+void GameWorld::drawFastForwardOverlay(sf::RenderWindow& window) {
+    sf::Vector2f pos(300.f, 260.f), size(680.f, 300.f);
+    uiPanelBg(window, pos, size);
+    uiText(window, { pos.x + 24.f, pos.y + 16.f }, Localization::t("menu_fastforward_header"), 20, sf::Color(232, 212, 120), true);
+    uiButton(window, { pos.x + size.x - 120.f, pos.y + 14.f }, { 100.f, 34.f }, Localization::t("close_button"), [this]() { closeOverlay(); });
+
+    struct Preset { const char* key; double minutes; };
+    const Preset presets[] = {
+        { "ff_15m", 15.0 }, { "ff_1h", 60.0 }, { "ff_4h", 240.0 }, { "ff_1d", 1440.0 }, { "ff_1w", 10080.0 },
+    };
+    float btnY = pos.y + 100.f, btnW = 110.f, btnH = 44.f, gap = 14.f;
+    float x = pos.x + 24.f;
+    for (const auto& p : presets) {
+        uiButton(window, { x, btnY }, { btnW, btnH }, Localization::t(p.key), [this, minutes = p.minutes, key = std::string(p.key)]() {
+            TickOutcome outcome = game_.tryFastForward(minutes);
+            if (outcome.died) { handleTickOutcome(outcome); return; }
+            setFeedback(Localization::t("simulated_prefix") + Localization::t(key), true);
+        });
+        x += btnW + gap;
+    }
+
+    if (!overlayFeedback_.empty()) {
+        uiText(window, { pos.x + 24.f, pos.y + size.y - 34.f }, overlayFeedback_, 15, overlayFeedbackColor_);
+    }
+}
+
+void GameWorld::drawAchievementsOverlay(sf::RenderWindow& window) {
+    sf::Vector2f pos(180.f, 40.f), size(920.f, 740.f);
+    uiPanelBg(window, pos, size);
+    uiText(window, { pos.x + 24.f, pos.y + 16.f }, Localization::t("menu_achievements_header"), 20, sf::Color(232, 212, 120), true);
+    uiButton(window, { pos.x + size.x - 130.f, pos.y + 14.f }, { 110.f, 36.f }, Localization::t("close_button"), [this]() { closeOverlay(); });
+
+    // 20+ achievements now (started at 12, grown several times this
+    // session) -- outgrew the panel, so scroll it the same way Market/Staff/
+    // Tree/How to Play already do. Grouped into categories (see
+    // achievementCategoryFor above) with a header row per group, instead of
+    // one flat undifferentiated list.
+    std::vector<AchievementInfo> achievements = game_.achievementInfos();
+    int unlockedCount = 0;
+    for (const auto& a : achievements) if (a.unlocked) unlockedCount++;
+    uiText(window, { pos.x + 260.f, pos.y + 20.f },
+        Localization::t("achievements_progress_prefix") + std::to_string(unlockedCount) + "/" + std::to_string(achievements.size()),
+        15, sf::Color(200, 200, 200));
+    constexpr float rowH = 52.f, headerH = 30.f, listTop = 66.f, listBottom = 20.f;
+
+    struct AchRow { bool isHeader; AchievementInfo info; const char* headerLabelKey; sf::Color color; };
+    std::vector<AchRow> rows;
+    for (const char* catKey : kAchievementCategoryOrder) {
+        bool any = false;
+        for (const auto& a : achievements) if (achievementCategoryFor(a.id).labelKey == std::string(catKey)) { any = true; break; }
+        if (!any) continue;
+        AchievementCategory cat{ catKey, sf::Color::White };
+        rows.push_back(AchRow{ true, AchievementInfo{}, catKey, sf::Color(200, 200, 200) });
+        for (const auto& a : achievements) {
+            AchievementCategory info = achievementCategoryFor(a.id);
+            if (info.labelKey != std::string(catKey)) continue;
+            rows.push_back(AchRow{ false, a, catKey, info.color });
+        }
+    }
+
+    float visibleH = size.y - listTop - listBottom;
+    float contentH = 0.f;
+    for (const auto& r : rows) contentH += r.isHeader ? headerH : rowH;
+    float maxScroll = std::max(0.f, contentH - visibleH);
+    overlayScrollOffset_ = std::clamp(overlayScrollOffset_, 0.f, maxScroll);
+
+    float y = pos.y + listTop - overlayScrollOffset_;
+    for (const auto& r : rows) {
+        float h = r.isHeader ? headerH : rowH;
+        if (y < pos.y + listTop - h || y > pos.y + size.y - listBottom) { y += h; continue; }
+        if (r.isHeader) {
+            uiText(window, { pos.x + 24.f, y + 6.f }, Localization::t(r.headerLabelKey), 14, sf::Color(232, 212, 120), true);
+        } else {
+            const AchievementInfo& a = r.info;
+            sf::RectangleShape rowBg(sf::Vector2f(size.x - 48.f, rowH - 6.f));
+            rowBg.setPosition(sf::Vector2f(pos.x + 24.f, y));
+            rowBg.setFillColor(a.unlocked ? sf::Color(48, 70, 50) : sf::Color(50, 52, 62));
+            window.draw(rowBg);
+
+            sf::CircleShape dot(5.f);
+            dot.setPosition(sf::Vector2f(pos.x + 32.f, y + 10.f));
+            dot.setFillColor(r.color);
+            window.draw(dot);
+
+            std::string mark = a.unlocked ? "[X] " : "[ ] ";
+            uiText(window, { pos.x + 48.f, y + 4.f }, mark + Localization::t("ach_" + a.id + "_name"), 15,
+                a.unlocked ? sf::Color(150, 230, 150) : sf::Color::White, true);
+            std::string descLine = Localization::t("ach_" + a.id + "_desc");
+            if (!a.unlocked) descLine += "  (" + Localization::t("reward_label") + formatNumber(a.reward) + ")";
+            uiText(window, { pos.x + 48.f, y + 26.f }, descLine, 13, sf::Color(200, 200, 200));
+        }
+        y += h;
+    }
+    if (maxScroll > 0.f) {
+        uiText(window, { pos.x + size.x - 260.f, pos.y + 16.f }, Localization::t("scroll_hint"), 12, sf::Color(160, 160, 160));
+    }
+}
+
+void GameWorld::drawPauseOverlay(sf::RenderWindow& window) {
+    sf::Vector2f pos(380.f, 190.f), size(520.f, 440.f);
+    uiPanelBg(window, pos, size);
+    uiText(window, { pos.x + 24.f, pos.y + 20.f }, Localization::t("pause_title"), 22, sf::Color(232, 212, 120), true);
+    uiText(window, { pos.x + 24.f, pos.y + 66.f }, Localization::t("pause_save_prompt"), 16, sf::Color::White);
+
+    float btnW = size.x - 48.f, btnH = 48.f, gap = 16.f;
+    float y = pos.y + 108.f;
+    uiButton(window, { pos.x + 24.f, y }, { btnW, btnH }, Localization::t("pause_save_button"), [this]() {
+        game_.saveNow();
+        setFeedback(Localization::t("pause_saved_feedback"), true);
+    });
+    y += btnH + gap;
+    uiButton(window, { pos.x + 24.f, y }, { btnW, btnH }, Localization::t("pause_resume_button"), [this]() { closeOverlay(); });
+    y += btnH + gap;
+    uiButton(window, { pos.x + 24.f, y }, { btnW, btnH }, Localization::t("pause_settings_button"), [this]() { openOverlay(OverlayKind::Settings); });
+    y += btnH + gap;
+    uiButton(window, { pos.x + 24.f, y }, { btnW, btnH }, Localization::t("pause_quit_button"), [this, &window]() {
+        game_.exitAndSave();
+        window.close();
+    });
+
+    if (!overlayFeedback_.empty()) {
+        uiText(window, { pos.x + 24.f, pos.y + size.y - 30.f }, overlayFeedback_, 15, overlayFeedbackColor_);
+    }
+}
+
+void GameWorld::drawSettingsOverlay(sf::RenderWindow& window) {
+    sf::Vector2f pos(180.f, 40.f), size(920.f, 740.f);
+    uiPanelBg(window, pos, size);
+    uiText(window, { pos.x + 24.f, pos.y + 16.f }, Localization::t("settings_title"), 20, sf::Color(232, 212, 120), true);
+    uiButton(window, { pos.x + size.x - 130.f, pos.y + 14.f }, { 110.f, 36.f }, Localization::t("settings_back_button"),
+        [this]() { openOverlay(OverlayKind::Pause); });
+    uiButton(window, { pos.x + size.x - 270.f, pos.y + 14.f }, { 130.f, 36.f }, Localization::t("settings_reset_button"),
+        [this, &window]() {
+            settings_ = Settings{}; // fresh defaults, including KeyBindings' own default member initializers
+            applyVideoMode(window);
+            applySfxVolume();
+            applyMusicVolume();
+            SettingsManager::save(settings_);
+            setFeedback(Localization::t("settings_reset_feedback"), true);
+        });
+
+    float labelX = pos.x + 24.f, valueX = pos.x + 320.f, ctrlX = pos.x + 480.f, rowH = 50.f;
+    float y = pos.y + 72.f;
+
+    // ---- SFX volume: +/- 10% steps rather than a drag slider, matching the
+    // rest of the game's plain-button UI (no drag widgets anywhere else). ----
+    uiText(window, { labelX, y + 8.f }, Localization::t("settings_volume_label"), 15, sf::Color(200, 200, 200));
+    uiText(window, { valueX, y + 8.f }, std::to_string(static_cast<int>(settings_.sfxVolumePercent)) + "%", 16, sf::Color::White, true);
+    uiButton(window, { ctrlX, y }, { 40.f, 36.f }, "-", [this]() {
+        settings_.sfxVolumePercent = std::max(0.f, settings_.sfxVolumePercent - 10.f);
+        applySfxVolume();
+        SettingsManager::save(settings_);
+    });
+    uiButton(window, { ctrlX + 50.f, y }, { 40.f, 36.f }, "+", [this]() {
+        settings_.sfxVolumePercent = std::min(100.f, settings_.sfxVolumePercent + 10.f);
+        applySfxVolume();
+        SettingsManager::save(settings_);
+    });
+    y += rowH;
+
+    // ---- Music volume: same +/-10% pattern, independent of SFX volume
+    // above -- the looping per-season background melody (see initAudio/
+    // playMusicForSeason). ----
+    uiText(window, { labelX, y + 8.f }, Localization::t("settings_music_volume_label"), 15, sf::Color(200, 200, 200));
+    uiText(window, { valueX, y + 8.f }, std::to_string(static_cast<int>(settings_.musicVolumePercent)) + "%", 16, sf::Color::White, true);
+    uiButton(window, { ctrlX, y }, { 40.f, 36.f }, "-", [this]() {
+        settings_.musicVolumePercent = std::max(0.f, settings_.musicVolumePercent - 10.f);
+        applyMusicVolume();
+        SettingsManager::save(settings_);
+    });
+    uiButton(window, { ctrlX + 50.f, y }, { 40.f, 36.f }, "+", [this]() {
+        settings_.musicVolumePercent = std::min(100.f, settings_.musicVolumePercent + 10.f);
+        applyMusicVolume();
+        SettingsManager::save(settings_);
+    });
+    y += rowH;
+
+    // ---- Resolution: cycles through kResolutionPresets; disabled while
+    // Fullscreen is on since it wouldn't do anything visible. ----
+    bool resolutionEnabled = !settings_.fullscreen;
+    sf::Vector2u res = kResolutionPresets[std::clamp(settings_.resolutionIndex, 0, kResolutionPresetCount - 1)];
+    uiText(window, { labelX, y + 8.f }, Localization::t("settings_resolution_label"), 15, sf::Color(200, 200, 200));
+    uiText(window, { valueX, y + 8.f }, std::to_string(res.x) + " x " + std::to_string(res.y), 16,
+        resolutionEnabled ? sf::Color::White : sf::Color(120, 120, 120), true);
+    uiButton(window, { ctrlX, y }, { 40.f, 36.f }, "<", [this, &window]() {
+        settings_.resolutionIndex = (settings_.resolutionIndex - 1 + kResolutionPresetCount) % kResolutionPresetCount;
+        applyVideoMode(window);
+        SettingsManager::save(settings_);
+    }, resolutionEnabled);
+    uiButton(window, { ctrlX + 50.f, y }, { 40.f, 36.f }, ">", [this, &window]() {
+        settings_.resolutionIndex = (settings_.resolutionIndex + 1) % kResolutionPresetCount;
+        applyVideoMode(window);
+        SettingsManager::save(settings_);
+    }, resolutionEnabled);
+    y += rowH;
+
+    // ---- Fullscreen toggle ----
+    uiText(window, { labelX, y + 8.f }, Localization::t("settings_fullscreen_label"), 15, sf::Color(200, 200, 200));
+    uiButton(window, { ctrlX, y }, { 90.f, 36.f },
+        Localization::t(settings_.fullscreen ? "toggle_on" : "toggle_off"), [this, &window]() {
+            settings_.fullscreen = !settings_.fullscreen;
+            applyVideoMode(window);
+            SettingsManager::save(settings_);
+        });
+    y += rowH + 10.f;
+
+    // ---- Key bindings: click "Rebind", then press any key to bind it to
+    // that action (Esc cancels instead -- see the KeyPressed handler in
+    // run()). Picking a key already used by another bindable action swaps
+    // the two instead of leaving a silent collision. ----
+    uiText(window, { labelX, y }, Localization::t("settings_keybinds_label"), 16, sf::Color(232, 212, 120), true);
+    y += 34.f;
+
+    struct KeyRow { RebindAction action; const char* labelKey; sf::Keyboard::Key* key; };
+    KeyRow rows[] = {
+        { RebindAction::MoveUp,       "key_move_up",       &settings_.keys.moveUp },
+        { RebindAction::MoveDown,     "key_move_down",     &settings_.keys.moveDown },
+        { RebindAction::MoveLeft,     "key_move_left",     &settings_.keys.moveLeft },
+        { RebindAction::MoveRight,    "key_move_right",    &settings_.keys.moveRight },
+        { RebindAction::Interact,     "key_interact",      &settings_.keys.interact },
+        { RebindAction::QuickUpgrade, "key_quick_upgrade", &settings_.keys.quickUpgrade },
+        { RebindAction::Minimap,      "key_minimap",       &settings_.keys.minimap },
+        { RebindAction::Minigame,     "key_minigame",      &settings_.keys.minigame },
+    };
+    for (const auto& row : rows) {
+        uiText(window, { labelX, y + 8.f }, Localization::t(row.labelKey), 15, sf::Color(200, 200, 200));
+        bool waiting = (awaitingRebind_ == row.action);
+        if (waiting) {
+            uiText(window, { valueX, y + 8.f }, Localization::t("settings_rebind_waiting"), 14, sf::Color(230, 190, 90), true);
+        } else {
+            uiText(window, { valueX, y + 8.f }, keyName(*row.key), 16, sf::Color::White, true);
+            RebindAction action = row.action;
+            uiButton(window, { ctrlX, y }, { 140.f, 36.f }, Localization::t("settings_rebind_button"),
+                [this, action]() { awaitingRebind_ = action; });
+        }
+        y += rowH - 4.f;
+    }
+
+    if (!overlayFeedback_.empty()) {
+        uiText(window, { pos.x + 24.f, pos.y + size.y - 30.f }, overlayFeedback_, 15, overlayFeedbackColor_);
+    }
+}
+
+void GameWorld::drawHowToPlayOverlay(sf::RenderWindow& window) {
+    sf::Vector2f pos(180.f, 40.f), size(920.f, 740.f);
+    uiPanelBg(window, pos, size);
+    uiText(window, { pos.x + 24.f, pos.y + 16.f }, Localization::t("howtoplay_title"), 20, sf::Color(232, 212, 120), true);
+    uiButton(window, { pos.x + size.x - 130.f, pos.y + 14.f }, { 110.f, 36.f }, Localization::t("close_button"), [this]() { closeOverlay(); });
+
+    if (!fontLoaded_) return;
+
+    // This text has grown past what fits in one screen (seasons/crops/
+    // fishing added since it was first written) -- scroll it the same way
+    // drawTreeOverlay does, line by line, instead of one big sf::Text
+    // block that just overflows the panel.
+    constexpr float lineH = 24.f;
+    constexpr float contentTop = 64.f;
+    constexpr float contentBottom = 20.f;
+    float visibleH = size.y - contentTop - contentBottom;
+
+    std::string body = applyKeyPlaceholders(Localization::t("howtoplay_body"));
+    std::vector<std::string> lines;
+    size_t start = 0;
+    while (true) {
+        size_t nl = body.find('\n', start);
+        if (nl == std::string::npos) { lines.push_back(body.substr(start)); break; }
+        lines.push_back(body.substr(start, nl - start));
+        start = nl + 1;
+    }
+
+    float contentH = static_cast<float>(lines.size()) * lineH;
+    float maxScroll = std::max(0.f, contentH - visibleH);
+    overlayScrollOffset_ = std::clamp(overlayScrollOffset_, 0.f, maxScroll);
+
+    float y = pos.y + contentTop - overlayScrollOffset_;
+    for (const auto& line : lines) {
+        if (y >= pos.y + contentTop - lineH && y <= pos.y + size.y - contentBottom) {
+            uiText(window, { pos.x + 24.f, y }, line, 15, sf::Color::White);
+        }
+        y += lineH;
+    }
+
+    if (maxScroll > 0.f) {
+        uiText(window, { pos.x + 24.f, pos.y + size.y - 18.f }, Localization::t("scroll_hint"), 12, sf::Color(160, 160, 160));
+    }
+}
+
+void GameWorld::drawCropPickerOverlay(sf::RenderWindow& window) {
+    sf::Vector2f pos(300.f, 250.f), size(680.f, 340.f);
+    uiPanelBg(window, pos, size);
+    uiText(window, { pos.x + 24.f, pos.y + 16.f }, Localization::t("crop_picker_header"), 20, sf::Color(232, 212, 120), true);
+    uiButton(window, { pos.x + size.x - 120.f, pos.y + 14.f }, { 100.f, 34.f }, Localization::t("close_button"),
+        [this]() { openOverlay(OverlayKind::Businesses); });
+
+    std::string currentCropId;
+    for (const auto& b : game_.businessInfos()) {
+        if (b.id == "farm") { currentCropId = b.cropId; break; }
+    }
+
+    // Compact 3-per-row button grid, same style as drawStaffOverlay's
+    // foreman-focus grid -- 7 crops fits comfortably in 3 rows.
+    float startX = pos.x + 24.f, x = startX, y = pos.y + 70.f;
+    float btnW = 200.f, btnH = 66.f, gapX = 12.f, gapY = 12.f;
+    int perRow = 3, placed = 0;
+    for (const auto& crop : game_.cropOptions()) {
+        bool isCurrent = crop.id == currentCropId;
+        std::string label = Localization::t(crop.id) + "\n" + Localization::t("crop_favorite_prefix") +
+            Localization::t(seasonKey(crop.favoriteSeason)) + Localization::t("crop_favorite_suffix") +
+            (isCurrent ? " *" : "");
+        uiButton(window, { x, y }, { btnW, btnH }, label, [this, id = crop.id]() {
+            ActionResult r = game_.tryChangeCrop(id);
+            if (r.success) {
+                if (upgradeSound_) upgradeSound_->play();
+                openOverlay(OverlayKind::Businesses);
+                setFeedback(Localization::t("crop_changed_prefix") + Localization::t(id), true);
+            } else {
+                setFeedback(Localization::t(r.messageKey), false);
+            }
+        }, !isCurrent);
+        placed++;
+        if (placed % perRow == 0) { x = startX; y += btnH + gapY; }
+        else { x += btnW + gapX; }
+    }
+
+    if (!overlayFeedback_.empty()) {
+        uiText(window, { pos.x + 24.f, pos.y + size.y - 30.f }, overlayFeedback_, 15, overlayFeedbackColor_);
+    }
+}
+
+void GameWorld::drawTimingMinigameOverlay(sf::RenderWindow& window) {
+    MinigameFlavor flavor = minigameFlavorFor(minigameBusinessId_);
+    sf::Vector2f pos(440.f, 280.f), size(400.f, 240.f);
+    uiPanelBg(window, pos, size);
+    uiText(window, { pos.x + 24.f, pos.y + 14.f }, Localization::t(flavor.titleKey), 18, sf::Color(232, 212, 120), true);
+    uiButton(window, { pos.x + size.x - 110.f, pos.y + 12.f }, { 90.f, 32.f }, Localization::t("close_button"), [this]() { closeOverlay(); });
+
+    uiText(window, { pos.x + 24.f, pos.y + 52.f }, Localization::t("fishing_hint"), 12, sf::Color(200, 200, 200));
+
+    float barX = pos.x + 24.f, barY = pos.y + 96.f, barW = size.x - 48.f, barH = 26.f;
+    sf::RectangleShape barBg(sf::Vector2f(barW, barH));
+    barBg.setPosition(sf::Vector2f(barX, barY));
+    barBg.setFillColor(sf::Color(40, 40, 50));
+    barBg.setOutlineThickness(2.f);
+    barBg.setOutlineColor(sf::Color(25, 20, 15));
+    window.draw(barBg);
+
+    float targetX = barX + (minigameTargetCenter_ - minigameTargetHalfWidth_) * barW;
+    float targetW = minigameTargetHalfWidth_ * 2.f * barW;
+    sf::RectangleShape targetZone(sf::Vector2f(targetW, barH));
+    targetZone.setPosition(sf::Vector2f(targetX, barY));
+    targetZone.setFillColor(sf::Color(90, 200, 110, 190));
+    window.draw(targetZone);
+
+    float indicatorPos = 0.5f + 0.5f * std::sin(minigameIndicatorPhase_ * kMinigameIndicatorSpeed);
+    float indicatorX = barX + indicatorPos * barW;
+    sf::RectangleShape indicator(sf::Vector2f(4.f, barH + 10.f));
+    indicator.setPosition(sf::Vector2f(indicatorX - 2.f, barY - 5.f));
+    indicator.setFillColor(flavor.accent);
+    window.draw(indicator);
+
+    uiButton(window, { pos.x + 24.f, barY + 50.f }, { size.x - 48.f, 44.f }, Localization::t(flavor.buttonKey),
+        [this]() { resolveTimingMinigame(); });
+
+    if (!overlayFeedback_.empty()) {
+        uiText(window, { pos.x + 24.f, pos.y + size.y - 28.f }, overlayFeedback_, 13, overlayFeedbackColor_);
+    }
+}
+
+void GameWorld::tryStartTimingMinigame(const std::string& businessId) {
+    bool built = false;
+    for (const auto& info : game_.businessInfos()) {
+        if (info.id == businessId) { built = info.level > 0; break; }
+    }
+    float& cooldown = (businessId == "fishing") ? fishingCooldown_ : miningCooldown_;
+    if (!built) {
+        setFeedback(Localization::t("minigame_needs_building"), false);
+    } else if (cooldown > 0.f) {
+        std::ostringstream oss;
+        oss << Localization::t("fishing_cooldown_prefix") << static_cast<int>(std::ceil(cooldown))
+            << Localization::t("fishing_cooldown_suffix");
+        setFeedback(oss.str(), false);
+    } else {
+        minigameBusinessId_ = businessId;
+        minigameIndicatorPhase_ = 0.f;
+        minigameTargetCenter_ = randRange(0.2f, 0.8f);
+        openOverlay(OverlayKind::TimingMinigame);
+    }
+}
+
+void GameWorld::resolveTimingMinigame() {
+    float indicatorPos = 0.5f + 0.5f * std::sin(minigameIndicatorPhase_ * kMinigameIndicatorSpeed);
+    bool hit = std::abs(indicatorPos - minigameTargetCenter_) <= minigameTargetHalfWidth_;
+    ActionResult r = game_.tryMinigameBonus(minigameBusinessId_, hit);
+    closeOverlay();
+    float& cooldown = (minigameBusinessId_ == "fishing") ? fishingCooldown_ : miningCooldown_;
+    cooldown = kMinigameCooldownSeconds;
+    if (r.success) {
+        if (hit && upgradeSound_) upgradeSound_->play();
+        std::string msg = Localization::t(r.rare ? "minigame_rare_prefix" : (hit ? "fishing_hit_prefix" : "fishing_miss_prefix"))
+            + formatNumber(r.amount) + " " + Localization::t(r.goodId) + Localization::t("minigame_result_suffix");
+        setFeedback(msg, hit);
+    } else {
+        setFeedback(Localization::t(r.messageKey), false);
+    }
+}
+
+void GameWorld::tryStartChopping() {
+    bool built = false;
+    for (const auto& info : game_.businessInfos()) {
+        if (info.id == "lumber") { built = info.level > 0; break; }
+    }
+    if (!built) {
+        setFeedback(Localization::t("minigame_needs_building"), false);
+    } else if (lumberCooldown_ > 0.f) {
+        std::ostringstream oss;
+        oss << Localization::t("fishing_cooldown_prefix") << static_cast<int>(std::ceil(lumberCooldown_))
+            << Localization::t("fishing_cooldown_suffix");
+        setFeedback(oss.str(), false);
+    } else {
+        choppingClicks_ = 0;
+        choppingTimeLeft_ = kChoppingTimeWindow;
+        openOverlay(OverlayKind::Chopping);
+    }
+}
+
+void GameWorld::updateChopping(float dt) {
+    choppingTimeLeft_ -= dt;
+    if (choppingTimeLeft_ <= 0.f) resolveChopping();
+}
+
+void GameWorld::resolveChopping() {
+    bool hit = choppingClicks_ >= kChoppingClicksTarget;
+    ActionResult r = game_.tryMinigameBonus("lumber", hit);
+    closeOverlay();
+    lumberCooldown_ = kLumberCooldownSeconds;
+    if (r.success) {
+        if (hit && upgradeSound_) upgradeSound_->play();
+        std::string msg = Localization::t(hit ? "fishing_hit_prefix" : "fishing_miss_prefix")
+            + formatNumber(r.amount) + " " + Localization::t(r.goodId) + Localization::t("minigame_result_suffix");
+        setFeedback(msg, hit);
+    } else {
+        setFeedback(Localization::t(r.messageKey), false);
+    }
+}
+
+void GameWorld::drawChoppingOverlay(sf::RenderWindow& window) {
+    sf::Vector2f pos(440.f, 280.f), size(400.f, 240.f);
+    uiPanelBg(window, pos, size);
+    uiText(window, { pos.x + 24.f, pos.y + 14.f }, Localization::t("chopping_title"), 18, sf::Color(232, 212, 120), true);
+    uiButton(window, { pos.x + size.x - 110.f, pos.y + 12.f }, { 90.f, 32.f }, Localization::t("close_button"), [this]() { closeOverlay(); });
+
+    uiText(window, { pos.x + 24.f, pos.y + 52.f }, Localization::t("chopping_hint"), 12, sf::Color(200, 200, 200));
+
+    std::ostringstream progressOss;
+    progressOss << choppingClicks_ << " / " << kChoppingClicksTarget;
+    uiText(window, { pos.x + 24.f, pos.y + 86.f }, Localization::t("chopping_progress_prefix") + progressOss.str(), 16, sf::Color::White);
+
+    // Progress bar (clicks) and a shrinking time bar underneath it.
+    float barX = pos.x + 24.f, barW = size.x - 48.f;
+    float clickBarY = pos.y + 116.f, barH = 22.f;
+    sf::RectangleShape clickBg(sf::Vector2f(barW, barH));
+    clickBg.setPosition(sf::Vector2f(barX, clickBarY));
+    clickBg.setFillColor(sf::Color(40, 40, 50));
+    clickBg.setOutlineThickness(2.f);
+    clickBg.setOutlineColor(sf::Color(25, 20, 15));
+    window.draw(clickBg);
+    float clickFrac = std::clamp(static_cast<float>(choppingClicks_) / static_cast<float>(kChoppingClicksTarget), 0.f, 1.f);
+    sf::RectangleShape clickFill(sf::Vector2f(barW * clickFrac, barH));
+    clickFill.setPosition(sf::Vector2f(barX, clickBarY));
+    clickFill.setFillColor(sf::Color(160, 120, 70));
+    window.draw(clickFill);
+
+    float timeBarY = clickBarY + barH + 10.f;
+    sf::RectangleShape timeBg(sf::Vector2f(barW, 10.f));
+    timeBg.setPosition(sf::Vector2f(barX, timeBarY));
+    timeBg.setFillColor(sf::Color(40, 40, 50));
+    window.draw(timeBg);
+    float timeFrac = std::clamp(choppingTimeLeft_ / kChoppingTimeWindow, 0.f, 1.f);
+    sf::RectangleShape timeFill(sf::Vector2f(barW * timeFrac, 10.f));
+    timeFill.setPosition(sf::Vector2f(barX, timeBarY));
+    timeFill.setFillColor(sf::Color(200, 90, 80));
+    window.draw(timeFill);
+
+    uiButton(window, { pos.x + 24.f, timeBarY + 30.f }, { size.x - 48.f, 44.f }, Localization::t("chopping_button"),
+        [this]() { choppingClicks_++; });
+
+    if (!overlayFeedback_.empty()) {
+        uiText(window, { pos.x + 24.f, pos.y + size.y - 28.f }, overlayFeedback_, 13, overlayFeedbackColor_);
+    }
+}
+
+void GameWorld::tryStartBrewing(const std::string& businessId) {
+    bool built = false;
+    for (const auto& info : game_.businessInfos()) {
+        if (info.id == businessId) { built = info.level > 0; break; }
+    }
+    float& cooldown = (businessId == "alchemist") ? alchemistCooldown_ : wineryCooldown_;
+    if (!built) {
+        setFeedback(Localization::t("minigame_needs_building"), false);
+    } else if (cooldown > 0.f) {
+        std::ostringstream oss;
+        oss << Localization::t("fishing_cooldown_prefix") << static_cast<int>(std::ceil(cooldown))
+            << Localization::t("fishing_cooldown_suffix");
+        setFeedback(oss.str(), false);
+    } else {
+        minigameBusinessId_ = businessId;
+        brewSequence_.clear();
+        for (int i = 0; i < kBrewSequenceLength; ++i) brewSequence_.push_back(std::rand() % 4);
+        brewStep_ = 0;
+        brewShowTimer_ = kBrewShowSeconds;
+        brewShowingSequence_ = true;
+        openOverlay(OverlayKind::Brewing);
+    }
+}
+
+void GameWorld::updateBrewing(float dt) {
+    if (!brewShowingSequence_) return;
+    brewShowTimer_ -= dt;
+    if (brewShowTimer_ <= 0.f) {
+        brewShowingSequence_ = false;
+        brewStep_ = 0;
+    }
+}
+
+void GameWorld::handleBrewClick(int colorIndex) {
+    if (brewShowingSequence_ || brewStep_ >= brewSequence_.size()) return;
+    if (colorIndex != brewSequence_[brewStep_]) {
+        resolveBrewing(false);
+        return;
+    }
+    brewStep_++;
+    if (brewStep_ >= brewSequence_.size()) resolveBrewing(true);
+}
+
+void GameWorld::resolveBrewing(bool hit) {
+    ActionResult r = game_.tryMinigameBonus(minigameBusinessId_, hit);
+    closeOverlay();
+    float& cooldown = (minigameBusinessId_ == "alchemist") ? alchemistCooldown_ : wineryCooldown_;
+    cooldown = kMinigameCooldownSeconds;
+    if (r.success) {
+        if (hit && upgradeSound_) upgradeSound_->play();
+        std::string msg = Localization::t(hit ? "fishing_hit_prefix" : "fishing_miss_prefix")
+            + formatNumber(r.amount) + " " + Localization::t(r.goodId) + Localization::t("minigame_result_suffix");
+        setFeedback(msg, hit);
+    } else {
+        setFeedback(Localization::t(r.messageKey), false);
+    }
+}
+
+void GameWorld::drawBrewingOverlay(sf::RenderWindow& window) {
+    static const sf::Color kBrewColors[4] = {
+        sf::Color(210, 90, 90), sf::Color(90, 150, 210), sf::Color(110, 200, 120), sf::Color(220, 200, 90)
+    };
+
+    sf::Vector2f pos(440.f, 260.f), size(400.f, 280.f);
+    uiPanelBg(window, pos, size);
+    uiText(window, { pos.x + 24.f, pos.y + 14.f }, Localization::t("brewing_title"), 18, sf::Color(232, 212, 120), true);
+    uiButton(window, { pos.x + size.x - 110.f, pos.y + 12.f }, { 90.f, 32.f }, Localization::t("close_button"), [this]() { closeOverlay(); });
+
+    uiText(window, { pos.x + 24.f, pos.y + 52.f },
+        Localization::t(brewShowingSequence_ ? "brewing_hint_memorize" : "brewing_hint_repeat"), 12, sf::Color(200, 200, 200));
+
+    // The sequence row: full-color while memorizing, and while repeating it
+    // shows a filled-in swatch for each already-correct step (so the player
+    // can see their own progress) and a dim placeholder for the rest.
+    float swatchSize = 44.f, gap = 12.f;
+    float rowW = static_cast<float>(kBrewSequenceLength) * swatchSize + static_cast<float>(kBrewSequenceLength - 1) * gap;
+    float rowX = pos.x + (size.x - rowW) / 2.f, rowY = pos.y + 90.f;
+    for (int i = 0; i < kBrewSequenceLength; ++i) {
+        sf::RectangleShape swatch(sf::Vector2f(swatchSize, swatchSize));
+        swatch.setPosition(sf::Vector2f(rowX + static_cast<float>(i) * (swatchSize + gap), rowY));
+        bool reveal = brewShowingSequence_ || static_cast<size_t>(i) < brewStep_;
+        swatch.setFillColor(reveal ? kBrewColors[static_cast<size_t>(brewSequence_[static_cast<size_t>(i)])] : sf::Color(50, 50, 58));
+        swatch.setOutlineThickness(2.f);
+        swatch.setOutlineColor(sf::Color(25, 20, 15));
+        window.draw(swatch);
+    }
+
+    if (!brewShowingSequence_) {
+        // Four clickable color buttons to reproduce the sequence with.
+        float btnSize = 70.f, btnGap = 14.f;
+        float btnRowW = 4.f * btnSize + 3.f * btnGap;
+        float btnX = pos.x + (size.x - btnRowW) / 2.f, btnY = pos.y + 170.f;
+        for (int i = 0; i < 4; ++i) {
+            sf::Vector2f btnPos(btnX + static_cast<float>(i) * (btnSize + btnGap), btnY);
+            sf::RectangleShape btn(sf::Vector2f(btnSize, btnSize));
+            btn.setPosition(btnPos);
+            btn.setFillColor(kBrewColors[static_cast<size_t>(i)]);
+            btn.setOutlineThickness(2.f);
+            btn.setOutlineColor(sf::Color(232, 212, 120));
+            window.draw(btn);
+            overlayClickRegions_.push_back(ClickRegion{ sf::FloatRect(btnPos, sf::Vector2f(btnSize, btnSize)),
+                [this, i]() { handleBrewClick(i); } });
+        }
+    }
+
+    if (!overlayFeedback_.empty()) {
+        uiText(window, { pos.x + 24.f, pos.y + size.y - 28.f }, overlayFeedback_, 13, overlayFeedbackColor_);
+    }
+}
+
+void GameWorld::drawDeathNoticeOverlay(sf::RenderWindow& window) {
+    sf::Vector2f pos(320.f, 210.f), size(640.f, 360.f);
+    uiPanelBg(window, pos, size);
+    uiText(window, { pos.x + 24.f, pos.y + 20.f }, Localization::t("death_notice_title"), 22, sf::Color(230, 120, 110), true);
+    uiText(window, { pos.x + 24.f, pos.y + 70.f }, deathNoticeMessage_, 15);
+
+    // handleDeath() already reset Game's own peakMoney() to the new
+    // generation's starting cash by the time this draws, so the life that
+    // just ended is read back from the history entry it recorded instead
+    // (its `generation` is deathNoticeGeneration_ - 1, since that counter
+    // was already incremented too).
+    double peak = 0.0;
+    for (const auto& rec : game_.generationHistory()) {
+        if (rec.generation == deathNoticeGeneration_ - 1) { peak = rec.peakMoney; break; }
+    }
+    uiText(window, { pos.x + 24.f, pos.y + 106.f }, Localization::t("death_peak_prefix") + formatNumber(peak), 14);
+    uiText(window, { pos.x + 24.f, pos.y + 132.f },
+        Localization::t("achievements_button") + ": " + std::to_string(game_.unlockedAchievementCount()), 14);
+    uiText(window, { pos.x + 24.f, pos.y + 166.f },
+        Localization::t("generation_prefix") + std::to_string(deathNoticeGeneration_) + Localization::t("generation_suffix"), 14);
+
+    uiButton(window, { pos.x + size.x / 2.f - 100.f, pos.y + size.y - 70.f }, { 200.f, 44.f },
+        Localization::t("death_notice_continue"), [this]() { closeOverlay(); });
+}
+
+void GameWorld::drawLegacyOverlay(sf::RenderWindow& window) {
+    sf::Vector2f pos(260.f, 90.f), size(760.f, 680.f);
+    uiPanelBg(window, pos, size);
+    uiText(window, { pos.x + 24.f, pos.y + 16.f }, Localization::t("menu_legacy_header"), 20, sf::Color(232, 212, 120), true);
+    uiButton(window, { pos.x + size.x - 120.f, pos.y + 14.f }, { 100.f, 34.f }, Localization::t("close_button"), [this]() { closeOverlay(); });
+
+    uiText(window, { pos.x + 24.f, pos.y + 70.f }, Localization::t("legacy_points_label") + std::to_string(game_.legacyPoints()), 17, sf::Color(232, 212, 120), true);
+
+    float y = pos.y + 116.f;
+    uiText(window, { pos.x + 24.f, y },
+        Localization::t("legacy_cash_option_prefix") + formatNumber(static_cast<double>(game_.legacyCashLevel()) * game_.legacyCashBonusPerLevel()), 15);
+    y += 26.f;
+    uiButton(window, { pos.x + 24.f, y }, { 320.f, 44.f },
+        Localization::t("upgrade_button") + " (" + std::to_string(game_.legacyCashUpgradeCost()) + Localization::t("legacy_points_suffix"),
+        [this]() {
+            ActionResult r = game_.tryBuyLegacyCashLevel();
+            if (r.success) setFeedback(Localization::t("legacy_bought_prefix") + std::to_string(r.count), true);
+            else setFeedback(Localization::t(r.messageKey), false);
+        });
+    y += 74.f;
+
+    std::ostringstream prodOss;
+    prodOss << std::fixed << std::setprecision(0) << (static_cast<double>(game_.legacyProdLevel()) * game_.legacyProdBonusPercentPerLevel());
+    uiText(window, { pos.x + 24.f, y }, Localization::t("legacy_prod_option_prefix") + prodOss.str() + "%", 15);
+    y += 26.f;
+    uiButton(window, { pos.x + 24.f, y }, { 320.f, 44.f },
+        Localization::t("upgrade_button") + " (" + std::to_string(game_.legacyProdUpgradeCost()) + Localization::t("legacy_points_suffix"),
+        [this]() {
+            ActionResult r = game_.tryBuyLegacyProdLevel();
+            if (r.success) setFeedback(Localization::t("legacy_bought_prefix") + std::to_string(r.count), true);
+            else setFeedback(Localization::t(r.messageKey), false);
+        });
+    y += 74.f;
+
+    bool seasonMaxed = game_.legacySeasonLevel() >= Game::kLegacySeasonMaxLevel;
+    std::ostringstream seasonOss;
+    seasonOss << std::fixed << std::setprecision(0) << (game_.legacySeasonNegation() * 100.0);
+    uiText(window, { pos.x + 24.f, y }, Localization::t("legacy_season_option_prefix") + seasonOss.str() + "%", 15);
+    y += 26.f;
+    uiButton(window, { pos.x + 24.f, y }, { 320.f, 44.f },
+        seasonMaxed ? Localization::t("legacy_season_maxed_suffix")
+                    : Localization::t("upgrade_button") + " (" + std::to_string(game_.legacySeasonUpgradeCost()) + Localization::t("legacy_points_suffix"),
+        [this]() {
+            ActionResult r = game_.tryBuyLegacySeasonLevel();
+            if (r.success) setFeedback(Localization::t("legacy_bought_prefix") + std::to_string(r.count), true);
+            else setFeedback(Localization::t(r.messageKey), false);
+        }, !seasonMaxed);
+    y += 74.f;
+
+    uiText(window, { pos.x + 24.f, y }, Localization::t("history_header"), 16, sf::Color(232, 212, 120), true);
+    y += 28.f;
+    auto history = game_.generationHistory();
+    if (history.empty()) {
+        uiText(window, { pos.x + 24.f, y }, Localization::t("contract_none_active"), 14, sf::Color(180, 180, 180));
+    } else {
+        // A horizontal dot-per-generation timeline above the existing detail
+        // lines -- brighter/bigger dot means a higher peak net worth that
+        // life, relative to the others currently shown (capped at
+        // kMaxHistoryEntries, so this never needs its own scrolling).
+        double maxPeak = 0.0;
+        for (const auto& rec : history) maxPeak = std::max(maxPeak, rec.peakMoney);
+        if (maxPeak < 1.0) maxPeak = 1.0;
+
+        float lineY = y + 10.f;
+        float startX = pos.x + 24.f, endX = pos.x + size.x - 24.f;
+        sf::Vertex axisLine[] = {
+            sf::Vertex{ sf::Vector2f(startX, lineY), sf::Color(120, 120, 130) },
+            sf::Vertex{ sf::Vector2f(endX, lineY), sf::Color(120, 120, 130) },
+        };
+        window.draw(axisLine, 2, sf::PrimitiveType::Lines);
+
+        float stepX = history.size() > 1 ? (endX - startX) / static_cast<float>(history.size() - 1) : 0.f;
+        for (size_t i = 0; i < history.size(); ++i) {
+            float dx = history.size() > 1 ? startX + stepX * static_cast<float>(i) : (startX + endX) / 2.f;
+            float frac = static_cast<float>(history[i].peakMoney / maxPeak);
+            sf::Color dotColor(
+                static_cast<std::uint8_t>(120.f + 110.f * frac),
+                static_cast<std::uint8_t>(130.f + 70.f * frac),
+                80);
+            float radius = 5.f + 4.f * frac;
+            sf::CircleShape dot(radius);
+            dot.setPosition(sf::Vector2f(dx - radius, lineY - radius));
+            dot.setFillColor(dotColor);
+            dot.setOutlineThickness(1.5f);
+            dot.setOutlineColor(sf::Color(25, 20, 15));
+            window.draw(dot);
+
+            std::string genLabel = std::to_string(history[i].generation);
+            uiText(window, { dx - 4.f * static_cast<float>(genLabel.size()), lineY + 10.f }, genLabel, 11, sf::Color(200, 200, 200));
+        }
+        y += 40.f;
+
+        for (const auto& rec : history) {
+            std::ostringstream oss;
+            oss << Localization::t("history_entry_prefix") << rec.generation
+                << Localization::t("history_entry_mid1") << formatNumber(rec.peakMoney)
+                << Localization::t("history_entry_mid2") << std::fixed << std::setprecision(1) << rec.ageYears
+                << Localization::t("history_entry_mid3") << rec.cause;
+            uiText(window, { pos.x + 24.f, y }, oss.str(), 13, sf::Color(210, 210, 210));
+            y += 22.f;
+        }
+    }
+
+    if (!overlayFeedback_.empty()) {
+        uiText(window, { pos.x + 24.f, pos.y + size.y - 30.f }, overlayFeedback_, 15, overlayFeedbackColor_);
+    }
+}
+
+void GameWorld::drawDialogueOverlay(sf::RenderWindow& window) {
+    // Classic bottom-of-screen dialogue box, sized to sit just above the HUD
+    // bar. NPC lines are short enough (checked against the panel width) that
+    // this doesn't need word-wrapping.
+    sf::Vector2f pos(140.f, 540.f), size(1000.f, 200.f);
+    uiPanelBg(window, pos, size);
+    uiButton(window, { pos.x + size.x - 120.f, pos.y + 14.f }, { 100.f, 34.f }, Localization::t("close_button"), [this]() { closeOverlay(); });
+
+    uiText(window, { pos.x + 24.f, pos.y + 18.f }, dialogueSpeaker_, 19, sf::Color(232, 212, 120), true);
+    uiText(window, { pos.x + 24.f, pos.y + 64.f }, dialogueText_, 16, sf::Color::White);
+
+    if (dialogueNpc_ && dialogueNpc_->hasQuest) {
+        double have = 0.0;
+        for (const auto& g : game_.goodInfos()) {
+            if (g.id == dialogueNpc_->questGoodId) { have = g.stock; break; }
+        }
+        bool canTurnIn = have >= dialogueNpc_->questQty;
+        uiButton(window, { pos.x + 24.f, pos.y + 120.f }, { 200.f, 44.f }, Localization::t("quest_turn_in_button"),
+            [this]() {
+                Npc* npc = dialogueNpc_;
+                if (!npc) return;
+                ActionResult r = game_.tryFulfillQuest(npc->questGoodId, npc->questQty, npc->questReward);
+                if (r.success) {
+                    npc->hasQuest = false;
+                    npc->questRollTimer = randRange(30.f, 60.f);
+                    dialogueText_ = Localization::t("quest_thanks");
+                    setFeedback(Localization::t("quest_completed_prefix") + formatNumber(r.amount), true);
+                } else {
+                    setFeedback(Localization::t(r.messageKey), false);
+                }
+            }, canTurnIn);
+        if (!canTurnIn) {
+            std::ostringstream needOss;
+            needOss << Localization::t("quest_need_prefix") << formatNumber(dialogueNpc_->questQty - have) << " " << Localization::t("quest_need_suffix");
+            uiText(window, { pos.x + 240.f, pos.y + 134.f }, needOss.str(), 13, sf::Color(200, 150, 150));
+        }
+    }
+
+    if (dialogueNpc_ && dialogueNpc_->hasDeal) {
+        bool canAfford = game_.money() >= dialogueNpc_->dealTotalPrice;
+        uiButton(window, { pos.x + 24.f, pos.y + 120.f }, { 200.f, 44.f }, Localization::t("deal_buy_button"),
+            [this]() {
+                Npc* npc = dialogueNpc_;
+                if (!npc) return;
+                ActionResult r = game_.tryBuyDeal(npc->dealGoodId, npc->dealQty, npc->dealTotalPrice);
+                if (r.success) {
+                    npc->hasDeal = false;
+                    npc->dealRollTimer = randRange(40.f, 80.f);
+                    dialogueText_ = Localization::t("deal_thanks");
+                    setFeedback(Localization::t("deal_bought_prefix") + formatNumber(r.amount), true);
+                } else {
+                    setFeedback(Localization::t(r.messageKey), false);
+                }
+            }, canAfford);
+        if (!canAfford) {
+            uiText(window, { pos.x + 240.f, pos.y + 134.f }, Localization::t("not_enough_cash_prefix") + formatNumber(dialogueNpc_->dealTotalPrice), 13, sf::Color(200, 150, 150));
+        }
+    }
+
+    if (!overlayFeedback_.empty()) {
+        uiText(window, { pos.x + 24.f, pos.y + 170.f }, overlayFeedback_, 14, overlayFeedbackColor_);
+    }
+
+    uiText(window, { pos.x + 24.f, pos.y + size.y - 30.f }, Localization::t("dialogue_continue_hint"), 13, sf::Color(180, 180, 180));
+}
+
+void GameWorld::drawBankOverlay(sf::RenderWindow& window) {
+    sf::Vector2f pos(360.f, 220.f), size(560.f, 360.f);
+    uiPanelBg(window, pos, size);
+    uiText(window, { pos.x + 24.f, pos.y + 16.f }, Localization::t("menu_bank_header"), 20, sf::Color(232, 212, 120), true);
+    uiButton(window, { pos.x + size.x - 120.f, pos.y + 14.f }, { 100.f, 34.f }, Localization::t("close_button"), [this]() { closeOverlay(); });
+
+    uiText(window, { pos.x + 24.f, pos.y + 70.f }, Localization::t("bank_cash_label") + formatNumber(game_.money()), 15);
+    std::ostringstream feeOss;
+    feeOss << Localization::t("bank_balance_label") << formatNumber(game_.bankBalance())
+        << Localization::t("bank_fee_note") << std::fixed << std::setprecision(0) << (game_.bankWithdrawFeeRate() * 100.0) << "%)";
+    uiText(window, { pos.x + 24.f, pos.y + 100.f }, feeOss.str(), 15);
+
+    auto doDeposit = [this](double amt) {
+        ActionResult r = game_.tryBankDeposit(amt);
+        if (r.success) setFeedback(Localization::t("bank_deposited_prefix") + formatNumber(r.amount), true);
+        else setFeedback(Localization::t(r.messageKey), false);
+    };
+    auto doWithdraw = [this](double amt) {
+        ActionResult r = game_.tryBankWithdraw(amt);
+        if (r.success) setFeedback(Localization::t("bank_withdrew_prefix") + formatNumber(r.amount), true);
+        else setFeedback(Localization::t(r.messageKey), false);
+    };
+
+    float btnW = 110.f, btnH = 42.f, gap = 10.f;
+    float depositY = pos.y + 160.f;
+    uiText(window, { pos.x + 24.f, depositY - 20.f }, Localization::t("deposit_button"), 13, sf::Color(200, 200, 200));
+    uiButton(window, { pos.x + 24.f, depositY }, { btnW, btnH }, "$50", [doDeposit]() { doDeposit(50.0); });
+    uiButton(window, { pos.x + 24.f + (btnW + gap), depositY }, { btnW, btnH }, "$200", [doDeposit]() { doDeposit(200.0); });
+    uiButton(window, { pos.x + 24.f + 2.f * (btnW + gap), depositY }, { btnW, btnH }, Localization::t("qty_all"),
+        [this, doDeposit]() { doDeposit(game_.money()); });
+
+    float withdrawY = depositY + btnH + 34.f;
+    uiText(window, { pos.x + 24.f, withdrawY - 20.f }, Localization::t("withdraw_button"), 13, sf::Color(200, 200, 200));
+    uiButton(window, { pos.x + 24.f, withdrawY }, { btnW, btnH }, "$50", [doWithdraw]() { doWithdraw(50.0); });
+    uiButton(window, { pos.x + 24.f + (btnW + gap), withdrawY }, { btnW, btnH }, "$200", [doWithdraw]() { doWithdraw(200.0); });
+    uiButton(window, { pos.x + 24.f + 2.f * (btnW + gap), withdrawY }, { btnW, btnH }, Localization::t("qty_all"),
+        [this, doWithdraw]() { doWithdraw(game_.bankBalance()); });
+
+    if (!overlayFeedback_.empty()) {
+        uiText(window, { pos.x + 24.f, pos.y + size.y - 30.f }, overlayFeedback_, 15, overlayFeedbackColor_);
+    }
+}
+
+void GameWorld::drawWarehouseOverlay(sf::RenderWindow& window) {
+    sf::Vector2f pos(400.f, 260.f), size(480.f, 300.f);
+    uiPanelBg(window, pos, size);
+    uiText(window, { pos.x + 24.f, pos.y + 16.f }, Localization::t("menu_warehouse_header"), 20, sf::Color(232, 212, 120), true);
+    uiButton(window, { pos.x + size.x - 120.f, pos.y + 14.f }, { 100.f, 34.f }, Localization::t("close_button"), [this]() { closeOverlay(); });
+
+    std::ostringstream info;
+    info << Localization::t("warehouse_level_label") << game_.warehouseLevel()
+        << Localization::t("warehouse_cap_label") << formatNumber(game_.maxStockPerGood()) << ")";
+    uiText(window, { pos.x + 24.f, pos.y + 70.f }, info.str(), 15);
+    uiText(window, { pos.x + 24.f, pos.y + 104.f }, Localization::t("warehouse_cost_prefix") + formatNumber(game_.warehouseNextCost()), 15);
+
+    uiButton(window, { pos.x + 24.f, pos.y + 160.f }, { 200.f, 44.f }, Localization::t("upgrade_button"), [this]() {
+        ActionResult r = game_.tryUpgradeWarehouse();
+        if (r.success) setFeedback(Localization::t("warehouse_upgraded_prefix") + std::to_string(game_.warehouseLevel()), true);
+        else setFeedback(Localization::t(r.messageKey), false);
+    });
+
+    if (!overlayFeedback_.empty()) {
+        uiText(window, { pos.x + 24.f, pos.y + size.y - 34.f }, overlayFeedback_, 15, overlayFeedbackColor_);
+    }
+}
+
+void GameWorld::drawContractsOverlay(sf::RenderWindow& window) {
+    sf::Vector2f pos(360.f, 190.f), size(600.f, 440.f);
+    uiPanelBg(window, pos, size);
+    uiText(window, { pos.x + 24.f, pos.y + 16.f }, Localization::t("menu_contracts_header"), 20, sf::Color(232, 212, 120), true);
+    uiButton(window, { pos.x + size.x - 120.f, pos.y + 14.f }, { 100.f, 34.f }, Localization::t("close_button"), [this]() { closeOverlay(); });
+
+    auto list = game_.contracts();
+    float y = pos.y + 70.f, rowH = 50.f;
+    for (size_t i = 0; i < list.size(); ++i) {
+        sf::RectangleShape rowBg(sf::Vector2f(size.x - 48.f, rowH - 8.f));
+        rowBg.setPosition(sf::Vector2f(pos.x + 24.f, y));
+        rowBg.setFillColor(sf::Color(50, 52, 62));
+        window.draw(rowBg);
+        uiText(window, { pos.x + 34.f, y + 12.f }, Localization::t(list[i].goodId) + " @ $" + formatNumber(list[i].lockedPrice), 15);
+        uiButton(window, { pos.x + size.x - 170.f, y + 3.f }, { 130.f, rowH - 16.f }, Localization::t("fulfill_button"),
+            [this, idx = static_cast<int>(i)]() {
+                ActionResult r = game_.tryFulfillContract(idx);
+                if (r.success) setFeedback(Localization::t("contract_fulfilled_prefix") + formatNumber(r.amount), true);
+                else setFeedback(Localization::t(r.messageKey), false);
+            });
+        y += rowH;
+    }
+    if (list.empty()) {
+        uiText(window, { pos.x + 24.f, y }, Localization::t("contract_none_active"), 14, sf::Color(180, 180, 180));
+        y += rowH;
+    }
+
+    y += 20.f;
+    auto goods = game_.goodInfos();
+    bool haveSlot = static_cast<int>(list.size()) < 3;
+    if (!haveSlot) {
+        uiText(window, { pos.x + 24.f, y }, Localization::t("contract_slots_full"), 14, sf::Color(180, 120, 120));
+    } else if (selectedGoodIndex_ >= 0 && selectedGoodIndex_ < static_cast<int>(goods.size())) {
+        const auto& sel = goods[static_cast<size_t>(selectedGoodIndex_)];
+        uiText(window, { pos.x + 24.f, y },
+            Localization::t("contract_sign_selected_prefix") + Localization::t(sel.id) + " ($" + formatNumber(sel.price) + ")", 14);
+        y += 26.f;
+        uiButton(window, { pos.x + 24.f, y }, { 240.f, 44.f }, Localization::t("contract_sign_option"),
+            [this, id = sel.id]() {
+                ActionResult r = game_.trySignContract(id);
+                if (r.success) setFeedback(Localization::t("contract_signed_prefix") + Localization::t(id), true);
+                else setFeedback(Localization::t(r.messageKey), false);
+            });
+    }
+
+    if (!overlayFeedback_.empty()) {
+        uiText(window, { pos.x + 24.f, pos.y + size.y - 30.f }, overlayFeedback_, 15, overlayFeedbackColor_);
+    }
+}
+
+void GameWorld::run() {
+    // Every building/UI position and the walk-off-edge bounds are absolute
+    // pixel coordinates sized for the logical windowSize_ (fixed at
+    // 1280x820), not the real window -- gameView_ (see applyVideoMode) maps
+    // one onto the other, so the player's chosen resolution/fullscreen never
+    // desyncs mouse clicks or the movement bounds from what's drawn.
+    settings_ = SettingsManager::load();
+    UpdateChecker::startCheck(); // no-op if Main.cpp's console path already started it
+    sf::RenderWindow window;
+    applyVideoMode(window);
+
+    // Microsoft YaHei covers both Chinese and Latin glyphs; Arial (Latin-only)
+    // is just the fallback for systems without it, and won't render Chinese text.
+    fontLoaded_ = font_.openFromFile("C:/Windows/Fonts/msyh.ttc");
+    if (!fontLoaded_) fontLoaded_ = font_.openFromFile("C:/Windows/Fonts/arial.ttf");
+    if (!fontLoaded_) {
+        std::cout << "[GameWorld] Could not load a system font; building/HUD labels will be blank, but the game still works.\n";
+    }
+
+    initAudio();
+    buildZones();
+    currentZone_ = 0;
+    playerPos_ = sf::Vector2f(620.f, 400.f);
+    // Baseline so an already-unlocked achievement from a loaded save doesn't
+    // falsely trigger the fanfare on the very first frame.
+    lastAchievementCount_ = game_.unlockedAchievementCount();
+    // Baseline so a mid-cycle load doesn't fire a spurious transition on the
+    // very first frame the season is actually checked (see the tick loop below).
+    lastSeason_ = game_.currentSeason();
+
+    while (window.isOpen() && showingTutorial_) {
+        while (const std::optional event = window.pollEvent()) {
+            if (event->is<sf::Event::Closed>()) window.close();
+            else if (event->is<sf::Event::KeyPressed>() || event->is<sf::Event::MouseButtonPressed>()) showingTutorial_ = false;
+        }
+        drawTutorial(window);
+    }
+
+    sf::Clock clock;
+    while (window.isOpen()) {
+        while (const std::optional event = window.pollEvent()) {
+            if (event->is<sf::Event::Closed>()) {
+                window.close();
+            } else if (const auto* keyPressed = event->getIf<sf::Event::KeyPressed>()) {
+                if (awaitingRebind_ != RebindAction::None) {
+                    // Settings overlay is waiting for a key to (re)bind (see
+                    // drawSettingsOverlay's "Rebind" buttons) -- this keypress
+                    // is consumed entirely here, not passed through to the
+                    // normal handling below (so binding Interact to E, say,
+                    // doesn't also trigger an E-interact this same frame).
+                    if (keyPressed->code == sf::Keyboard::Key::Escape) {
+                        awaitingRebind_ = RebindAction::None; // cancel, no change
+                    } else if (sf::Keyboard::Key* target = settings_.keys.find(awaitingRebind_)) {
+                        sf::Keyboard::Key newKey = keyPressed->code;
+                        sf::Keyboard::Key oldKey = *target;
+                        // Already used by a different bindable action -> swap
+                        // instead of leaving both actions on the same key.
+                        RebindAction swappedWith = RebindAction::None;
+                        for (RebindAction other : { RebindAction::MoveUp, RebindAction::MoveDown, RebindAction::MoveLeft,
+                            RebindAction::MoveRight, RebindAction::Interact, RebindAction::QuickUpgrade,
+                            RebindAction::Minimap, RebindAction::Minigame }) {
+                            if (other == awaitingRebind_) continue;
+                            if (sf::Keyboard::Key* otherKey = settings_.keys.find(other); otherKey && *otherKey == newKey) {
+                                *otherKey = oldKey;
+                                swappedWith = other;
+                                break;
+                            }
+                        }
+                        *target = newKey;
+                        SettingsManager::save(settings_);
+                        setFeedback(swappedWith != RebindAction::None
+                            ? Localization::t("settings_rebind_swapped_prefix") + Localization::t(rebindActionLabelKey(swappedWith)) + Localization::t("settings_rebind_swapped_suffix")
+                            : Localization::t("settings_rebind_updated"), true);
+                        awaitingRebind_ = RebindAction::None;
+                    }
+                } else if (keyPressed->code == sf::Keyboard::Key::Escape && currentOverlay_ == OverlayKind::None) {
+                    openOverlay(OverlayKind::Pause);
+                } else if (keyPressed->code == sf::Keyboard::Key::Escape && currentOverlay_ != OverlayKind::None
+                    && currentOverlay_ != OverlayKind::DeathNotice) {
+                    closeOverlay();
+                } else if (keyPressed->code == settings_.keys.interact && currentOverlay_ == OverlayKind::None) {
+                    if (Npc* npc = findNearbyNpc(kInteractRadius)) {
+                        handleNpcTalk(*npc);
+                    } else if (Forageable* f = findNearbyForageable(kForageRadius)) {
+                        ActionResult r = game_.tryForage();
+                        if (r.success) {
+                            f->active = false;
+                            f->respawnTimer = kForageRespawnSeconds;
+                            if (interactSound_) interactSound_->play();
+                            setFeedback(Localization::t("forage_prefix") + formatNumber(r.amount) + " " + Localization::t(r.goodId), true);
+                        }
+                    } else if (const WorldBuilding* b = findNearbyBuilding(kInteractRadius)) {
+                        handleInteraction(*b);
+                    }
+                } else if (keyPressed->code == settings_.keys.interact && currentOverlay_ == OverlayKind::Dialogue) {
+                    // "Press E to continue" -- symmetric with E opening it in the first place.
+                    closeOverlay();
+                } else if (keyPressed->code == settings_.keys.minimap && currentOverlay_ == OverlayKind::None) {
+                    showMinimap_ = !showMinimap_;
+                } else if (keyPressed->code == settings_.keys.quickUpgrade && currentOverlay_ == OverlayKind::None) {
+                    // Quick-upgrade: one level on whichever unlocked business
+                    // building is nearby, without opening its panel -- for a
+                    // player who already knows what they're doing and doesn't
+                    // want to stop and click through it every time. Guarded
+                    // against service buildings (market, staff, ...): those
+                    // aren't in businessInfos() at all, so isBusinessLocked()
+                    // alone would silently say "not locked" for them too.
+                    if (const WorldBuilding* b = findNearbyBuilding(kInteractRadius)) {
+                        bool isBusiness = false;
+                        for (const auto& info : game_.businessInfos()) {
+                            if (info.id == b->id) { isBusiness = true; break; }
+                        }
+                        if (isBusiness && !game_.isBusinessLocked(b->id)) {
+                            handleUpgradeResult(game_.tryUpgradeBusinessBulk(b->id, 1), b->id);
+                        }
+                    }
+                } else if (keyPressed->code == settings_.keys.minigame && currentOverlay_ == OverlayKind::None) {
+                    // Minigames: only meaningful right next to the matching
+                    // built business. Fishing Dock and Mine/Gold Mine share
+                    // the timing-bar mechanic; Lumber Camp has its own.
+                    if (const WorldBuilding* b = findNearbyBuilding(kInteractRadius)) {
+                        if (b->id == "fishing" || b->id == "mine" || b->id == "goldmine") {
+                            tryStartTimingMinigame(b->id);
+                        } else if (b->id == "lumber") {
+                            tryStartChopping();
+                        } else if (b->id == "alchemist" || b->id == "winery") {
+                            tryStartBrewing(b->id);
+                        }
+                    }
+                } else if (keyPressed->code == sf::Keyboard::Key::Space && currentOverlay_ == OverlayKind::TimingMinigame) {
+                    resolveTimingMinigame();
+                } else if (keyPressed->code == sf::Keyboard::Key::Space && currentOverlay_ == OverlayKind::Chopping) {
+                    choppingClicks_++;
+                }
+            } else if (const auto* mousePressed = event->getIf<sf::Event::MouseButtonPressed>()) {
+                if (mousePressed->button == sf::Mouse::Button::Left) {
+                    // Real window pixel -> logical windowSize_ space, through
+                    // whatever letterboxed view applyVideoMode set up -- keeps
+                    // every ClickRegion/building hit test correct regardless
+                    // of the player's chosen resolution/fullscreen.
+                    sf::Vector2f click = window.mapPixelToCoords(mousePressed->position, gameView_);
+                    if (currentOverlay_ != OverlayKind::None) {
+                        // Click regions were registered by last frame's draw of this same
+                        // overlay (immediate-mode style) — the layout doesn't move frame to
+                        // frame, so testing against them here is safe and simple.
+                        for (const auto& region : overlayClickRegions_) {
+                            if (region.bounds.contains(click)) { region.onClick(); break; }
+                        }
+                    } else if (achievementsButtonBounds().contains(click)) {
+                        openOverlay(OverlayKind::Achievements);
+                    } else if (howToPlayButtonBounds().contains(click)) {
+                        openOverlay(OverlayKind::HowToPlay);
+                    } else {
+                        bool handled = false;
+                        for (auto& npc : zones_[currentZone_].npcs) {
+                            sf::FloatRect npcRect(npc.pos - sf::Vector2f(kPlayerSize / 2.f, kPlayerSize / 2.f), sf::Vector2f(kPlayerSize, kPlayerSize));
+                            if (npcRect.contains(click)) { handleNpcTalk(npc); handled = true; break; }
+                        }
+                        if (!handled) {
+                            for (const auto& b : zones_[currentZone_].buildings) {
+                                if (sf::FloatRect(b.position, b.size).contains(click)) { handleInteraction(b); break; }
+                            }
+                        }
+                    }
+                }
+            } else if (const auto* wheel = event->getIf<sf::Event::MouseWheelScrolled>()) {
+                // Shared by every scrollable overlay (Tree, How to Play,
+                // Market, Staff's focus grid) -- each one's own draw
+                // function clamps this against that frame's actual content
+                // height, so accumulating the raw delta here is harmless
+                // even for overlays that don't happen to need scrolling.
+                if (currentOverlay_ != OverlayKind::None) {
+                    overlayScrollOffset_ -= wheel->delta * 3.f * 24.f;
+                    if (overlayScrollOffset_ < 0.f) overlayScrollOffset_ = 0.f;
+                }
+            }
+        }
+
+        float dt = clock.restart().asSeconds();
+
+        historySampleTimer_ -= dt;
+        if (historySampleTimer_ <= 0.f) {
+            historySampleTimer_ = kHistorySampleInterval;
+            moneyHistory_.push_back(static_cast<float>(game_.money()));
+            if (moneyHistory_.size() > kMaxHistorySamples) moneyHistory_.erase(moneyHistory_.begin());
+        }
+
+        // Keeps counting down even while some other menu is open, unlike
+        // the movement/world-tick block below.
+        if (fishingCooldown_ > 0.f) fishingCooldown_ -= dt;
+        if (miningCooldown_ > 0.f) miningCooldown_ -= dt;
+        if (lumberCooldown_ > 0.f) lumberCooldown_ -= dt;
+        if (alchemistCooldown_ > 0.f) alchemistCooldown_ -= dt;
+        if (wineryCooldown_ > 0.f) wineryCooldown_ -= dt;
+        if (currentOverlay_ == OverlayKind::TimingMinigame) minigameIndicatorPhase_ += dt;
+        if (currentOverlay_ == OverlayKind::Chopping) updateChopping(dt);
+        if (currentOverlay_ == OverlayKind::Brewing) updateBrewing(dt);
+        updateForaging(dt);
+
+        // Movement, zone transitions, and the world tick are all paused while
+        // an overlay is open — mirroring how the classic console version
+        // effectively blocked on a menu until it returned.
+        if (currentOverlay_ == OverlayKind::None) {
+            updateDayNightAndWeather(dt);
+            waterWaveTimer_ += dt;
+
+            // Arrow keys always work as a fixed second binding on top of
+            // whichever key settings_.keys assigns to each direction (see
+            // Settings.h) -- so rebinding never leaves the player with no way
+            // to move, even mid-rebind.
+            sf::Vector2f move(0.f, 0.f);
+            if (sf::Keyboard::isKeyPressed(settings_.keys.moveUp) || sf::Keyboard::isKeyPressed(sf::Keyboard::Key::Up))       move.y -= 1.f;
+            if (sf::Keyboard::isKeyPressed(settings_.keys.moveDown) || sf::Keyboard::isKeyPressed(sf::Keyboard::Key::Down))   move.y += 1.f;
+            if (sf::Keyboard::isKeyPressed(settings_.keys.moveLeft) || sf::Keyboard::isKeyPressed(sf::Keyboard::Key::Left))   move.x -= 1.f;
+            if (sf::Keyboard::isKeyPressed(settings_.keys.moveRight) || sf::Keyboard::isKeyPressed(sf::Keyboard::Key::Right)) move.x += 1.f;
+
+            bool isMoving = (move.x != 0.f || move.y != 0.f);
+            if (isMoving) {
+                float len = std::sqrt(move.x * move.x + move.y * move.y);
+                move.x /= len;
+                move.y /= len;
+            }
+            bool sprinting = sf::Keyboard::isKeyPressed(sf::Keyboard::Key::LShift) ||
+                              sf::Keyboard::isKeyPressed(sf::Keyboard::Key::RShift);
+            float speed = kMoveSpeed * (sprinting ? kSprintMultiplier : 1.f);
+            sf::Vector2f delta = move * speed * dt;
+
+            if (isMoving) {
+                footstepTimer_ -= dt;
+                if (footstepTimer_ <= 0.f) {
+                    if (footstepSound_) footstepSound_->play();
+                    footstepTimer_ = sprinting ? 0.32f / kSprintMultiplier : 0.32f;
+                }
+            } else {
+                footstepTimer_ = 0.f; // ready to play immediately the moment they move again
+            }
+
+            sf::Vector2f tryX = playerPos_ + sf::Vector2f(delta.x, 0.f);
+            if (!collidesWithBuilding(tryX, kPlayerSize) && !collidesWithTree(tryX, kPlayerSize)) playerPos_.x = tryX.x;
+            sf::Vector2f tryY = playerPos_ + sf::Vector2f(0.f, delta.y);
+            if (!collidesWithBuilding(tryY, kPlayerSize) && !collidesWithTree(tryY, kPlayerSize)) playerPos_.y = tryY.y;
+
+            // Zone edge transitions.
+            const Zone& z = zones_[currentZone_];
+            float maxX = static_cast<float>(windowSize_.x) - kPlayerSize;
+            float maxY = static_cast<float>(windowSize_.y) - kPlayerSize;
+            if (playerPos_.x < 0.f) {
+                if (z.west >= 0) { currentZone_ = z.west; playerPos_.x = maxX - kEdgeMargin; }
+                else playerPos_.x = 0.f;
+            } else if (playerPos_.x > maxX) {
+                if (z.east >= 0) { currentZone_ = z.east; playerPos_.x = kEdgeMargin; }
+                else playerPos_.x = maxX;
+            }
+            if (playerPos_.y < 0.f) {
+                if (z.north >= 0) { currentZone_ = z.north; playerPos_.y = maxY - kEdgeMargin; }
+                else playerPos_.y = 0.f;
+            } else if (playerPos_.y > maxY) {
+                if (z.south >= 0) { currentZone_ = z.south; playerPos_.y = kEdgeMargin; }
+                else playerPos_.y = maxY;
+            }
+
+            updateNpcs(dt);
+
+            // Live-only nudge to the Farm's output: rain helps crops outside
+            // Winter, snow during Winter hurts them (see Game::tickBackground's
+            // weatherMult doc comment) -- purely a "while actually playing"
+            // flavor effect, not something offline catch-up tries to guess at.
+            double weatherMult = 1.0;
+            if (raining_) {
+                weatherMult = (game_.currentSeason() == Season::Winter) ? Game::kSnowPenaltyMultiplier : Game::kRainBonusMultiplier;
+            }
+            TickOutcome outcome = game_.tickBackground(weatherMult);
+            int nowAchievementCount = game_.unlockedAchievementCount();
+            if (nowAchievementCount > lastAchievementCount_ && achievementSound_) achievementSound_->play();
+            lastAchievementCount_ = nowAchievementCount;
+            handleTickOutcome(outcome); // opens the death-notice overlay if outcome.died
+
+            // The season can only actually change while the world tick above
+            // is running (i.e. no overlay/pause), so this is the only place
+            // that needs to check for it.
+            Season nowSeason = game_.currentSeason();
+            if (nowSeason != lastSeason_) {
+                lastSeason_ = nowSeason;
+                seasonTransitionTo_ = nowSeason;
+                seasonTransitionActive_ = true;
+                seasonTransitionTimer_ = 0.f;
+                playMusicForSeason(nowSeason);
+            }
+        }
+        updateSeasonTransition(dt); // ticks (and, near the end, resolves) regardless of overlay state
+        updateMusicCrossfade(dt);   // same -- background music keeps fading/playing through a paused menu
+
+        // Ticks down regardless of overlay state: previously this only ran in
+        // the "overlay open" branch above (feedback used to only ever be set
+        // from inside an overlay's own button callbacks), but the locked-
+        // building world-view toast sets it while no overlay is open too.
+        if (overlayFeedbackTimer_ > 0.f) {
+            overlayFeedbackTimer_ -= dt;
+            if (overlayFeedbackTimer_ <= 0.f) overlayFeedback_.clear();
+        }
+
+        if (!updateAvailable_) { // cheap mutex check, not the network call itself -- fine every frame
+            UpdateChecker::Result r;
+            if (UpdateChecker::pollResult(r)) {
+                updateAvailable_ = true;
+                updateLatestVersion_ = r.latestVersion;
+                updateReleaseUrl_ = r.releaseUrl;
+            }
+        }
+
+        window.clear(sf::Color(58, 128, 68));
+        drawZone(window);
+
+        if (currentOverlay_ == OverlayKind::None) {
+            if (const WorldBuilding* near = findNearbyBuilding(kInteractRadius)) {
+                sf::RectangleShape highlight(near->size);
+                highlight.setPosition(near->position);
+                highlight.setFillColor(sf::Color::Transparent);
+                highlight.setOutlineThickness(3.f);
+                highlight.setOutlineColor(sf::Color::Yellow);
+                window.draw(highlight);
+            }
+        }
+
+        sf::RectangleShape player(sf::Vector2f(kPlayerSize, kPlayerSize));
+        player.setPosition(playerPos_);
+        player.setFillColor(sf::Color(250, 220, 60));
+        player.setOutlineThickness(2.f);
+        player.setOutlineColor(sf::Color(80, 60, 0));
+        window.draw(player);
+
+        // Tints/rains on the world (and the player standing in it), but not
+        // the legend/minimap/HUD/overlays drawn after this -- those stay
+        // fully readable regardless of time of day or weather.
+        drawDayNightOverlay(window);
+        drawWeather(window);
+        drawSeasonalAmbient(window);
+
+        drawLegend(window);
+        if (showMinimap_) drawMinimap(window);
+        drawHud(window);
+        drawNetWorthPanel(window);
+        drawAchievementsButton(window);
+        drawHowToPlayButton(window);
+        drawUpdateBanner(window);
+        drawOverlayRoot(window); // drawn last so it sits on top of everything else
+        drawSeasonTransitionOverlay(window); // drawn even later -- covers overlays too, so a season change is never missed
+
+        window.display();
+    }
+
+    game_.exitAndSave();
+}
