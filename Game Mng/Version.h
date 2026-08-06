@@ -5,7 +5,7 @@
 // compares against the latest GitHub Release tag. Bump this on every release
 // (and tag the matching GitHub Release the same way, e.g. "v1.0.1").
 namespace Version {
-    constexpr const char* kGameVersion = "1.0.0";
+    constexpr const char* kGameVersion = "1.1.0";
 
     // Where UpdateChecker looks for the latest release (GitHub Releases API:
     // https://api.github.com/repos/{owner}/{repo}/releases/latest). Fill
