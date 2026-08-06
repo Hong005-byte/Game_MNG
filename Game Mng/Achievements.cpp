@@ -41,6 +41,24 @@ AchievementManager::AchievementManager() {
         [](const GameStats& s) { return s.allSeasonsWitnessed; } });
     achievements_.push_back(Achievement{ "master_farmer", "Master Farmer", "Grow every crop during its favorite season, in one life.", 250.0, false,
         [](const GameStats& s) { return s.allCropsWitnessedInSeason; } });
+
+    // Construction system + Port/Fisher's Isle.
+    achievements_.push_back(Achievement{ "groundbreaking", "Groundbreaking", "Complete your first construction project.", 50.0, false,
+        [](const GameStats& s) { return s.anyConstructionCompleted; } });
+    achievements_.push_back(Achievement{ "master_builder", "Master Builder", "Have 5 or more constructed businesses standing at once.", 300.0, false,
+        [](const GameStats& s) { return s.constructionsCompletedCount >= 5; } });
+    achievements_.push_back(Achievement{ "harbormaster", "Harbormaster", "Build the Port.", 400.0, false,
+        [](const GameStats& s) { return s.portBuilt; } });
+    achievements_.push_back(Achievement{ "shipshape", "Shipshape", "Commission a ship at the Port.", 150.0, false,
+        [](const GameStats& s) { return s.hasIslandShip; } });
+    achievements_.push_back(Achievement{ "set_sail", "Set Sail", "Sail to Fisher's Isle.", 100.0, false,
+        [](const GameStats& s) { return s.hasVisitedIsland; } });
+    achievements_.push_back(Achievement{ "island_explorer", "Island Explorer", "Own every business on Fisher's Isle.", 350.0, false,
+        [](const GameStats& s) { return s.allIslandBusinessesOwned; } });
+    achievements_.push_back(Achievement{ "market_row_regular", "Market Row Regular", "Own every stall in Market Row.", 250.0, false,
+        [](const GameStats& s) { return s.allMarketRowBusinessesOwned; } });
+    achievements_.push_back(Achievement{ "full_stock", "Full Stock", "Hold 10 or more different goods in the warehouse at once.", 150.0, false,
+        [](const GameStats& s) { return s.distinctGoodsInStock >= 10; } });
 }
 
 std::vector<const Achievement*> AchievementManager::checkAndUnlock(const GameStats& stats, double& money) {

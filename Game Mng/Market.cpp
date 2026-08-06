@@ -64,12 +64,19 @@ Market::Market() : rng_(std::random_device{}()) {
     goods_.push_back(Good{ "grapes",    "Grapes",    6.0,   6.0,   0.05 });
     goods_.push_back(Good{ "wine",      "Wine",      20.0,  20.0,  0.07 });
 
-    // Harbor District: salt/pearl raw goods, plus the shipyard/cannery chains.
+    // Harbor District: salt/pearl raw goods, plus the shipyard chain.
     goods_.push_back(Good{ "salt",           "Salt",          6.0,   6.0,   0.05 });
     goods_.push_back(Good{ "pearls",         "Pearls",        40.0,  40.0,  0.09 });
     goods_.push_back(Good{ "ships",          "Ships",         140.0, 140.0, 0.08 });
-    goods_.push_back(Good{ "canned_fish",    "Canned Fish",   22.0,  22.0,  0.07 });
     goods_.push_back(Good{ "pearl_jewelry",  "Pearl Jewelry", 180.0, 180.0, 0.10 });
+
+    // Fisher's Isle: cannery moved here from Harbor (see Business.cpp), plus
+    // the new deep sea/sushi chain -- pricier than anything the mainland
+    // dock produces, matching "more, better fish species" out on the isle.
+    goods_.push_back(Good{ "canned_fish", "Canned Fish", 22.0, 22.0, 0.07 });
+    goods_.push_back(Good{ "tuna",        "Tuna",        28.0, 28.0, 0.08 });
+    goods_.push_back(Good{ "sushi",       "Sushi",       75.0, 75.0, 0.10 });
+    goods_.push_back(Good{ "seafood_platter", "Seafood Platter", 140.0, 140.0, 0.09 });
 
     // Highlands District: dairy, apiary, trapping, and tea/flax chains.
     goods_.push_back(Good{ "milk",       "Milk",       5.0,  5.0,  0.05 });
@@ -82,6 +89,7 @@ Market::Market() : rng_(std::random_device{}()) {
     goods_.push_back(Good{ "tea",        "Tea",        18.0, 18.0, 0.07 });
     goods_.push_back(Good{ "flax",       "Flax",       4.0,  4.0,  0.05 });
     goods_.push_back(Good{ "linen",      "Linen",      15.0, 15.0, 0.06 });
+    goods_.push_back(Good{ "gift_basket","Gift Basket",125.0,125.0,0.08 });
 
     // Farm's selectable crops (see Business.h's CropType) + their processors.
     goods_.push_back(Good{ "strawberry",           "Strawberry",           6.0,  6.0,  0.05 });
@@ -96,6 +104,13 @@ Market::Market() : rng_(std::random_device{}()) {
     goods_.push_back(Good{ "pumpkin_pie",          "Pumpkin Pie",          17.0, 17.0, 0.06 });
     goods_.push_back(Good{ "roasted_sweet_potato", "Roasted Sweet Potato", 13.0, 13.0, 0.06 });
     goods_.push_back(Good{ "sauerkraut",           "Sauerkraut",           12.0, 12.0, 0.06 });
+
+    // Multi-input recipes (see BusinessType::extraInputs) -- pricier than
+    // any single-input good they're built from, same "more processing =
+    // more valuable" pattern as everything else in this file.
+    goods_.push_back(Good{ "honey_syrup", "Honey Syrup", 22.0,  22.0,  0.07 });
+    goods_.push_back(Good{ "cake",        "Cake",        130.0, 130.0, 0.09 });
+    goods_.push_back(Good{ "fruit_bread", "Fruit Bread", 120.0, 120.0, 0.08 });
 }
 
 Good* Market::find(const std::string& id) {

@@ -102,7 +102,22 @@ bool Game::simulateElapsed(long long seconds, std::vector<std::string>& eventLog
     if (seconds <= 0) return false;
 
     double legacyMult = 1.0 + static_cast<double>(legacyProdLevel_) * kLegacyProdBonusPerLevel;
-    double mult = staff_.multiplier() * life_.productionMultiplier() * life_.ageEfficiency() * legacyMult;
+
+    // Daily yield variance (see Game.h's kDailyYieldVarianceMin/Max):
+    // rerolled the first time a given in-game day is seen, then held steady
+    // for the rest of that day -- same "computed once per call, using the
+    // day/season at the start of this interval" simplification the season
+    // math below already relies on, so a long fast-forward/offline catch-up
+    // spanning several days still only rerolls once per call rather than
+    // jumping every tick.
+    long long dayIndex = static_cast<long long>(life_.ageDays);
+    if (dayIndex != dailyYieldVarianceDay_) {
+        dailyYieldVarianceDay_ = dayIndex;
+        double t = static_cast<double>(std::rand()) / static_cast<double>(RAND_MAX);
+        dailyYieldVariance_ = kDailyYieldVarianceMin + t * (kDailyYieldVarianceMax - kDailyYieldVarianceMin);
+    }
+
+    double mult = staff_.multiplier() * life_.productionMultiplier() * life_.ageEfficiency() * legacyMult * dailyYieldVariance_ * kEconomyPaceMultiplier;
 
     // The focused business (see trySetStaffFocus) gets an extra staff-scaled
     // multiplier stacked on top of the shared `mult` every business gets.
@@ -113,6 +128,23 @@ bool Game::simulateElapsed(long long seconds, std::vector<std::string>& eventLog
         if (staffFocusBusinessId_.empty() || biz.typeId != staffFocusBusinessId_) return m;
         return m * (1.0 + static_cast<double>(staff_.level) * kStaffFocusBonusPerLevel);
     };
+
+    // Pass 0: advance any business under construction (see
+    // Business::constructionDaysRemaining / tryStartConstruction). Same
+    // real-seconds -> game-days conversion Life::advanceReal uses for
+    // ageDays (Life.cpp), so a construction site's countdown moves in step
+    // with the rest of the calendar regardless of how big this `seconds`
+    // chunk is (a single tick, a fast-forward, or an offline catch-up).
+    double daysElapsed = static_cast<double>(seconds) * Life::kTimeCompression / Life::kGameSecondsPerDay;
+    for (auto& b : businessManager_.businesses()) {
+        if (b.constructionDaysRemaining <= 0.0) continue;
+        b.constructionDaysRemaining -= daysElapsed;
+        if (b.constructionDaysRemaining <= 0.0) {
+            b.constructionDaysRemaining = 0.0;
+            b.level = 1; // construction complete
+            completedConstructionEvents_.push_back(b.typeId); // drained by GameWorld for a "X built!" toast
+        }
+    }
 
     // Pass 1: raw producers (no input required) — farms, mines, storefront.
     Season season = currentSeason();
@@ -174,17 +206,36 @@ bool Game::simulateElapsed(long long seconds, std::vector<std::string>& eventLog
         if (b.level <= 0) continue;
         const BusinessType* type = businessManager_.findType(b.typeId);
         if (!type || type->inputGoodId.empty()) continue;
-        Good* input = market_.find(type->inputGoodId);
-        if (!input) continue;
+
+        // Primary input (inputGoodId/inputPerOutput) plus any
+        // BusinessType::extraInputs -- a multi-input recipe (see Cake Shop/
+        // Artisan Bakery in Business.cpp) is bottlenecked by whichever one
+        // of these can support the least output, same as a kitchen running
+        // out of one ingredient before the others. A plain single-input
+        // business just has one entry here and behaves exactly as before.
+        struct InputRef { Good* good; double perOutput; const std::string* goodId; };
+        std::vector<InputRef> reqs;
+        if (Good* g = market_.find(type->inputGoodId)) reqs.push_back({ g, type->inputPerOutput, &type->inputGoodId });
+        for (const auto& extra : type->extraInputs) {
+            if (Good* g = market_.find(extra.goodId)) reqs.push_back({ g, extra.perOutput, &extra.goodId });
+        }
+        if (reqs.empty()) continue; // primary input good id doesn't resolve to anything -- nothing to do
+
         Good* output = type->outputGoodId.empty() ? nullptr : market_.find(type->outputGoodId);
 
         double desiredOutput = b.ratePerSecond(*type) * businessMult(b) * seasonProdMult * static_cast<double>(seconds);
-        double desiredInput = desiredOutput * type->inputPerOutput;
-        double actualInput = std::min(desiredInput, input->stock);
-        double actualOutput = type->inputPerOutput > 0.0 ? actualInput / type->inputPerOutput : desiredOutput;
+        double actualOutput = desiredOutput;
+        for (const auto& r : reqs) {
+            if (r.perOutput <= 0.0) continue;
+            actualOutput = std::min(actualOutput, r.good->stock / r.perOutput);
+        }
+        actualOutput = std::max(0.0, actualOutput);
 
-        market_.applyConsumptionPressure(type->inputGoodId, actualInput); // reads stock before the line below changes it
-        input->stock -= actualInput;
+        for (const auto& r : reqs) {
+            double consumed = actualOutput * r.perOutput;
+            market_.applyConsumptionPressure(*r.goodId, consumed); // reads stock before the line below changes it
+            r.good->stock -= consumed;
+        }
         if (output) {
             market_.applyProductionPressure(type->outputGoodId, actualOutput);
             output->stock = std::min(output->stock + actualOutput, maxStockPerGood());
@@ -314,6 +365,8 @@ void Game::handleDeath() {
     seasonsWitnessedMask_ = 0;
     cropsInSeasonWitnessed_.clear();
     minigameHitCount_ = 0;
+    hasIslandShip_ = false;
+    hasVisitedIsland_ = false;
     deathCause_.clear();
     lastTickEpoch_ = nowEpoch();
     save();
@@ -325,13 +378,19 @@ void Game::checkAchievements() {
     // Harbor/Highlands district membership, for the ownership achievements
     // below -- fishing counts as Harbor even though it predates that zone,
     // since that's where it actually lives now (see GameWorld::buildZones()).
-    static const std::vector<std::string> kHarborIds = { "seasalt", "pearlfarm", "shipyard", "cannery", "pearlatelier", "fishing" };
-    static const std::vector<std::string> kHighlandsIds = { "dairyfarm", "creamery", "beehive", "meadery", "trapper", "tannery", "teafield", "teahouse", "flaxfield", "linenmill" };
+    // cannery moved out to Fisher's Isle (see kIslandIds below) and port
+    // moved in, so this list follows the same "wherever it actually lives
+    // now" rule.
+    static const std::vector<std::string> kHarborIds = { "seasalt", "pearlfarm", "shipyard", "port", "pearlatelier", "fishing" };
+    static const std::vector<std::string> kHighlandsIds = { "dairyfarm", "creamery", "beehive", "meadery", "trapper", "tannery", "teafield", "teahouse", "flaxfield", "linenmill", "giftbasket" };
+    static const std::vector<std::string> kIslandIds = { "cannery", "smokehouse", "deepsea", "sushibar", "fishermanplatter" };
+    static const std::vector<std::string> kMarketRowIds = { "jamkitchen", "popcornstand", "juicebar", "pieshop", "roaststand", "picklinghouse", "honeyrefinery", "cakeshop", "artisanbakery" };
 
     GameStats stats;
     stats.money = money_;
-    int totalLevels = 0, distinctTypes = 0, highestTier = 0, tier2Owned = 0;
-    bool anyFullyStaffed = false, anyHarbor = false, anyHighlands = false;
+    int totalLevels = 0, distinctTypes = 0, highestTier = 0, tier2Owned = 0, constructedCount = 0;
+    int islandOwned = 0, marketRowOwned = 0;
+    bool anyFullyStaffed = false, anyHarbor = false, anyHighlands = false, anyConstructed = false, portBuilt = false;
     for (const auto& b : businessManager_.businesses()) {
         totalLevels += b.level;
         if (b.level > 0) {
@@ -342,6 +401,10 @@ void Game::checkAchievements() {
             }
             if (std::find(kHarborIds.begin(), kHarborIds.end(), b.typeId) != kHarborIds.end()) anyHarbor = true;
             if (std::find(kHighlandsIds.begin(), kHighlandsIds.end(), b.typeId) != kHighlandsIds.end()) anyHighlands = true;
+            if (std::find(kIslandIds.begin(), kIslandIds.end(), b.typeId) != kIslandIds.end()) islandOwned++;
+            if (std::find(kMarketRowIds.begin(), kMarketRowIds.end(), b.typeId) != kMarketRowIds.end()) marketRowOwned++;
+            if (businessManager_.requiresConstruction(b.typeId)) { anyConstructed = true; constructedCount++; }
+            if (b.typeId == "port") portBuilt = true;
         }
         if (b.workers >= kMaxWorkersPerBusiness) anyFullyStaffed = true;
     }
@@ -353,6 +416,18 @@ void Game::checkAchievements() {
     stats.anyBusinessFullyStaffed = anyFullyStaffed;
     stats.anyHarborBusinessOwned = anyHarbor;
     stats.anyHighlandsBusinessOwned = anyHighlands;
+    stats.anyConstructionCompleted = anyConstructed;
+    stats.constructionsCompletedCount = constructedCount;
+    stats.portBuilt = portBuilt;
+    stats.hasIslandShip = hasIslandShip_;
+    stats.hasVisitedIsland = hasVisitedIsland_;
+    stats.allIslandBusinessesOwned = islandOwned >= static_cast<int>(kIslandIds.size());
+    stats.allMarketRowBusinessesOwned = marketRowOwned >= static_cast<int>(kMarketRowIds.size());
+    int distinctGoodsInStock = 0;
+    for (const auto& g : market_.goods()) {
+        if (g.stock > 0.0001) distinctGoodsInStock++;
+    }
+    stats.distinctGoodsInStock = distinctGoodsInStock;
     stats.totalTradeRevenue = totalTradeRevenue_;
     stats.staffLevel = staff_.level;
     stats.ageYears = life_.ageYears();
@@ -370,6 +445,7 @@ void Game::checkAchievements() {
         std::cout << Localization::t("achievement_prefix") << Localization::t("ach_" + a->id + "_name")
             << " - " << Localization::t("ach_" + a->id + "_desc")
             << " (+$" << formatNumber(a->cashReward) << ")\n";
+        pendingAchievementPopups_.push_back(a->id); // drained by GameWorld for the Minecraft-style toast
     }
 }
 
@@ -488,6 +564,30 @@ void Game::menuBusinesses() {
     }
     if (action != 1) {
         std::cout << Localization::t("invalid_choice");
+        return;
+    }
+
+    // First build of a business that needs construction (see
+    // BusinessManager::requiresConstruction/tryStartConstruction) doesn't go
+    // through the plain cash-and-instant path below at all -- same rule the
+    // graphical GameWorld enforces, needed here too since both modes share
+    // the same save file and this menu would otherwise be a way around it.
+    if (b.level == 0 && businessManager_.requiresConstruction(b.typeId)) {
+        if (b.constructionDaysRemaining > 0.0) {
+            std::cout << Localization::t("construction_in_progress_hint") << "\n";
+            return;
+        }
+        ActionResult r = tryStartConstruction(b.typeId);
+        if (r.success) {
+            std::cout << Localization::t("construction_started_prefix") << Localization::t(type->id)
+                << " ($" << formatNumber(r.amount) << ").\n";
+        } else if (r.messageKey == "not_enough_cash_prefix") {
+            std::cout << Localization::t(r.messageKey) << formatNumber(r.amount) << ".\n";
+        } else if (r.messageKey == "construction_missing_materials") {
+            std::cout << Localization::t(r.messageKey) << " " << Localization::t(r.goodId) << ".\n";
+        } else {
+            std::cout << Localization::t(r.messageKey) << "\n";
+        }
         return;
     }
 
@@ -1001,6 +1101,22 @@ std::vector<BusinessInfo> Game::businessInfos() const {
         info.outputGoodId = businessManager_.resolvedOutputGoodId(b, *t);
         info.inputGoodId = t->inputGoodId;
         info.inputPerOutput = t->inputPerOutput;
+        // Live "need vs have" list for the UI (see BusinessInfo::inputs) --
+        // primary input first, then any BusinessType::extraInputs. const
+        // method, so this reads through goods() rather than the non-const
+        // market_.find() (same reason businessConstructionInfo does).
+        auto stockOf = [this](const std::string& goodId) {
+            for (const auto& g : market_.goods()) {
+                if (g.id == goodId) return g.stock;
+            }
+            return 0.0;
+        };
+        if (!t->inputGoodId.empty()) {
+            info.inputs.push_back(BuildMaterialInfo{ t->inputGoodId, t->inputPerOutput, stockOf(t->inputGoodId) });
+        }
+        for (const auto& extra : t->extraInputs) {
+            info.inputs.push_back(BuildMaterialInfo{ extra.goodId, extra.perOutput, stockOf(extra.goodId) });
+        }
         info.nextCost = b.nextCost(*t);
         info.locked = (b.level == 0 && businessManager_.isLocked(*t));
         info.workers = b.workers;
@@ -1077,6 +1193,160 @@ ActionResult Game::tryUpgradeBusinessBulk(const std::string& businessId, int max
     result.amount = totalCost;
     result.count = levelsBought;
     checkAchievements();
+    return result;
+}
+
+ConstructionInfo Game::businessConstructionInfo(const std::string& businessId) const {
+    ConstructionInfo info;
+    const Business* b = businessManager_.find(businessId);
+    const BusinessType* type = businessManager_.findType(businessId);
+    // Not a BusinessType at all (a service building like the Market/Staff
+    // Office/Warehouse) or already built -- neither needs a construction
+    // snapshot, so bail out before doing any of the material/day lookups.
+    if (!b || !type || b->level > 0) return info;
+
+    info.requiresConstruction = businessManager_.requiresConstruction(businessId);
+    if (!info.requiresConstruction) return info; // one of the 4 free starters
+
+    info.inProgress = b->constructionDaysRemaining > 0.0;
+    info.daysRemaining = b->constructionDaysRemaining;
+    info.totalDays = businessManager_.buildDaysFor(*type);
+
+    if (!info.inProgress) {
+        // market_.find() is non-const (see Market.h) -- this is a const
+        // method, so look the good up through the const goods() accessor
+        // instead of adding a const overload just for this one read.
+        for (const auto& req : businessManager_.buildMaterialsFor(*type)) {
+            double have = 0.0;
+            for (const auto& g : market_.goods()) {
+                if (g.id == req.goodId) { have = g.stock; break; }
+            }
+            info.materials.push_back(BuildMaterialInfo{ req.goodId, req.amount, have });
+        }
+    }
+    return info;
+}
+
+ActionResult Game::tryStartConstruction(const std::string& businessId) {
+    ActionResult result;
+    Business* b = businessManager_.find(businessId);
+    const BusinessType* type = businessManager_.findType(businessId);
+    if (!b || !type) {
+        result.messageKey = "invalid_business_number";
+        return result;
+    }
+    if (b->level > 0 || b->constructionDaysRemaining > 0.0) {
+        result.messageKey = "construction_in_progress_hint";
+        return result;
+    }
+    if (businessManager_.isLocked(*type)) {
+        result.messageKey = "locked_prefix";
+        return result;
+    }
+    if (!businessManager_.requiresConstruction(businessId)) {
+        // One of the 4 free starters -- shouldn't be routed here at all
+        // (see GameWorld's performBuildOrUpgrade), but fail safe rather than
+        // silently starting a pointless zero-material "construction".
+        result.messageKey = "invalid_business_number";
+        return result;
+    }
+
+    double cost = b->nextCost(*type); // same first-level cash cost as before construction existed
+    if (money_ < cost) {
+        result.messageKey = "not_enough_cash_prefix";
+        result.amount = cost;
+        return result;
+    }
+
+    std::vector<BuildMaterialCost> needed = businessManager_.buildMaterialsFor(*type);
+    for (const auto& req : needed) {
+        Good* g = market_.find(req.goodId);
+        if (!g || g->stock < req.amount) {
+            result.messageKey = "construction_missing_materials";
+            result.goodId = req.goodId;
+            return result;
+        }
+    }
+
+    money_ -= cost;
+    for (const auto& req : needed) {
+        Good* g = market_.find(req.goodId);
+        g->stock -= req.amount; // presence + sufficiency already checked above
+    }
+    b->constructionDaysRemaining = businessManager_.buildDaysFor(*type);
+
+    result.success = true;
+    result.amount = cost;
+    return result;
+}
+
+ActionResult Game::tryCancelConstruction(const std::string& businessId) {
+    ActionResult result;
+    Business* b = businessManager_.find(businessId);
+    const BusinessType* type = businessManager_.findType(businessId);
+    if (!b || !type || b->constructionDaysRemaining <= 0.0) {
+        result.messageKey = "invalid_business_number";
+        return result;
+    }
+
+    // Refund half of everything already spent -- a real but not painless
+    // way out of a misclick, not a free do-over.
+    double refundCash = b->nextCost(*type) * 0.5;
+    money_ += refundCash;
+    for (const auto& req : businessManager_.buildMaterialsFor(*type)) {
+        if (Good* g = market_.find(req.goodId)) {
+            g->stock = std::min(g->stock + req.amount * 0.5, maxStockPerGood());
+        }
+    }
+    b->constructionDaysRemaining = 0.0;
+
+    result.success = true;
+    result.amount = refundCash;
+    return result;
+}
+
+std::vector<std::string> Game::drainCompletedConstructions() {
+    std::vector<std::string> out;
+    out.swap(completedConstructionEvents_);
+    return out;
+}
+
+std::vector<std::string> Game::drainNewlyUnlockedAchievements() {
+    std::vector<std::string> out;
+    out.swap(pendingAchievementPopups_);
+    return out;
+}
+
+ActionResult Game::tryCommissionShip() {
+    ActionResult result;
+    const Business* port = businessManager_.find("port");
+    if (!port || port->level <= 0) {
+        result.messageKey = "invalid_business_number";
+        return result;
+    }
+    if (hasIslandShip_) {
+        result.messageKey = "invalid_business_number";
+        return result;
+    }
+    if (money_ < kShipCommissionCash) {
+        result.messageKey = "not_enough_cash_prefix";
+        result.amount = kShipCommissionCash;
+        return result;
+    }
+    Good* ships = market_.find("ships");
+    if (!ships || ships->stock < kShipCommissionShips) {
+        result.messageKey = "construction_missing_materials";
+        result.goodId = "ships";
+        return result;
+    }
+
+    money_ -= kShipCommissionCash;
+    ships->stock -= kShipCommissionShips;
+    hasIslandShip_ = true;
+    checkAchievements(); // catches "shipshape" right away, not just on the next unrelated action
+
+    result.success = true;
+    result.amount = kShipCommissionCash;
     return result;
 }
 
@@ -1548,6 +1818,8 @@ void Game::load() {
         while (std::getline(ss, id, ',')) cropsInSeasonWitnessed_.push_back(id);
     }
     minigameHitCount_ = getI("stats.minigameHitCount", minigameHitCount_);
+    hasIslandShip_ = getI("stats.hasIslandShip", hasIslandShip_ ? 1 : 0) != 0;
+    hasVisitedIsland_ = getI("stats.hasVisitedIsland", hasVisitedIsland_ ? 1 : 0) != 0;
     life_.ageDays = getD("life.ageDays", life_.ageDays);
     life_.energy = getD("life.energy", life_.energy);
     life_.hunger = getD("life.hunger", life_.hunger);
@@ -1588,6 +1860,10 @@ void Game::load() {
         b.level = getI("business." + b.typeId + ".level", b.level);
         b.workers = getI("business." + b.typeId + ".workers", b.workers);
         b.cropId = getS("business." + b.typeId + ".crop", b.cropId);
+        // Missing on older saves -> defaults to 0 (not under construction),
+        // which is exactly right: an old save's level-0 business just shows
+        // up as an unstarted empty plot under the new system, no migration needed.
+        b.constructionDaysRemaining = getD("business." + b.typeId + ".construction_days_remaining", b.constructionDaysRemaining);
     }
     for (auto& a : achievements_.achievements()) {
         a.unlocked = getI("achievement." + a.id + ".unlocked", a.unlocked ? 1 : 0) != 0;
@@ -1615,6 +1891,8 @@ void Game::save() const {
         out << "stats.cropsInSeason=" << joined << "\n";
     }
     out << "stats.minigameHitCount=" << minigameHitCount_ << "\n";
+    out << "stats.hasIslandShip=" << (hasIslandShip_ ? 1 : 0) << "\n";
+    out << "stats.hasVisitedIsland=" << (hasVisitedIsland_ ? 1 : 0) << "\n";
     out << "life.ageDays=" << life_.ageDays << "\n";
     out << "life.energy=" << life_.energy << "\n";
     out << "life.hunger=" << life_.hunger << "\n";
@@ -1649,6 +1927,7 @@ void Game::save() const {
         out << "business." << b.typeId << ".level=" << b.level << "\n";
         out << "business." << b.typeId << ".workers=" << b.workers << "\n";
         out << "business." << b.typeId << ".crop=" << b.cropId << "\n";
+        out << "business." << b.typeId << ".construction_days_remaining=" << b.constructionDaysRemaining << "\n";
     }
     for (const auto& a : achievements_.achievements()) {
         out << "achievement." << a.id << ".unlocked=" << (a.unlocked ? 1 : 0) << "\n";

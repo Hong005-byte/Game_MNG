@@ -9,6 +9,18 @@
 #include "Achievements.h"
 #include "Life.h"
 
+// One material's build requirement alongside how much of it is actually
+// sitting in the warehouse right now -- lets a UI show "have X / need Y"
+// (and gray out Start Construction) without a second round-trip. Also
+// reused by BusinessInfo::inputs for an ongoing-production recipe's
+// "need vs have" list (there `required` is a per-output ratio, not a
+// one-time cost, but the shape -- and the UI treatment -- is the same).
+struct BuildMaterialInfo {
+    std::string goodId;
+    double required = 0.0;
+    double have = 0.0;
+};
+
 // Read-only snapshot of one business, for a UI to render without touching
 // Game's internals directly.
 struct BusinessInfo {
@@ -19,12 +31,31 @@ struct BusinessInfo {
     std::string outputGoodId; // empty => produces cash directly
     std::string inputGoodId;  // empty => no input required
     double inputPerOutput = 0.0;
+    // Primary input (inputGoodId/inputPerOutput above) plus any
+    // BusinessType::extraInputs, combined into one live "need vs have" list
+    // for a UI -- reuses BuildMaterialInfo's shape (required = per-output
+    // ratio here, not a one-time cost) since it's the same "need/have" idea.
+    // Empty for a raw producer with no inputs at all.
+    std::vector<BuildMaterialInfo> inputs;
     double nextCost = 0.0;
     bool locked = false;
     int workers = 0;        // hired workers boosting just this business (see Game::tryHireWorker)
     double workerCost = 0.0; // cost of the next worker, 0 if already at the cap
     std::string cropId;      // only meaningful for "farm" -- its currently-active CropType id
     bool seasonBonusActive = false; // only meaningful for "farm" -- true if cropId's favorite season is current
+};
+
+// Read-only snapshot of a business's first-build construction state (see
+// Business::constructionDaysRemaining / BusinessManager::requiresConstruction).
+// Returned even for businesses that don't need construction at all or are
+// already built -- `requiresConstruction` false means the rest of the
+// fields aren't meaningful (see Game::businessConstructionInfo).
+struct ConstructionInfo {
+    bool requiresConstruction = false;
+    bool inProgress = false; // true once construction has actually started (daysRemaining > 0)
+    double daysRemaining = 0.0;
+    int totalDays = 0;
+    std::vector<BuildMaterialInfo> materials; // only meaningful pre-construction (level 0, not yet started)
 };
 
 // Read-only snapshot of one market good.
@@ -279,6 +310,55 @@ public:
     // upgrade would: locked, or can't afford even one more level.
     ActionResult tryUpgradeBusinessBulk(const std::string& businessId, int maxLevels);
 
+    // ---- First-build construction (see Business::constructionDaysRemaining
+    // and BusinessManager::requiresConstruction/buildMaterialsFor/
+    // buildDaysFor). Only meaningful for a business still at level 0 that
+    // requiresConstruction() -- everything else (the 4 free starters, or any
+    // business already at level >= 1) keeps using tryUpgradeBusinessBulk
+    // above untouched. ----
+    // Read-only snapshot for a UI: whether this id needs construction at
+    // all, whether it's already under way, and (if not yet started) the
+    // material shopping list with current warehouse stock alongside it.
+    ConstructionInfo businessConstructionInfo(const std::string& businessId) const;
+    // Spends the cash cost (same BusinessType::baseCost as a normal first
+    // level) plus every required material from the warehouse, then starts
+    // the countdown -- level stays 0 until simulateElapsed ticks it to
+    // completion. Fails if already built/under construction, locked, or
+    // short on cash/materials (messageKey says which).
+    ActionResult tryStartConstruction(const std::string& businessId);
+    // Refunds half of whatever was already spent (cash + each material) and
+    // resets constructionDaysRemaining to 0, back to an empty plot. Fails if
+    // nothing is actually under construction there.
+    ActionResult tryCancelConstruction(const std::string& businessId);
+    // Newly-completed construction ids since the last drain (see
+    // simulateElapsed's Pass 0) -- for a UI to toast "X built!" even when the
+    // player isn't standing next to it. Not persisted; drains to empty.
+    std::vector<std::string> drainCompletedConstructions();
+
+    // ---- Port -> Fisher's Isle (see GameWorld's Zone 7 and the Port's
+    // Sail/Commission Ship buttons in drawBusinessesOverlay). The ship is a
+    // one-time purchase (not consumed per trip); once built, sailing back
+    // and forth is free and unlimited. ----
+    bool hasIslandShip() const { return hasIslandShip_; }
+    bool hasVisitedIsland() const { return hasVisitedIsland_; }
+    static constexpr double kShipCommissionCash = 1000.0;
+    static constexpr double kShipCommissionShips = 2.0;
+    // Consumes kShipCommissionShips worth of the "ships" good plus
+    // kShipCommissionCash -- fails if the Port isn't built yet, a ship's
+    // already been commissioned, or the player is short on cash/ships.
+    ActionResult tryCommissionShip();
+    // Called once by GameWorld right after the player arrives on the isle
+    // (see the Sail button) -- drives the "set_sail" achievement.
+    void markIslandVisited() { hasVisitedIsland_ = true; }
+
+    // ---- Achievement unlock popups (see Achievements.h/AchievementManager::
+    // checkAndUnlock) -- ids newly unlocked since the last drain, for a
+    // Minecraft-style toast (see GameWorld::drawAchievementToast). Not
+    // persisted; an already-unlocked achievement from a loaded save never
+    // ends up in here (see checkAchievements(), which only appends what
+    // checkAndUnlock itself just flipped). ----
+    std::vector<std::string> drainNewlyUnlockedAchievements();
+
     // ---- Per-business worker hiring: separate from the global Staff Office
     // and the foreman focus (staffFocusBusinessId_ above), this boosts just
     // one business's own output. Priced off that business's own cost, with a
@@ -293,6 +373,19 @@ public:
     // A flat fee rather than free/instant so switching to chase whichever
     // season is active is a real choice, not a costless reflex. ----
     static constexpr double kSeasonBonusMultiplier = 1.5;
+
+    // ---- Daily yield variance (see simulateElapsed): a small once-per-day
+    // reroll applied to every business's output so two otherwise-identical
+    // days don't produce the exact same amount. Kept narrow -- flavor, not
+    // a real balance lever. ----
+    static constexpr double kDailyYieldVarianceMin = 0.90;
+    static constexpr double kDailyYieldVarianceMax = 1.15;
+    // ---- Overall economy pace: a flat multiplier on every business's
+    // output (goods and direct cash alike, see simulateElapsed's `mult`) --
+    // paired with the tier-based construction cost formula (see
+    // BusinessManager's kTier1Cost/kTier2Cost/kTier3Cost in Business.cpp) so
+    // raising prices doesn't get compounded by an unchanged income rate. ----
+    static constexpr double kEconomyPaceMultiplier = 0.7;
     // Live weather nudges to the Farm only (see tickBackground's
     // `weatherMult` param) -- rain helps crops outside Winter, snow during
     // Winter hurts them. Deliberately small; this is flavor, not a lever.
@@ -311,6 +404,13 @@ public:
     double cropSwitchCost() const { return kCropSwitchCost; }
     std::vector<CropType> cropOptions() const { return businessManager_.crops(); }
     ActionResult tryChangeCrop(const std::string& cropId);
+    // Cheap single-field lookup for the world view's building label (see
+    // GameWorld::drawBuilding) -- avoids copying the whole businessInfos()
+    // vector just to read one field every frame.
+    std::string farmCropId() const {
+        const Business* farm = businessManager_.find("farm");
+        return farm ? farm->cropId : std::string("wheat");
+    }
 
     // ---- Minigames (graphical-only -- see GameWorld's F key). `hit` is
     // whether the player succeeded (the timing bar's indicator was inside
@@ -447,6 +547,24 @@ private:
     int minigameHitCount_ = 0;  // this life's successful (hit) minigame results -- same reset pattern
     int seasonsWitnessedMask_ = 0; // bit i set once currentSeason() == Season(i) has been observed this life -- same reset pattern, drives the "Full Cycle" achievement
     std::vector<std::string> cropsInSeasonWitnessed_; // crop ids that have grown during their favorite season at least once this life -- drives "Master Farmer"
+    // Port -> Fisher's Isle (see tryCommissionShip/markIslandVisited above) --
+    // reset each generation like the rest of this life's progress, since the
+    // Port itself resets to an unbuilt plot along with every other business.
+    bool hasIslandShip_ = false;
+    bool hasVisitedIsland_ = false;
+
+    // ---- Daily yield variance (see kDailyYieldVarianceMin/Max and
+    // simulateElapsed): rerolled once per in-game day so production isn't
+    // perfectly identical every day. Deliberately not saved -- it just
+    // rerolls itself the next time simulateElapsed notices the day changed. ----
+    double dailyYieldVariance_ = 1.0;
+    long long dailyYieldVarianceDay_ = -1;
+
+    // ---- Transient UI event queues (see drainNewlyUnlockedAchievements/
+    // drainCompletedConstructions) -- never saved, just drained by GameWorld
+    // once per frame to drive toasts. ----
+    std::vector<std::string> pendingAchievementPopups_;
+    std::vector<std::string> completedConstructionEvents_;
     long long lastTickEpoch_ = 0;
     std::string deathCause_; // set by simulateElapsed right before it returns true
     int generation_ = 1; // incremented on each death/rebirth; persists across lives

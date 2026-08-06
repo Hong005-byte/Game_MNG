@@ -89,7 +89,7 @@ struct Zone {
 // the console version effectively blocks on a menu until it returns.
 enum class OverlayKind {
     None, Businesses, Tree, Market, Staff, Sleep, Eat, Doctor, FastForward, Achievements, DeathNotice, Legacy, Dialogue,
-    Bank, Warehouse, Contracts, HowToPlay, CropPicker,
+    Bank, Warehouse, Contracts, HowToPlay, CropPicker, RecipeBook,
     TimingMinigame, // fishing (Fishing Dock) or mining (Mine/Gold Mine) -- see minigameBusinessId_
     Chopping,       // lumber (Lumber Camp) -- a different mash-to-target mechanic
     Brewing,        // alchemist or winery -- memorize-then-repeat a color sequence
@@ -139,6 +139,10 @@ private:
     // against it independently. Reset to 0 whenever any overlay opens.
     float overlayScrollOffset_ = 0.f;
     float waterWaveTimer_ = 0.f; // drives the animated shimmer on Decoration::Kind::Water (Harbor's shoreline)
+    // OverlayKind::RecipeBook's grid/detail toggle (see drawRecipeBookOverlay)
+    // -- empty = grid of every processed good, non-empty = detail view of
+    // that one good's recipe. Reset to empty whenever the overlay (re)opens.
+    std::string recipeBookSelectedGoodId_;
 
     // ---- Timing-bar minigames (see OverlayKind::TimingMinigame /
     // drawTimingMinigameOverlay): an indicator sweeps back and forth over a
@@ -224,7 +228,16 @@ private:
     std::optional<sf::Sound> achievementSound_;
     std::optional<sf::Sound> upgradeSound_;
     float footstepTimer_ = 0.f;
-    int lastAchievementCount_ = 0;
+
+    // ---- Achievement unlock toast (see Game::drainNewlyUnlockedAchievements
+    // and drawAchievementToast): a Minecraft-style "Achievement Unlocked!"
+    // box in the bottom-left corner. Multiple unlocks in the same tick (e.g.
+    // a big offline catch-up crossing several thresholds at once) queue up
+    // and show one at a time rather than overlapping. ----
+    static constexpr float kAchievementToastSeconds = 3.f;
+    std::vector<std::string> achievementToastQueue_; // ids waiting to be shown, oldest first
+    std::string currentAchievementToastId_;          // empty = nothing currently shown
+    float achievementToastTimer_ = 0.f;              // counts down while currentAchievementToastId_ is non-empty
 
     // Ambient weather noise (synthesized white noise, looped) -- plays while
     // raining_ is true (see updateDayNightAndWeather), covering both the
@@ -288,6 +301,13 @@ private:
     // building keyboard shortcut: plays the upgrade chime on success, sets
     // the feedback toast either way.
     void handleUpgradeResult(const ActionResult& r, const std::string& businessId);
+    // Shared by the Businesses overlay's button area and the U-key quick
+    // action (see OverlayKind::None's keyPressed handling): routes to
+    // tryStartConstruction if this business is still an unstarted level-0
+    // plot that requiresConstruction(), a "still building" toast if a site
+    // is already in progress, or the plain tryUpgradeBusinessBulk(id, 1)
+    // path for everything else (free starters, or already built).
+    void performBuildOrUpgrade(const std::string& businessId);
 
     void handleInteraction(const WorldBuilding& building);
     void handleNpcTalk(Npc& npc);
@@ -307,7 +327,14 @@ private:
     bool collidesWithTree(sf::Vector2f pos, float size) const;
     sf::FloatRect achievementsButtonBounds() const;
     sf::FloatRect howToPlayButtonBounds() const;
+    sf::FloatRect recipeBookButtonBounds() const;
     void drawHowToPlayButton(sf::RenderWindow& window);
+    void drawRecipeBookButton(sf::RenderWindow& window);
+    // Grid of every processed good (anything produced by a business with at
+    // least one input -- raw materials have no recipe and aren't listed) as
+    // a small color-block icon + name, 3 per row; clicking one switches to a
+    // detail view of that good's recipe (see recipeBookSelectedGoodId_).
+    void drawRecipeBookOverlay(sf::RenderWindow& window);
 
     void drawZone(sf::RenderWindow& window);
     void drawBuilding(sf::RenderWindow& window, const WorldBuilding& b);
@@ -337,6 +364,15 @@ private:
     void drawBush(sf::RenderWindow& window, sf::Vector2f pos);
     void drawNpc(sf::RenderWindow& window, const Npc& npc);
     void drawLockOverlay(sf::RenderWindow& window, const WorldBuilding& b);
+    // First-build construction (see Business::constructionDaysRemaining /
+    // Game::ConstructionInfo): drawn instead of the building's normal shape
+    // while level == 0 and requiresConstruction() is true -- an unstarted
+    // plot gets a signboard naming what goes there, a started one gets a
+    // scaffolding/progress-bar site. Neither applies to the 4 free starters
+    // or to a prerequisite-locked building (that still just gets
+    // drawLockOverlay on top of its full shape, unchanged).
+    void drawEmptyPlotShape(sf::RenderWindow& window, const WorldBuilding& b, const ConstructionInfo& ci);
+    void drawConstructionSiteShape(sf::RenderWindow& window, const WorldBuilding& b, const ConstructionInfo& ci);
     void drawLegend(sf::RenderWindow& window);
     void drawMinimap(sf::RenderWindow& window);
     void drawHud(sf::RenderWindow& window);
@@ -353,6 +389,11 @@ private:
     // has paused the world) and draws the sweeping color-block wipe while active.
     void updateSeasonTransition(float dt);
     void drawSeasonTransitionOverlay(sf::RenderWindow& window);
+    // Advances achievementToastTimer_ / pops the next queued id -- called
+    // once per frame regardless of overlay state, same as
+    // updateSeasonTransition.
+    void updateAchievementToast(float dt);
+    void drawAchievementToast(sf::RenderWindow& window);
     void drawAchievementsButton(sf::RenderWindow& window);
     void drawTutorial(sf::RenderWindow& window);
 

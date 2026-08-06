@@ -144,7 +144,8 @@ namespace {
     constexpr int kAccentBar = 5;
 
     bool isDockId(const std::string& id) {
-        return id == "fishing" || id == "shipyard" || id == "cannery";
+        return id == "fishing" || id == "shipyard" || id == "cannery" || id == "port" || id == "deepsea" ||
+               id == "island_ferry" || id == "fishermanplatter";
     }
     bool isFieldId(const std::string& id) {
         return id == "dairyfarm" || id == "beehive" || id == "trapper" || id == "teafield" ||
@@ -197,16 +198,25 @@ namespace {
             { "teahouse",     { kAccentCircle,    sf::Color(120, 150, 90) } },
             { "linenmill",    { kAccentBar,       sf::Color(220, 215, 195) } },
             { "pearlatelier", { kAccentCircle,    sf::Color(225, 225, 230) } },
+            { "sushibar",     { kAccentDiamond,   sf::Color(230, 100, 110) } },
+            { "giftbasket",   { kAccentDiamond,   sf::Color(210, 160, 200) } },
             { "jamkitchen",     { kAccentCircle,   sf::Color(200, 90, 110) } },
             { "popcornstand",   { kAccentTriangle, sf::Color(230, 210, 120) } },
             { "juicebar",       { kAccentCircle,   sf::Color(200, 60, 70) } },
             { "pieshop",        { kAccentDiamond,  sf::Color(210, 170, 110) } },
             { "roaststand",     { kAccentTriangle, sf::Color(200, 120, 60) } },
             { "picklinghouse",  { kAccentBar,      sf::Color(140, 170, 90) } },
+            { "honeyrefinery",  { kAccentDiamond,  sf::Color(230, 180, 60) } },
+            { "cakeshop",       { kAccentCircle,   sf::Color(235, 200, 210) } },
+            { "artisanbakery",  { kAccentBar,      sf::Color(200, 150, 90) } },
             // Dock
             { "fishing",  { kAccentCircle,   sf::Color(90, 140, 190) } },
             { "shipyard", { kAccentTriangle, sf::Color(230, 230, 235) } },
             { "cannery",  { kAccentBar,      sf::Color(160, 160, 170) } },
+            { "port",     { kAccentCross,    sf::Color(90, 160, 200) } },
+            { "deepsea",  { kAccentDoubleDot,sf::Color(40, 90, 150) } },
+            { "fishermanplatter", { kAccentBar, sf::Color(80, 150, 160) } },
+            { "island_ferry", { kAccentTriangle, sf::Color(210, 210, 215) } },
             // ServiceHall
             { "storefront", { kAccentBar,     sf::Color(200, 80, 80) } },
             { "market",     { kAccentDiamond, sf::Color(220, 190, 90) } },
@@ -247,12 +257,29 @@ namespace {
             { "season_cycle",      { "ach_cat_season", sf::Color(140, 200, 150) } },
             { "master_farmer",     { "ach_cat_season", sf::Color(140, 200, 150) } },
             { "minigame_pro",      { "ach_cat_minigame", sf::Color(230, 150, 90) } },
+            { "groundbreaking",    { "ach_cat_business", sf::Color(150, 180, 220) } },
+            { "master_builder",    { "ach_cat_business", sf::Color(150, 180, 220) } },
+            { "market_row_regular",{ "ach_cat_business", sf::Color(150, 180, 220) } },
+            { "full_stock",        { "ach_cat_economy", sf::Color(220, 190, 90) } },
+            { "harbormaster",      { "ach_cat_maritime", sf::Color(90, 160, 200) } },
+            { "shipshape",         { "ach_cat_maritime", sf::Color(90, 160, 200) } },
+            { "set_sail",          { "ach_cat_maritime", sf::Color(90, 160, 200) } },
+            { "island_explorer",   { "ach_cat_maritime", sf::Color(90, 160, 200) } },
         };
         auto it = table.find(id);
         return it != table.end() ? it->second : AchievementCategory{ "ach_cat_business", sf::Color(180, 180, 180) };
     }
     // Fixed display order for the categories above.
-    const char* const kAchievementCategoryOrder[] = { "ach_cat_economy", "ach_cat_business", "ach_cat_life", "ach_cat_season", "ach_cat_minigame" };
+    const char* const kAchievementCategoryOrder[] = { "ach_cat_economy", "ach_cat_business", "ach_cat_life", "ach_cat_season", "ach_cat_minigame", "ach_cat_maritime" };
+
+    // Zone indices for the Port <-> Fisher's Isle sail/return trip (see
+    // handleInteraction's "island_ferry" case and the Port's Sail button in
+    // drawBusinessesOverlay) -- named rather than inlined since both sides
+    // of the trip need to agree on them.
+    constexpr int kHarborZoneIndex = 4;
+    constexpr int kFisherIsleZoneIndex = 7;
+    const sf::Vector2f kFisherIsleArrivalPos(120.f, 400.f);
+    const sf::Vector2f kHarborReturnPos(570.f, 560.f); // just south of the Port building
 
     // Tier label colors — the single source of truth for "what color means
     // what tier", now applied to name text rather than the building's shape.
@@ -297,12 +324,18 @@ void GameWorld::initAudio() {
     // rain-or-snow visual -- see the raining_ check in updateDayNightAndWeather. ----
     {
         constexpr float kNoiseDurationSeconds = 2.0f;
-        constexpr float kNoiseAmplitude = 0.18f;
+        constexpr float kNoiseAmplitude = 0.10f; // was 0.18 -- plain white noise at that level read as harsh static rather than rain
         std::vector<std::int16_t> noiseSamples;
         std::size_t n = static_cast<std::size_t>(kNoiseDurationSeconds * static_cast<float>(kSampleRate));
         noiseSamples.reserve(n);
+        // A one-pole low-pass (simple running average with the previous
+        // sample) knocks down the harsh high-frequency hiss that pure white
+        // noise has, leaving something closer to a soft, dull rain patter.
+        float prev = 0.f;
         for (std::size_t i = 0; i < n; ++i) {
-            float sample = (static_cast<float>(std::rand()) / static_cast<float>(RAND_MAX) * 2.f - 1.f) * kNoiseAmplitude;
+            float raw = (static_cast<float>(std::rand()) / static_cast<float>(RAND_MAX) * 2.f - 1.f) * kNoiseAmplitude;
+            float sample = 0.6f * raw + 0.4f * prev;
+            prev = sample;
             noiseSamples.push_back(static_cast<std::int16_t>(sample * 32767.f));
         }
         if (!ambientRainBuffer_.loadFromSamples(noiseSamples.data(), noiseSamples.size(), 1, kSampleRate, { sf::SoundChannel::Mono })) {
@@ -385,7 +418,7 @@ void GameWorld::applySfxVolume() {
     if (interactSound_) interactSound_->setVolume(55.f * scale);
     if (achievementSound_) achievementSound_->setVolume(60.f * scale);
     if (upgradeSound_) upgradeSound_->setVolume(50.f * scale);
-    if (ambientRainSound_) ambientRainSound_->setVolume(40.f * scale);
+    if (ambientRainSound_) ambientRainSound_->setVolume(26.f * scale); // was 40 -- softer, less of a hiss under the visual rain/snow
 }
 
 void GameWorld::applyVideoMode(sf::RenderWindow& window) {
@@ -425,8 +458,8 @@ void GameWorld::applyVideoMode(sf::RenderWindow& window) {
 
 void GameWorld::buildZones() {
     zones_.clear();
-    zones_.resize(6); // 0 = Town Square, 1 = Farmlands, 2 = Mining District, 3 = Valley District,
-                       // 4 = Harbor District, 5 = Highlands District
+    zones_.resize(8); // 0 = Town Square, 1 = Farmlands, 2 = Mining District, 3 = Valley District,
+                       // 4 = Harbor District, 5 = Highlands District, 6 = Market Row, 7 = Fisher's Isle
 
     const sf::Vector2f bSize(110.f, 80.f);
     auto addBuilding = [](Zone& z, const std::string& id, sf::Vector2f pos, sf::Color labelColor, sf::Vector2f size) {
@@ -538,30 +571,34 @@ void GameWorld::buildZones() {
     {
         Zone& z = zones_[1];
         z.nameKey = "zone_farmlands";
-        z.west = 0; // -> Town Square
+        z.west = 0;  // -> Town Square
+        z.south = 6; // -> Market Row
 
-        // 5-column grid (same 240px spacing as Valley District) -- needed
-        // once the Farm's 6 new crop-processor buildings joined the
-        // original 8, which no longer fit the old 3-column layout.
-        addBuilding(z, "lumber",       { 130.f, 180.f }, kTier1, bSize);
-        addBuilding(z, "sawmill",      { 370.f, 180.f }, kTier2, bSize);
-        addBuilding(z, "farm",         { 610.f, 180.f }, kTier1, bSize);
-        addBuilding(z, "jamkitchen",   { 850.f, 180.f }, kTier2, bSize);
-        addBuilding(z, "popcornstand", { 1090.f, 180.f }, kTier2, bSize);
-        addBuilding(z, "quarry",       { 130.f, 480.f }, kTier1, bSize);
-        addBuilding(z, "mason",        { 370.f, 480.f }, kTier2, bSize);
-        addBuilding(z, "bakery",       { 610.f, 480.f }, kTier2, bSize);
-        addBuilding(z, "juicebar",     { 850.f, 480.f }, kTier2, bSize);
-        addBuilding(z, "pieshop",      { 1090.f, 480.f }, kTier2, bSize);
-        addBuilding(z, "sheep",        { 130.f, 650.f }, kTier1, bSize);
-        addBuilding(z, "textile",      { 370.f, 650.f }, kTier2, bSize);
-        addBuilding(z, "roaststand",   { 610.f, 650.f }, kTier2, bSize);
-        addBuilding(z, "picklinghouse",{ 850.f, 650.f }, kTier2, bSize);
+        // 4-column x 2-row grid, each column pairing a raw producer directly
+        // above its own first-stage processor (lumber/sawmill, farm/bakery,
+        // quarry/mason, sheep/textile) -- reads as four short production
+        // lines instead of a flat list. The six farm-crop specialty stalls
+        // that used to crowd a 5th/6th column here (jam/popcorn/juice/pie/
+        // roast/pickling) now live in their own zone (see Zone 6: Market
+        // Row below) -- this zone was up to 14 buildings, more than double
+        // every other zone's 6-10.
+        addBuilding(z, "lumber",  { 130.f, 180.f }, kTier1, bSize);
+        addBuilding(z, "sawmill", { 370.f, 180.f }, kTier2, bSize);
+        addBuilding(z, "farm",    { 610.f, 180.f }, kTier1, bSize);
+        addBuilding(z, "bakery",  { 850.f, 180.f }, kTier2, bSize);
+        addBuilding(z, "quarry",  { 130.f, 480.f }, kTier1, bSize);
+        addBuilding(z, "mason",   { 370.f, 480.f }, kTier2, bSize);
+        addBuilding(z, "sheep",   { 610.f, 480.f }, kTier1, bSize);
+        addBuilding(z, "textile", { 850.f, 480.f }, kTier2, bSize);
 
         addPath(z, { 0.f, 390.f }, { 1280.f, 40.f });
         addPath(z, { 590.f, 40.f }, { 40.f, 740.f });
 
-        for (float x = 20.f; x < 1260.f; x += 70.f) { addTree(z, { x, 15.f }); addTree(z, { x, 800.f }); }
+        for (float x = 20.f; x < 1260.f; x += 70.f) {
+            addTree(z, { x, 15.f });
+            if (x > 540.f && x < 780.f) continue; // south gap (-> Market Row)
+            addTree(z, { x, 800.f });
+        }
         for (float y = 90.f; y < 800.f; y += 70.f) {
             if (y > 330.f && y < 490.f) continue; // west gap (back to Town Square)
             addTree(z, { 15.f, y });
@@ -573,10 +610,12 @@ void GameWorld::buildZones() {
         addNpc(z, "npc_farmer", { 570.f, 330.f }, sf::Color(120, 180, 90),
             { "These fields grow the finest wheat in the land.",
               "The Bakery turns my wheat into bread -- smells wonderful.",
-              "Lumber and stone come from further out here too." },
+              "Lumber and stone come from further out here too.",
+              "The jam, pie, and popcorn stalls moved down to Market Row now -- more room for actual fields up here." },
             { "这片地里种出的小麦是全镇最好的。",
               "面包坊会把我的小麦做成面包,可香了。",
-              "木材和石头在这附近也能找到。" });
+              "木材和石头在这附近也能找到。",
+              "果酱、派和爆米花那些摊子都搬到集市区去了,这边总算能腾出地方种地了。" });
         addNpc(z, "npc_child", { 950.f, 330.f }, sf::Color(230, 190, 210),
             { "Have you seen how tall the wheat gets? Taller than me!",
               "Mom says the Bakery bread is best right after it's made." },
@@ -591,13 +630,16 @@ void GameWorld::buildZones() {
         z.south = 0; // -> Town Square
         z.north = 5; // -> Highlands District
 
+        // 3x2 grid -- smokehouse used to sit here as a 7th building despite
+        // having nothing to do with mining (a leftover placement mistake);
+        // it's moved to Fisher's Isle now (see Zone 7 below), where the rest
+        // of the fish-processing chain actually lives.
         addBuilding(z, "mine",       { 280.f, 180.f }, kTier1, bSize);
         addBuilding(z, "smelter",    { 600.f, 180.f }, kTier2, bSize);
         addBuilding(z, "gemshop",    { 920.f, 180.f }, kTier2, bSize);
-        addBuilding(z, "blacksmith", { 440.f, 480.f }, kTier3, bSize);
-        addBuilding(z, "carpenter",  { 760.f, 480.f }, kTier3, bSize);
-        addBuilding(z, "smokehouse", { 280.f, 650.f }, kTier2, bSize);
-        addBuilding(z, "tailor",     { 920.f, 650.f }, kTier3, bSize);
+        addBuilding(z, "blacksmith", { 280.f, 480.f }, kTier3, bSize);
+        addBuilding(z, "carpenter",  { 600.f, 480.f }, kTier3, bSize);
+        addBuilding(z, "tailor",     { 920.f, 480.f }, kTier3, bSize);
 
         addPath(z, { 590.f, 0.f }, { 40.f, 780.f });
 
@@ -684,7 +726,11 @@ void GameWorld::buildZones() {
         addBuilding(z, "fishing",      { 570.f, 180.f }, kTier1, bSize);
         addBuilding(z, "pearlfarm",    { 890.f, 180.f }, kTier1, bSize);
         addBuilding(z, "shipyard",     { 250.f, 480.f }, kTier2, bSize);
-        addBuilding(z, "cannery",      { 570.f, 480.f }, kTier2, bSize);
+        // Port sits in the lower row (the "downstream/further out" half of
+        // this zone's layout, matching every other district) -- once built
+        // it's what unlocks commissioning a ship and sailing to Fisher's
+        // Isle (see Zone 7 below and Game::tryCommissionShip).
+        addBuilding(z, "port",         { 570.f, 480.f }, kTier3, bSize);
         addBuilding(z, "pearlatelier", { 890.f, 480.f }, kTier2, bSize);
 
         addPath(z, { 590.f, 0.f }, { 40.f, 260.f }); // spine leading down from the Town Square gap
@@ -703,9 +749,11 @@ void GameWorld::buildZones() {
 
         addNpc(z, "npc_shipwright", { 340.f, 380.f }, sf::Color(90, 110, 140),
             { "Give me enough planks and I'll build you a ship worth sailing.",
-              "The Fishing Dock keeps me in steady work -- always something to haul." },
+              "The Fishing Dock keeps me in steady work -- always something to haul.",
+              "Once the Port's built, commission a ship there and you can sail out to Fisher's Isle." },
             { "只要木板给够,我就能造出一艘经得起出海的船。",
-              "渔港一直有活给我干,总有东西要装卸。" });
+              "渔港一直有活给我干,总有东西要装卸。",
+              "港口建好以后,在那边造艘船,就能出海去渔人岛了。" });
         addNpc(z, "npc_pearldiver", { 780.f, 620.f }, sf::Color(80, 160, 170),
             { "Deep water, cold water -- but a good pearl makes it worth the dive.",
               "The Pearl Atelier pays well for a clean, unblemished pearl." },
@@ -729,6 +777,11 @@ void GameWorld::buildZones() {
         addBuilding(z, "teahouse",  { 610.f, 480.f }, kTier2, bSize);
         addBuilding(z, "flaxfield", { 850.f, 480.f }, kTier1, bSize);
         addBuilding(z, "linenmill", { 1090.f, 480.f }, kTier2, bSize);
+        // Country Gift Basket: a multi-input recipe (see BusinessType::
+        // extraInputs) sourced entirely from within this district (cheese +
+        // honey + tea), off in its own spot clear of the south-facing path
+        // spine below.
+        addBuilding(z, "giftbasket", { 1090.f, 650.f }, kTier3, bSize);
 
         addPath(z, { 590.f, 540.f }, { 40.f, 260.f }); // spine leading up to the Mining District gap
 
@@ -771,6 +824,93 @@ void GameWorld::buildZones() {
         addForageable(z, { 400.f, 600.f });
         addForageable(z, { 830.f, 610.f });
     }
+
+    // ---------------- Zone 6: Market Row ----------------
+    {
+        // The six farm-crop specialty stalls that used to crowd Farmlands
+        // (see Zone 1 above) -- jam/popcorn/juice/pie/roast/pickling all
+        // consume one of the Farm's seasonal crops (strawberry/corn/
+        // watermelon/pumpkin/sweetpotato/cabbage, see Business.cpp's
+        // "Farm crop processors" section), so they read better as their own
+        // bustling market square than mixed in with the open fields. A 3rd
+        // row (honeyrefinery/cakeshop/artisanbakery) joined later -- see
+        // Business.cpp's multi-input recipes -- making this a 3x3 grid.
+        Zone& z = zones_[6];
+        z.nameKey = "zone_market";
+        z.north = 1; // -> Farmlands
+
+        addBuilding(z, "jamkitchen",     { 250.f, 160.f }, kTier2, bSize);
+        addBuilding(z, "popcornstand",   { 610.f, 160.f }, kTier2, bSize);
+        addBuilding(z, "juicebar",       { 970.f, 160.f }, kTier2, bSize);
+        addBuilding(z, "pieshop",        { 250.f, 390.f }, kTier2, bSize);
+        addBuilding(z, "roaststand",     { 610.f, 390.f }, kTier2, bSize);
+        addBuilding(z, "picklinghouse",  { 970.f, 390.f }, kTier2, bSize);
+        addBuilding(z, "honeyrefinery",  { 250.f, 620.f }, kTier2, bSize);
+        addBuilding(z, "cakeshop",       { 610.f, 620.f }, kTier3, bSize);
+        addBuilding(z, "artisanbakery",  { 970.f, 620.f }, kTier3, bSize);
+
+        addPath(z, { 590.f, 0.f }, { 40.f, 260.f }); // spine leading down from the Farmlands gap
+
+        for (float x = 20.f; x < 1260.f; x += 70.f) {
+            if (x > 540.f && x < 780.f) continue; // north gap (-> Farmlands)
+            addTree(z, { x, 15.f });
+            addTree(z, { x, 800.f });
+        }
+        for (float y = 90.f; y < 800.f; y += 70.f) { addTree(z, { 15.f, y }); addTree(z, { 1260.f, y }); }
+        for (int i = 0; i < 14; ++i) addBush(z, { randRange(120.f, 1160.f), randRange(120.f, 760.f) });
+        for (int i = 0; i < 18; ++i) addPatch(z, { randRange(0.f, 1260.f), randRange(0.f, 800.f) }, { 46.f, 30.f }); // busier ground clutter than the open zones -- reads as a market square, not a field
+
+        addNpc(z, "npc_market_vendor", { 610.f, 280.f }, sf::Color(220, 140, 60),
+            { "Fresh jam, hot popcorn, cold juice -- whatever the Farm's growing this season, we're selling it.",
+              "Business swings with the crop calendar. Strawberries in spring, pumpkins in autumn.",
+              "The Honey Refinery, Cake Shop, and Artisan Bakery down the row mix in stuff from other parts of town too." },
+            { "新鲜果酱、热爆米花、冰果汁——农场这季种什么,我们就卖什么。",
+              "生意跟着作物季节走,春天卖草莓,秋天就卖南瓜了。",
+              "那边的蜜糖坊、蛋糕坊和手工烘焙坊,用的料是从镇上好几个地方凑来的。" });
+    }
+
+    // ---------------- Zone 7: Fisher's Isle ----------------
+    {
+        // Reached only by sailing from the Port in Harbor District (see
+        // Game::tryCommissionShip and the Port's Sail button in
+        // drawBusinessesOverlay) -- deliberately has no north/south/east/west
+        // links at all, unlike every other zone. Walking to any edge here
+        // just stops at the edge (see the travel code's "else" branches);
+        // the only way back is interacting with the ferry below.
+        Zone& z = zones_[7];
+        z.nameKey = "zone_fisher_isle";
+
+        addBuilding(z, "cannery",    { 250.f, 220.f }, kTier2, bSize);
+        addBuilding(z, "smokehouse", { 610.f, 220.f }, kTier2, bSize);
+        addBuilding(z, "deepsea",    { 250.f, 520.f }, kTier1, bSize);
+        addBuilding(z, "sushibar",   { 610.f, 520.f }, kTier2, bSize);
+        // Fisherman's Platter: a multi-input recipe (see BusinessType::
+        // extraInputs) combining Cannery/Smokehouse's own output with
+        // Harbor's salt.
+        addBuilding(z, "fishermanplatter", { 970.f, 520.f }, kTier3, bSize);
+        // The ferry home -- not a BusinessType, just an interactive world
+        // object (see handleInteraction's "island_ferry" special case,
+        // alongside market/staff/etc.).
+        addBuilding(z, "island_ferry", { 970.f, 220.f }, kService, bSize);
+
+        // Surrounded by sea on every side instead of the usual tree-wall
+        // border -- there's no adjacent zone to wall off from here, and
+        // water reads immediately as "this is an island" the way trees wouldn't.
+        addWater(z, { 0.f, 0.f }, { 1280.f, 60.f });
+        addWater(z, { 0.f, 760.f }, { 1280.f, 60.f });
+        addWater(z, { 0.f, 0.f }, { 60.f, 820.f });
+        addWater(z, { 1220.f, 0.f }, { 60.f, 820.f });
+        for (int i = 0; i < 10; ++i) addBush(z, { randRange(120.f, 1160.f), randRange(120.f, 700.f) });
+        for (int i = 0; i < 14; ++i) addPatch(z, { randRange(80.f, 1200.f), randRange(80.f, 740.f) }, { 46.f, 30.f });
+
+        addNpc(z, "npc_islander", { 610.f, 650.f }, sf::Color(70, 150, 160),
+            { "Tuna run deep out here -- takes real gear, but it's worth the trip.",
+              "The Sushi Bar pays top price for a fresh catch.",
+              "Ring for the ferry whenever you're ready to head back to the mainland." },
+            { "这一带的金枪鱼要往深处下网才捞得到,不过很值。",
+              "寿司吧对新鲜的鱼货出价最高。",
+              "想回大陆的话,去渡船那边就行。" });
+    }
 }
 
 bool GameWorld::collidesWithBuilding(sf::Vector2f pos, float size) const {
@@ -802,6 +942,11 @@ sf::FloatRect GameWorld::howToPlayButtonBounds() const {
     return sf::FloatRect({ static_cast<float>(windowSize_.x) - 168.f - 158.f - 10.f, 10.f }, { 158.f, 34.f });
 }
 
+sf::FloatRect GameWorld::recipeBookButtonBounds() const {
+    // Sits just left of How to Play, same size, same row.
+    return sf::FloatRect({ static_cast<float>(windowSize_.x) - 168.f - 158.f - 10.f - 158.f - 10.f, 10.f }, { 158.f, 34.f });
+}
+
 void GameWorld::handleInteraction(const WorldBuilding& building) {
     if (interactSound_) interactSound_->play();
 
@@ -818,6 +963,15 @@ void GameWorld::handleInteraction(const WorldBuilding& building) {
     if (building.id == "townhall") { openOverlay(OverlayKind::Tree); return; }
     if (building.id == "bank") { openOverlay(OverlayKind::Bank); return; }
     if (building.id == "warehouse") { openOverlay(OverlayKind::Warehouse); return; }
+    // The ferry back to the mainland (see Zone 7 in buildZones()) -- an
+    // instant round-trip, no overlay, symmetric with the Port's "Sail"
+    // button that got the player out here in the first place.
+    if (building.id == "island_ferry") {
+        currentZone_ = kHarborZoneIndex;
+        playerPos_ = kHarborReturnPos;
+        setFeedback(Localization::t("returned_to_harbor"), true);
+        return;
+    }
 
     // A locked production building still opening the full Businesses screen
     // (just to show that one row greyed out) reads as "I can still interact
@@ -942,6 +1096,7 @@ void GameWorld::openOverlay(OverlayKind kind) {
     // resetting the selection here would always fall back to good #0.
     if (kind != OverlayKind::Contracts) selectedGoodIndex_ = 0;
     overlayScrollOffset_ = 0.f;
+    if (kind == OverlayKind::RecipeBook) recipeBookSelectedGoodId_.clear(); // always start at the grid, not wherever it was left last time
 }
 
 void GameWorld::closeOverlay() {
@@ -1610,26 +1765,165 @@ void GameWorld::drawLockOverlay(sf::RenderWindow& window, const WorldBuilding& b
     window.draw(shackle);
 }
 
-void GameWorld::drawBuilding(sf::RenderWindow& window, const WorldBuilding& b) {
-    if (b.id == "farm") drawFarmShape(window, b);
-    else if (b.id == "mine") drawMineShape(window, b);
-    else if (b.id == "lumber") drawLumberShape(window, b);
-    else if (b.id == "quarry") drawQuarryShape(window, b);
-    else if (b.id == "sheep") drawPastureShape(window, b);
-    else if (b.id == "orchard") drawOrchardShape(window, b);
-    else if (b.id == "herbgarden") drawHerbGardenShape(window, b);
-    else if (b.id == "vineyard") drawVineyardShape(window, b);
-    else if (b.id == "goldmine") drawGoldMineShape(window, b);
-    else if (isDockId(b.id)) { BuildingAccent a = accentFor(b.id); drawDockShape(window, b, a.kind, a.color); }
-    else if (isFieldId(b.id)) { BuildingAccent a = accentFor(b.id); drawFieldShape(window, b, a.kind, a.color); }
-    else if (isServiceHallId(b.id)) { BuildingAccent a = accentFor(b.id); drawServiceHallShape(window, b, a.kind, a.color); }
-    else if (b.id == "sleep" || b.id == "eat" || b.id == "doctor") drawCottageShape(window, b);
-    else { BuildingAccent a = accentFor(b.id); drawWorkshopShape(window, b, a.kind, a.color); } // every remaining tier-2/3 processor
+void GameWorld::drawEmptyPlotShape(sf::RenderWindow& window, const WorldBuilding& b, const ConstructionInfo& ci) {
+    // Bare, muted ground -- deliberately duller/flatter than any built shape
+    // (or the construction site below) so an unstarted plot reads as
+    // "nothing here yet" at a glance rather than looking broken.
+    sf::RectangleShape ground(b.size);
+    ground.setPosition(b.position);
+    ground.setFillColor(sf::Color(70, 78, 62));
+    ground.setOutlineThickness(1.5f);
+    ground.setOutlineColor(sf::Color(45, 50, 40));
+    window.draw(ground);
 
-    if (game_.isBusinessLocked(b.id)) drawLockOverlay(window, b);
+    // A small signboard in the corner of the plot naming what's meant to go
+    // here (plus the material shortlist, so a walk-by tells you what to
+    // stockpile without opening the full panel) -- separate from (and in
+    // addition to) the floating name label drawBuilding draws above every
+    // building regardless of state. Tall enough for up to 3 material lines
+    // (the most any recipe has -- see BusinessManager::buildMaterialsFor).
+    float boardH = 22.f + static_cast<float>(ci.materials.size()) * 13.f;
+    sf::Vector2f postPos(b.position.x + 10.f, b.position.y + b.size.y - (boardH + 10.f));
+    sf::RectangleShape post(sf::Vector2f(5.f, boardH + 6.f));
+    post.setPosition(postPos);
+    post.setFillColor(sf::Color(94, 62, 32));
+    window.draw(post);
+
+    sf::RectangleShape board(sf::Vector2f(88.f, boardH));
+    board.setPosition(sf::Vector2f(postPos.x - 6.f, postPos.y));
+    board.setFillColor(sf::Color(196, 168, 118));
+    board.setOutlineThickness(1.5f);
+    board.setOutlineColor(sf::Color(94, 62, 32));
+    window.draw(board);
 
     if (fontLoaded_) {
-        sf::Text text(font_, toSfString(Localization::t(b.labelKey)), 13);
+        std::string text = Localization::t("construction_plot_sign_prefix") + Localization::t(b.labelKey);
+        sf::Text label(font_, toSfString(text), 10);
+        label.setFillColor(sf::Color(40, 30, 15));
+        label.setPosition(sf::Vector2f(board.getPosition().x + 4.f, board.getPosition().y + 4.f));
+        window.draw(label);
+
+        float lineY = board.getPosition().y + 20.f;
+        for (const auto& m : ci.materials) {
+            std::ostringstream line;
+            line << Localization::t(m.goodId) << " " << formatNumber(m.have) << "/" << formatNumber(m.required);
+            sf::Text matLine(font_, toSfString(line.str()), 9);
+            matLine.setFillColor(m.have >= m.required ? sf::Color(30, 90, 30) : sf::Color(110, 30, 30));
+            matLine.setPosition(sf::Vector2f(board.getPosition().x + 4.f, lineY));
+            window.draw(matLine);
+            lineY += 13.f;
+        }
+    }
+}
+
+void GameWorld::drawConstructionSiteShape(sf::RenderWindow& window, const WorldBuilding& b, const ConstructionInfo& ci) {
+    // Excavated, earthy ground -- distinct from both the empty plot's dull
+    // grey-green above and any finished building's own colors.
+    sf::RectangleShape ground(b.size);
+    ground.setPosition(b.position);
+    ground.setFillColor(sf::Color(120, 96, 62));
+    ground.setOutlineThickness(2.f);
+    ground.setOutlineColor(sf::Color(70, 55, 30));
+    window.draw(ground);
+
+    // A crossed scaffold -- flat lines, no gradients, matching every other
+    // building shape's look.
+    sf::Color beam(150, 110, 60);
+    sf::Vertex scaffold[] = {
+        sf::Vertex{ sf::Vector2f(b.position.x + 6.f, b.position.y + b.size.y - 6.f), beam },
+        sf::Vertex{ sf::Vector2f(b.position.x + b.size.x - 6.f, b.position.y + 6.f), beam },
+        sf::Vertex{ sf::Vector2f(b.position.x + 6.f, b.position.y + 6.f), beam },
+        sf::Vertex{ sf::Vector2f(b.position.x + b.size.x - 6.f, b.position.y + b.size.y - 6.f), beam },
+    };
+    window.draw(scaffold, 4, sf::PrimitiveType::Lines);
+
+    // A small pile of material blocks in the corner.
+    const sf::Color materialColors[3] = { sf::Color(196, 168, 118), sf::Color(150, 150, 156), sf::Color(120, 80, 50) };
+    for (int i = 0; i < 3; ++i) {
+        sf::RectangleShape chunk(sf::Vector2f(12.f, 10.f));
+        chunk.setPosition(sf::Vector2f(b.position.x + 8.f + static_cast<float>(i) * 14.f, b.position.y + b.size.y - 18.f));
+        chunk.setFillColor(materialColors[i]);
+        window.draw(chunk);
+    }
+
+    // Progress bar along the bottom edge of the site itself (not above the
+    // building) so it never collides with the floating name label
+    // drawBuilding already draws above every building's footprint.
+    float barW = b.size.x - 12.f, barH = 6.f;
+    sf::Vector2f barPos(b.position.x + 6.f, b.position.y + b.size.y - 8.f);
+    sf::RectangleShape barBg(sf::Vector2f(barW, barH));
+    barBg.setPosition(barPos);
+    barBg.setFillColor(sf::Color(30, 30, 34));
+    window.draw(barBg);
+
+    double totalDays = std::max(1, ci.totalDays);
+    float progress = static_cast<float>(std::clamp(1.0 - (ci.daysRemaining / totalDays), 0.0, 1.0));
+    sf::RectangleShape barFill(sf::Vector2f(barW * progress, barH));
+    barFill.setPosition(barPos);
+    barFill.setFillColor(sf::Color(232, 212, 120));
+    window.draw(barFill);
+
+    if (fontLoaded_) {
+        int daysLeft = static_cast<int>(std::ceil(ci.daysRemaining));
+        std::string text = Localization::t("construction_site_days_left_prefix") + std::to_string(daysLeft) + Localization::t("construction_site_days_left_suffix");
+        sf::Text label(font_, toSfString(text), 12);
+        sf::FloatRect bounds = label.getLocalBounds();
+        label.setPosition(sf::Vector2f(b.position.x + b.size.x / 2.f - bounds.size.x / 2.f - bounds.position.x, b.position.y + b.size.y / 2.f - 8.f));
+        label.setFillColor(sf::Color(255, 240, 210));
+        label.setOutlineColor(sf::Color::Black);
+        label.setOutlineThickness(2.f);
+        window.draw(label);
+    }
+}
+
+void GameWorld::drawBuilding(sf::RenderWindow& window, const WorldBuilding& b) {
+    // Prerequisite lock (see BusinessManager::isLocked) takes priority over
+    // everything below and is unchanged from before this feature: a
+    // tier-2/3 building whose tier-1 source isn't built yet still just gets
+    // its full normal shape dimmed with a padlock, not a plot/site.
+    bool locked = game_.isBusinessLocked(b.id);
+
+    // First-build construction (see Business::constructionDaysRemaining):
+    // requiresConstruction is only ever true here for an unlocked business
+    // still at level 0 that isn't one of the 4 free starters (see
+    // Game::businessConstructionInfo's early-outs) -- draw the empty-plot
+    // or construction-site shape instead of the real building, then skip
+    // straight to the shared name label below.
+    ConstructionInfo ci = locked ? ConstructionInfo{} : game_.businessConstructionInfo(b.id);
+    if (ci.requiresConstruction) {
+        if (ci.inProgress) drawConstructionSiteShape(window, b, ci);
+        else drawEmptyPlotShape(window, b, ci);
+    } else {
+        if (b.id == "farm") drawFarmShape(window, b);
+        else if (b.id == "mine") drawMineShape(window, b);
+        else if (b.id == "lumber") drawLumberShape(window, b);
+        else if (b.id == "quarry") drawQuarryShape(window, b);
+        else if (b.id == "sheep") drawPastureShape(window, b);
+        else if (b.id == "orchard") drawOrchardShape(window, b);
+        else if (b.id == "herbgarden") drawHerbGardenShape(window, b);
+        else if (b.id == "vineyard") drawVineyardShape(window, b);
+        else if (b.id == "goldmine") drawGoldMineShape(window, b);
+        else if (isDockId(b.id)) { BuildingAccent a = accentFor(b.id); drawDockShape(window, b, a.kind, a.color); }
+        else if (isFieldId(b.id)) { BuildingAccent a = accentFor(b.id); drawFieldShape(window, b, a.kind, a.color); }
+        else if (isServiceHallId(b.id)) { BuildingAccent a = accentFor(b.id); drawServiceHallShape(window, b, a.kind, a.color); }
+        else if (b.id == "sleep" || b.id == "eat" || b.id == "doctor") drawCottageShape(window, b);
+        else { BuildingAccent a = accentFor(b.id); drawWorkshopShape(window, b, a.kind, a.color); } // every remaining tier-2/3 processor
+
+        if (locked) drawLockOverlay(window, b);
+    }
+
+    if (fontLoaded_) {
+        // The Farm alone shows which crop is currently planted -- otherwise
+        // the sign stays "Farm" (or a stale "Wheat Farm"-style name) even
+        // after switching to strawberries/corn/watermelon/etc, which reads
+        // as a labeling mistake when the field itself is clearly a
+        // different crop. Every other building's label is just its own
+        // fixed name.
+        std::string label = Localization::t(b.labelKey);
+        if (b.id == "farm") {
+            label += " (" + Localization::t(game_.farmCropId()) + ")";
+        }
+        sf::Text text(font_, toSfString(label), 13);
         sf::FloatRect bounds = text.getLocalBounds();
         text.setPosition(sf::Vector2f(b.position.x + b.size.x / 2.f - bounds.size.x / 2.f, b.position.y - 26.f));
         text.setFillColor(b.labelColor);
@@ -1801,6 +2095,7 @@ void GameWorld::drawMinimap(sf::RenderWindow& window) {
     const sf::Vector2f farmPos(panelX + 220.f, panelY + 138.f);
     const sf::Vector2f valleyPos(panelX + 76.f, panelY + 138.f);
     const sf::Vector2f harborPos(panelX + 148.f, panelY + 200.f);
+    const sf::Vector2f marketPos(panelX + 220.f, panelY + 200.f); // south of Farmlands, same row as Harbor
 
     sf::Vertex vline[] = {
         sf::Vertex{ sf::Vector2f(townPos.x + boxSize.x / 2.f, townPos.y), sf::Color(210, 210, 210) },
@@ -1832,6 +2127,12 @@ void GameWorld::drawMinimap(sf::RenderWindow& window) {
     };
     window.draw(hlineWest, 2, sf::PrimitiveType::Lines);
 
+    sf::Vertex vlineMarket[] = {
+        sf::Vertex{ sf::Vector2f(farmPos.x + boxSize.x / 2.f, farmPos.y + boxSize.y), sf::Color(210, 210, 210) },
+        sf::Vertex{ sf::Vector2f(marketPos.x + boxSize.x / 2.f, marketPos.y), sf::Color(210, 210, 210) },
+    };
+    window.draw(vlineMarket, 2, sf::PrimitiveType::Lines);
+
     // Non-current boxes are outlined in a subtle per-zone theme color instead
     // of a flat grey, so the map reads at a glance even before walking there;
     // the current zone still always overrides to the same gold highlight.
@@ -1850,6 +2151,23 @@ void GameWorld::drawMinimap(sf::RenderWindow& window) {
             label.setFillColor(sf::Color::White);
             window.draw(label);
         }
+
+        // A small orange dot in the corner if anything in this zone is
+        // currently under construction (see Business::constructionDaysRemaining)
+        // -- lets a player planning a route see which districts have work
+        // in progress without walking all the way over.
+        if (zoneIndex >= 0 && zoneIndex < static_cast<int>(zones_.size())) {
+            bool anyBuilding = false;
+            for (const auto& zb : zones_[static_cast<size_t>(zoneIndex)].buildings) {
+                if (game_.businessConstructionInfo(zb.id).inProgress) { anyBuilding = true; break; }
+            }
+            if (anyBuilding) {
+                sf::CircleShape dot(4.f);
+                dot.setPosition(sf::Vector2f(pos.x + boxSize.x - 10.f, pos.y + 2.f));
+                dot.setFillColor(sf::Color(235, 150, 60));
+                window.draw(dot);
+            }
+        }
     };
 
     drawZoneBox(highlandsPos, 5, "zone_highlands", sf::Color(110, 190, 120));   // pastoral green
@@ -1858,6 +2176,7 @@ void GameWorld::drawMinimap(sf::RenderWindow& window) {
     drawZoneBox(farmPos, 1, "zone_farmlands", sf::Color(200, 190, 100));       // wheat gold
     drawZoneBox(valleyPos, 3, "zone_valley", sf::Color(180, 140, 200));        // orchard/vineyard purple
     drawZoneBox(harborPos, 4, "zone_harbor", sf::Color(100, 160, 210));        // marine blue
+    drawZoneBox(marketPos, 6, "zone_market", sf::Color(230, 150, 90));         // food-stall orange
 }
 
 void GameWorld::drawHud(sf::RenderWindow& window) {
@@ -2093,14 +2412,19 @@ void GameWorld::drawSeasonalAmbient(sf::RenderWindow& window) {
         break;
     }
     case Season::Spring: {
+        // Cherry-blossom petals -- round, saturated pink, and visibly
+        // tumbling (drift amplitude wider than it falls). Deliberately far
+        // from Winter's white square snowflakes below: a pale near-white
+        // square falling straight down used to read as "snow in spring" at
+        // a glance, which is what this shape+color swap fixes.
         constexpr int kCount = 20;
         for (int i = 0; i < kCount; ++i) {
             float laneX = std::fmod(static_cast<float>(i) * 173.f, w);
             float y = std::fmod(seasonalAmbientTimer_ * 16.f + static_cast<float>(i) * 47.f, h + 20.f) - 20.f; // slowest fall of the four -- petals/pollen, not rain
-            float drift = std::sin(seasonalAmbientTimer_ * 0.4f + static_cast<float>(i) * 0.7f) * 22.f;
-            sf::RectangleShape petal(sf::Vector2f(4.f, 4.f));
+            float drift = std::sin(seasonalAmbientTimer_ * 0.4f + static_cast<float>(i) * 0.7f) * 26.f;
+            sf::CircleShape petal(3.5f);
             petal.setPosition(sf::Vector2f(laneX + drift, y));
-            petal.setFillColor(sf::Color(250, 210, 225, 190));
+            petal.setFillColor(sf::Color(255, 140, 190, 210));
             window.draw(petal);
         }
         break;
@@ -2134,6 +2458,48 @@ void GameWorld::updateSeasonTransition(float dt) {
         seasonTransitionActive_ = false;
         seasonTransitionTimer_ = 0.f;
     }
+}
+
+void GameWorld::updateAchievementToast(float dt) {
+    if (!currentAchievementToastId_.empty()) {
+        achievementToastTimer_ -= dt;
+        if (achievementToastTimer_ <= 0.f) {
+            currentAchievementToastId_.clear();
+        }
+        return; // don't pop the next one the same frame the current one ends -- one at a time
+    }
+    if (!achievementToastQueue_.empty()) {
+        currentAchievementToastId_ = achievementToastQueue_.front();
+        achievementToastQueue_.erase(achievementToastQueue_.begin());
+        achievementToastTimer_ = kAchievementToastSeconds;
+        if (achievementSound_) achievementSound_->play();
+    }
+}
+
+void GameWorld::drawAchievementToast(sf::RenderWindow& window) {
+    if (currentAchievementToastId_.empty() || !fontLoaded_) return;
+
+    sf::Vector2f size(300.f, 64.f);
+    sf::Vector2f pos(16.f, static_cast<float>(windowSize_.y) - size.y - 16.f);
+    sf::RectangleShape bg(size);
+    bg.setPosition(pos);
+    bg.setFillColor(sf::Color(30, 32, 40, 235));
+    bg.setOutlineThickness(3.f);
+    bg.setOutlineColor(sf::Color(232, 212, 120));
+    window.draw(bg);
+
+    // A small gold square standing in for a trophy/badge icon -- keeps with
+    // the game's flat-shape, no-imported-art look instead of needing a
+    // texture just for this.
+    sf::RectangleShape badge(sf::Vector2f(36.f, 36.f));
+    badge.setPosition(sf::Vector2f(pos.x + 14.f, pos.y + size.y / 2.f - 18.f));
+    badge.setFillColor(sf::Color(232, 212, 120));
+    badge.setOutlineThickness(2.f);
+    badge.setOutlineColor(sf::Color(120, 100, 40));
+    window.draw(badge);
+
+    uiText(window, { pos.x + 62.f, pos.y + 12.f }, Localization::t("achievement_toast_header"), 13, sf::Color(232, 212, 120), true);
+    uiText(window, { pos.x + 62.f, pos.y + 34.f }, Localization::t("ach_" + currentAchievementToastId_ + "_name"), 15, sf::Color::White, true);
 }
 
 void GameWorld::drawSeasonTransitionOverlay(sf::RenderWindow& window) {
@@ -2252,6 +2618,23 @@ void GameWorld::drawHowToPlayButton(sf::RenderWindow& window) {
     window.draw(label);
 }
 
+void GameWorld::drawRecipeBookButton(sf::RenderWindow& window) {
+    sf::FloatRect rect = recipeBookButtonBounds();
+    sf::RectangleShape btn(rect.size);
+    btn.setPosition(rect.position);
+    btn.setFillColor(sf::Color(72, 58, 112));
+    btn.setOutlineThickness(2.f);
+    btn.setOutlineColor(sf::Color(232, 212, 120));
+    window.draw(btn);
+
+    if (!fontLoaded_) return;
+    sf::Text label(font_, toSfString(Localization::t("recipebook_button")), 15);
+    sf::FloatRect bounds = label.getLocalBounds();
+    label.setPosition(sf::Vector2f(rect.position.x + rect.size.x / 2.f - bounds.size.x / 2.f, rect.position.y + rect.size.y / 2.f - 11.f));
+    label.setFillColor(sf::Color(232, 212, 120));
+    window.draw(label);
+}
+
 void GameWorld::drawTutorial(sf::RenderWindow& window) {
     window.clear(sf::Color(22, 24, 30));
     if (!fontLoaded_) {
@@ -2260,8 +2643,27 @@ void GameWorld::drawTutorial(sf::RenderWindow& window) {
     }
 
     sf::Vector2u winSize = window.getSize();
-    sf::RectangleShape panel(sf::Vector2f(760.f, 340.f));
-    panel.setPosition(sf::Vector2f((static_cast<float>(winSize.x) - 760.f) / 2.f, (static_cast<float>(winSize.y) - 340.f) / 2.f));
+
+    // Measure the body text before sizing the panel -- its length varies a
+    // lot between languages (and whenever the copy grows), so a panel with a
+    // fixed height/width used to silently start clipping past its own
+    // outline and overlapping the "press any key" prompt below it. Sizing to
+    // fit the actual measured bounds keeps that from happening again.
+    sf::Text body(font_, toSfString(applyKeyPlaceholders(Localization::t("tutorial_body"))), 17);
+    body.setFillColor(sf::Color::White);
+    body.setLineSpacing(1.35f);
+    sf::FloatRect bodyBounds = body.getLocalBounds();
+
+    constexpr float kMargin = 36.f;
+    constexpr float kTopArea = 90.f;    // title + gap above the body
+    constexpr float kBottomArea = 70.f; // gap + "press any key" line below the body
+    constexpr float kMinPanelW = 760.f, kMinPanelH = 340.f;
+
+    float panelW = std::max(kMinPanelW, bodyBounds.size.x + kMargin * 2.f);
+    float panelH = std::max(kMinPanelH, kTopArea + bodyBounds.size.y + kBottomArea);
+
+    sf::RectangleShape panel(sf::Vector2f(panelW, panelH));
+    panel.setPosition(sf::Vector2f((static_cast<float>(winSize.x) - panelW) / 2.f, (static_cast<float>(winSize.y) - panelH) / 2.f));
     panel.setFillColor(sf::Color(40, 44, 56));
     panel.setOutlineThickness(3.f);
     panel.setOutlineColor(sf::Color(232, 212, 120));
@@ -2270,19 +2672,19 @@ void GameWorld::drawTutorial(sf::RenderWindow& window) {
     sf::Text title(font_, toSfString(Localization::t("tutorial_title")), 26);
     title.setStyle(sf::Text::Bold);
     sf::FloatRect titleBounds = title.getLocalBounds();
-    title.setPosition(sf::Vector2f(panel.getPosition().x + panel.getSize().x / 2.f - titleBounds.size.x / 2.f, panel.getPosition().y + 26.f));
+    title.setPosition(sf::Vector2f(panel.getPosition().x + panel.getSize().x / 2.f - titleBounds.size.x / 2.f - titleBounds.position.x, panel.getPosition().y + 26.f));
     title.setFillColor(sf::Color(232, 212, 120));
     window.draw(title);
 
-    sf::Text body(font_, toSfString(applyKeyPlaceholders(Localization::t("tutorial_body"))), 17);
-    body.setPosition(sf::Vector2f(panel.getPosition().x + 36.f, panel.getPosition().y + 90.f));
-    body.setFillColor(sf::Color::White);
-    body.setLineSpacing(1.35f);
+    float bodyTop = panel.getPosition().y + kTopArea;
+    body.setPosition(sf::Vector2f(panel.getPosition().x + kMargin - bodyBounds.position.x, bodyTop - bodyBounds.position.y));
     window.draw(body);
 
     sf::Text cont(font_, toSfString(Localization::t("tutorial_continue")), 15);
     sf::FloatRect contBounds = cont.getLocalBounds();
-    cont.setPosition(sf::Vector2f(panel.getPosition().x + panel.getSize().x / 2.f - contBounds.size.x / 2.f, panel.getPosition().y + panel.getSize().y - 42.f));
+    float bodyBottom = bodyTop + bodyBounds.size.y;
+    float contY = std::max(bodyBottom + 18.f, panel.getPosition().y + panel.getSize().y - 42.f);
+    cont.setPosition(sf::Vector2f(panel.getPosition().x + panel.getSize().x / 2.f - contBounds.size.x / 2.f - contBounds.position.x, contY));
     cont.setFillColor(sf::Color(200, 200, 200));
     window.draw(cont);
 
@@ -2394,6 +2796,29 @@ void GameWorld::handleUpgradeResult(const ActionResult& r, const std::string& bu
     }
 }
 
+void GameWorld::performBuildOrUpgrade(const std::string& businessId) {
+    ConstructionInfo ci = game_.businessConstructionInfo(businessId);
+    if (ci.requiresConstruction) {
+        if (ci.inProgress) {
+            setFeedback(Localization::t("construction_in_progress_hint"), false);
+            return;
+        }
+        ActionResult r = game_.tryStartConstruction(businessId);
+        if (r.success) {
+            if (upgradeSound_) upgradeSound_->play();
+            setFeedback(Localization::t("construction_started_prefix") + Localization::t(businessId), true);
+        } else if (r.messageKey == "construction_missing_materials") {
+            setFeedback(Localization::t(r.messageKey) + " " + Localization::t(r.goodId), false);
+        } else if (r.messageKey == "not_enough_cash_prefix") {
+            setFeedback(Localization::t(r.messageKey) + formatNumber(r.amount), false);
+        } else {
+            setFeedback(Localization::t(r.messageKey), false);
+        }
+        return;
+    }
+    handleUpgradeResult(game_.tryUpgradeBusinessBulk(businessId, 1), businessId);
+}
+
 void GameWorld::drawOverlayRoot(sf::RenderWindow& window) {
     if (currentOverlay_ == OverlayKind::None) return;
 
@@ -2420,6 +2845,7 @@ void GameWorld::drawOverlayRoot(sf::RenderWindow& window) {
         case OverlayKind::Warehouse:    drawWarehouseOverlay(window); break;
         case OverlayKind::HowToPlay:    drawHowToPlayOverlay(window); break;
         case OverlayKind::CropPicker:   drawCropPickerOverlay(window); break;
+        case OverlayKind::RecipeBook:   drawRecipeBookOverlay(window); break;
         case OverlayKind::TimingMinigame: drawTimingMinigameOverlay(window); break;
         case OverlayKind::Chopping:       drawChoppingOverlay(window); break;
         case OverlayKind::Brewing:        drawBrewingOverlay(window); break;
@@ -2452,6 +2878,15 @@ void GameWorld::drawBusinessesOverlay(sf::RenderWindow& window) {
     sf::Color tierColor = info->tier <= 1 ? kTier1 : (info->tier == 2 ? kTier2 : kTier3);
     uiText(window, { pos.x + 24.f, pos.y + 16.f }, Localization::t(info->id), 22, tierColor, true);
 
+    // Storefront is the one business whose outputGoodId is empty -- it pays
+    // straight into money_ instead of stocking a market good (see
+    // simulateElapsed's `if (outputGoodId.empty()) money_ += amount;`
+    // branch). Everything else in this overlay looks identical either way,
+    // so without this line Storefront reads as "does nothing".
+    if (info->outputGoodId.empty()) {
+        uiText(window, { pos.x + 24.f, pos.y + 46.f }, Localization::t("storefront_desc"), 13, sf::Color(160, 160, 160));
+    }
+
     float y = pos.y + 74.f;
     uiText(window, { pos.x + 24.f, y }, Localization::t("col_level") + ": " + std::to_string(info->level), 16);
     y += 32.f;
@@ -2463,20 +2898,101 @@ void GameWorld::drawBusinessesOverlay(sf::RenderWindow& window) {
     uiText(window, { pos.x + 24.f, y }, Localization::t("rate_note"), 11, sf::Color(160, 160, 160));
     y += 24.f;
 
-    if (!info->inputGoodId.empty()) {
-        std::ostringstream needsOss;
-        needsOss << std::fixed << std::setprecision(1) << info->inputPerOutput << " " << Localization::t(info->inputGoodId);
-        uiText(window, { pos.x + 24.f, y }, Localization::t("col_needs") + ": " + needsOss.str(), 16);
-        y += 32.f;
+    // Live "need vs have" list (see BusinessInfo::inputs) -- primary input
+    // first, then any BusinessType::extraInputs for a multi-input recipe
+    // (Cake Shop, Artisan Bakery, ...). Zero stock of any one of these
+    // means production is fully bottlenecked on it (see simulateElapsed's
+    // Pass 2), which is what the red/green coloring flags, not a one-time
+    // total the way the construction material list's coloring works.
+    // Only shown once actually built -- an unbuilt (level 0) business shows
+    // its construction material list instead (see the ConstructionInfo
+    // block below), and showing both at once would be redundant/confusing.
+    if (info->level > 0 && !info->inputs.empty()) {
+        uiText(window, { pos.x + 24.f, y }, Localization::t("col_needs"), 13, sf::Color(200, 200, 200));
+        y += 22.f;
+        for (const auto& in : info->inputs) {
+            bool producing = in.have > 0.0;
+            std::ostringstream line;
+            line << Localization::t(in.goodId) << " -" << std::fixed << std::setprecision(2) << in.required
+                << " (" << Localization::t("input_have_label") << formatNumber(in.have) << ")";
+            uiText(window, { pos.x + 24.f, y }, line.str(), 15, producing ? sf::Color(160, 220, 160) : sf::Color(220, 140, 140));
+            y += 22.f;
+        }
+        y += 10.f;
     }
     uiText(window, { pos.x + 24.f, y }, Localization::t("col_cost") + ": $" + formatNumber(info->nextCost), 16);
     y += 40.f;
+
+    ConstructionInfo ci = game_.businessConstructionInfo(info->id);
 
     if (info->locked) {
         // Not reachable in practice (handleInteraction filters locked
         // buildings out before opening this overlay) -- kept as a fallback
         // rather than assuming that check can never change.
         uiText(window, { pos.x + 24.f, y }, Localization::t("locked_label"), 16, sf::Color(180, 120, 120));
+        y += 70.f;
+    } else if (ci.requiresConstruction && info->level == 0) {
+        // First build of a non-starter business (see Business::
+        // constructionDaysRemaining) -- replaces the plain upgrade buttons
+        // below with either a materials shopping list + Start Construction,
+        // or (once started) a read-only progress readout.
+        if (ci.inProgress) {
+            int daysLeft = static_cast<int>(std::ceil(ci.daysRemaining));
+            uiText(window, { pos.x + 24.f, y }, Localization::t("construction_site_days_left_prefix") +
+                std::to_string(daysLeft) + Localization::t("construction_site_days_left_suffix"), 16, sf::Color(232, 212, 120));
+            y += 34.f;
+            float barW = size.x - 48.f, barH = 16.f;
+            sf::RectangleShape barBg(sf::Vector2f(barW, barH));
+            barBg.setPosition(sf::Vector2f(pos.x + 24.f, y));
+            barBg.setFillColor(sf::Color(30, 30, 34));
+            barBg.setOutlineThickness(1.f);
+            barBg.setOutlineColor(sf::Color(90, 90, 96));
+            window.draw(barBg);
+            double totalDays = std::max(1, ci.totalDays);
+            float progress = static_cast<float>(std::clamp(1.0 - (ci.daysRemaining / totalDays), 0.0, 1.0));
+            sf::RectangleShape barFill(sf::Vector2f(barW * progress, barH));
+            barFill.setPosition(sf::Vector2f(pos.x + 24.f, y));
+            barFill.setFillColor(sf::Color(232, 212, 120));
+            window.draw(barFill);
+            y += barH + 16.f;
+            // A real but not painless way out of a misclick -- half of
+            // whatever was already spent (cash + materials) comes back (see
+            // Game::tryCancelConstruction), not a free do-over.
+            uiButton(window, { pos.x + 24.f, y }, { 220.f, 38.f }, Localization::t("cancel_construction_button"),
+                [this, id = info->id]() {
+                    ActionResult r = game_.tryCancelConstruction(id);
+                    if (r.success) setFeedback(Localization::t("construction_cancelled_prefix") + formatNumber(r.amount), true);
+                    else setFeedback(Localization::t(r.messageKey), false);
+                });
+            y += 54.f;
+        } else {
+            uiText(window, { pos.x + 24.f, y - 20.f }, Localization::t("construction_materials_header"), 13, sf::Color(200, 200, 200));
+            bool allAffordable = game_.money() >= info->nextCost;
+            for (const auto& m : ci.materials) {
+                bool enough = m.have >= m.required;
+                if (!enough) allAffordable = false;
+                std::ostringstream line;
+                line << Localization::t(m.goodId) << ": " << formatNumber(m.have) << " / " << formatNumber(m.required);
+                uiText(window, { pos.x + 24.f, y }, line.str(), 14, enough ? sf::Color(160, 220, 160) : sf::Color(220, 140, 140));
+                y += 22.f;
+            }
+            y += 12.f;
+            uiButton(window, { pos.x + 24.f, y }, { 220.f, 46.f }, Localization::t("start_construction_button"),
+                [this, id = info->id]() {
+                    ActionResult r = game_.tryStartConstruction(id);
+                    if (r.success) {
+                        if (upgradeSound_) upgradeSound_->play();
+                        setFeedback(Localization::t("construction_started_prefix") + Localization::t(id), true);
+                    } else if (r.messageKey == "construction_missing_materials") {
+                        setFeedback(Localization::t(r.messageKey) + " " + Localization::t(r.goodId), false);
+                    } else if (r.messageKey == "not_enough_cash_prefix") {
+                        setFeedback(Localization::t(r.messageKey) + formatNumber(r.amount), false);
+                    } else {
+                        setFeedback(Localization::t(r.messageKey), false);
+                    }
+                }, allAffordable);
+            y += 60.f;
+        }
     } else {
         uiText(window, { pos.x + 24.f, y - 20.f }, Localization::t("upgrade_button"), 13, sf::Color(200, 200, 200));
         float btnW = 168.f, btnH = 46.f, gap = 12.f;
@@ -2486,8 +3002,8 @@ void GameWorld::drawBusinessesOverlay(sf::RenderWindow& window) {
             [this, id = info->id]() { handleUpgradeResult(game_.tryUpgradeBusinessBulk(id, 10), id); });
         uiButton(window, { pos.x + 24.f + 2.f * (btnW + gap), y }, { btnW, btnH }, Localization::t("qty_all"),
             [this, id = info->id]() { handleUpgradeResult(game_.tryUpgradeBusinessBulk(id, -1), id); });
+        y += 70.f;
     }
-    y += 70.f;
 
     // Per-business worker hiring (separate from the global Staff Office +
     // foreman focus, see Game::tryHireWorker) -- only meaningful once the
@@ -2520,6 +3036,40 @@ void GameWorld::drawBusinessesOverlay(sf::RenderWindow& window) {
             std::string cropLabel = Localization::t("current_crop_label") + Localization::t(info->cropId);
             if (info->seasonBonusActive) cropLabel += Localization::t("season_bonus_active");
             uiText(window, { pos.x + 24.f, y }, cropLabel, 14, sf::Color(232, 212, 120));
+        }
+
+        // The Port alone gets the ship-commission/sail step (see
+        // Game::tryCommissionShip and GameWorld's Zone 7) -- shown beside
+        // the hire-worker button just like the Farm's crop picker above.
+        if (info->id == "port") {
+            if (!game_.hasIslandShip()) {
+                std::ostringstream label;
+                label << Localization::t("commission_ship_button") << " ("
+                    << Game::kShipCommissionShips << " " << Localization::t("ships") << " + $" << Game::kShipCommissionCash << ")";
+                uiButton(window, { pos.x + 24.f + 240.f + 16.f, y }, { 260.f, 40.f }, label.str(),
+                    [this]() {
+                        ActionResult r = game_.tryCommissionShip();
+                        if (r.success) {
+                            if (upgradeSound_) upgradeSound_->play();
+                            setFeedback(Localization::t("ship_commissioned_prefix"), true);
+                        } else if (r.messageKey == "construction_missing_materials") {
+                            setFeedback(Localization::t(r.messageKey) + " " + Localization::t(r.goodId), false);
+                        } else if (r.messageKey == "not_enough_cash_prefix") {
+                            setFeedback(Localization::t(r.messageKey) + formatNumber(r.amount), false);
+                        } else {
+                            setFeedback(Localization::t(r.messageKey), false);
+                        }
+                    });
+            } else {
+                uiButton(window, { pos.x + 24.f + 240.f + 16.f, y }, { 260.f, 40.f }, Localization::t("sail_button"),
+                    [this]() {
+                        closeOverlay();
+                        currentZone_ = kFisherIsleZoneIndex;
+                        playerPos_ = kFisherIsleArrivalPos;
+                        game_.markIslandVisited();
+                        setFeedback(Localization::t("arrived_at_isle"), true);
+                    });
+            }
         }
     }
 
@@ -2673,6 +3223,10 @@ void GameWorld::drawStaffOverlay(sf::RenderWindow& window) {
     focusOss << Localization::t("staff_focus_label") << focusName
         << Localization::t("staff_focus_suffix") << std::fixed << std::setprecision(0) << game_.staffFocusBonusPercentPerLevel() << "%/lvl)";
     uiText(window, { pos.x + 24.f, pos.y + 208.f }, focusOss.str(), 15, sf::Color(232, 212, 120));
+    // Focus (this screen) and per-business Workers (hired from that
+    // business's own overlay) are two separate, stackable bonuses -- easy to
+    // mistake for the same thing since both just multiply output.
+    uiText(window, { pos.x + 24.f, pos.y + 230.f }, Localization::t("staff_focus_clarify"), 12, sf::Color(160, 160, 160));
 
     // Pick which owned business the foreman focuses on -- a compact wrapping
     // grid of buttons. Collected into a list first (rather than placed
@@ -2699,7 +3253,7 @@ void GameWorld::drawStaffOverlay(sf::RenderWindow& window) {
     float btnW = 108.f, btnH = 30.f, gapX = 8.f, gapY = 8.f;
     constexpr int perRow = 5;
     int totalRows = static_cast<int>((options.size() + perRow - 1) / static_cast<size_t>(perRow));
-    float gridTop = pos.y + 240.f;
+    float gridTop = pos.y + 256.f; // pushed down 16px from before to clear the new staff_focus_clarify line above
     float gridBottom = pos.y + size.y - 40.f; // leaves room for the feedback line below
     float contentH = static_cast<float>(totalRows) * (btnH + gapY);
     float maxScroll = std::max(0.f, contentH - (gridBottom - gridTop));
@@ -3091,6 +3645,10 @@ void GameWorld::drawCropPickerOverlay(sf::RenderWindow& window) {
     uiButton(window, { pos.x + size.x - 120.f, pos.y + 14.f }, { 100.f, 34.f }, Localization::t("close_button"),
         [this]() { openOverlay(OverlayKind::Businesses); });
 
+    // Switching crops already costs money (Game::kCropSwitchCost) -- this
+    // panel just never said so anywhere, which read as "replanting is free".
+    uiText(window, { pos.x + 24.f, pos.y + 46.f }, Localization::t("crop_switch_cost_prefix") + formatNumber(game_.cropSwitchCost()), 13, sf::Color(200, 200, 200));
+
     std::string currentCropId;
     for (const auto& b : game_.businessInfos()) {
         if (b.id == "farm") { currentCropId = b.cropId; break; }
@@ -3111,7 +3669,7 @@ void GameWorld::drawCropPickerOverlay(sf::RenderWindow& window) {
             if (r.success) {
                 if (upgradeSound_) upgradeSound_->play();
                 openOverlay(OverlayKind::Businesses);
-                setFeedback(Localization::t("crop_changed_prefix") + Localization::t(id), true);
+                setFeedback(Localization::t("crop_changed_prefix") + Localization::t(id) + " (-$" + formatNumber(r.amount) + ")", true);
             } else {
                 setFeedback(Localization::t(r.messageKey), false);
             }
@@ -3119,6 +3677,102 @@ void GameWorld::drawCropPickerOverlay(sf::RenderWindow& window) {
         placed++;
         if (placed % perRow == 0) { x = startX; y += btnH + gapY; }
         else { x += btnW + gapX; }
+    }
+
+    if (!overlayFeedback_.empty()) {
+        uiText(window, { pos.x + 24.f, pos.y + size.y - 30.f }, overlayFeedback_, 15, overlayFeedbackColor_);
+    }
+}
+
+void GameWorld::drawRecipeBookOverlay(sf::RenderWindow& window) {
+    sf::Vector2f pos(160.f, 40.f), size(960.f, 740.f);
+    uiPanelBg(window, pos, size);
+    uiButton(window, { pos.x + size.x - 130.f, pos.y + 14.f }, { 110.f, 36.f }, Localization::t("close_button"), [this]() { closeOverlay(); });
+
+    // Keep the vector alive for the whole function -- businessInfos()
+    // returns by value, same reasoning as drawBusinessesOverlay's `infos`.
+    const std::vector<BusinessInfo> infos = game_.businessInfos();
+
+    if (recipeBookSelectedGoodId_.empty()) {
+        uiText(window, { pos.x + 24.f, pos.y + 16.f }, Localization::t("recipebook_header"), 18, sf::Color(232, 212, 120), true);
+
+        // Every processed good -- the output of a business that itself has
+        // at least one input. Raw materials (wheat/wood/stone/ore/...) have
+        // no recipe and aren't listed here at all.
+        struct Entry { std::string goodId; sf::Color color; };
+        std::vector<Entry> entries;
+        for (const auto& info : infos) {
+            if (info.inputGoodId.empty() || info.outputGoodId.empty()) continue;
+            entries.push_back({ info.outputGoodId, accentFor(info.id).color });
+        }
+
+        constexpr int perRow = 3;
+        constexpr float cellW = 300.f, cellH = 116.f, iconSize = 56.f;
+        float startX = pos.x + 30.f, startY = pos.y + 70.f;
+        float gridBottom = pos.y + size.y - 24.f;
+        int totalRows = static_cast<int>((entries.size() + static_cast<size_t>(perRow) - 1) / static_cast<size_t>(perRow));
+        float contentH = static_cast<float>(totalRows) * cellH;
+        float maxScroll = std::max(0.f, contentH - (gridBottom - startY));
+        overlayScrollOffset_ = std::clamp(overlayScrollOffset_, 0.f, maxScroll);
+
+        for (size_t i = 0; i < entries.size(); ++i) {
+            int row = static_cast<int>(i / static_cast<size_t>(perRow));
+            int col = static_cast<int>(i % static_cast<size_t>(perRow));
+            float cellX = startX + static_cast<float>(col) * cellW;
+            float cellY = startY + static_cast<float>(row) * cellH - overlayScrollOffset_;
+            if (cellY < startY - cellH || cellY > gridBottom) continue;
+
+            sf::RectangleShape icon(sf::Vector2f(iconSize, iconSize));
+            icon.setPosition(sf::Vector2f(cellX, cellY));
+            icon.setFillColor(entries[i].color);
+            icon.setOutlineThickness(2.f);
+            icon.setOutlineColor(sf::Color(232, 212, 120));
+            window.draw(icon);
+
+            if (fontLoaded_) {
+                sf::Text label(font_, toSfString(Localization::t(entries[i].goodId)), 13);
+                sf::FloatRect b = label.getLocalBounds();
+                label.setPosition(sf::Vector2f(cellX + iconSize / 2.f - b.size.x / 2.f - b.position.x, cellY + iconSize + 6.f));
+                label.setFillColor(sf::Color::White);
+                window.draw(label);
+            }
+
+            std::string goodId = entries[i].goodId;
+            overlayClickRegions_.push_back(ClickRegion{
+                sf::FloatRect(sf::Vector2f(cellX, cellY), sf::Vector2f(iconSize, iconSize + 26.f)),
+                [this, goodId]() { recipeBookSelectedGoodId_ = goodId; overlayScrollOffset_ = 0.f; } });
+        }
+        if (maxScroll > 0.f) {
+            uiText(window, { pos.x + size.x - 210.f, pos.y + 46.f }, Localization::t("scroll_hint"), 12, sf::Color(160, 160, 160));
+        }
+    } else {
+        // Detail view: find the one business that makes this good, and show
+        // its recipe (primary input + any BusinessType::extraInputs) with
+        // live stock -- same "have vs need" format the Businesses overlay's
+        // production section uses.
+        const BusinessInfo* info = nullptr;
+        for (const auto& i : infos) {
+            if (i.outputGoodId == recipeBookSelectedGoodId_) { info = &i; break; }
+        }
+        uiButton(window, { pos.x + 24.f, pos.y + 14.f }, { 100.f, 36.f }, Localization::t("back_button"),
+            [this]() { recipeBookSelectedGoodId_.clear(); });
+        uiText(window, { pos.x + 140.f, pos.y + 20.f }, Localization::t(recipeBookSelectedGoodId_), 22, sf::Color(232, 212, 120), true);
+
+        if (info) {
+            float y = pos.y + 90.f;
+            uiText(window, { pos.x + 24.f, y }, Localization::t("recipebook_made_at_prefix") + Localization::t(info->id), 15, sf::Color(200, 200, 200));
+            y += 40.f;
+            uiText(window, { pos.x + 24.f, y }, Localization::t("col_needs"), 15, sf::Color(200, 200, 200), true);
+            y += 30.f;
+            for (const auto& in : info->inputs) {
+                bool producing = in.have > 0.0;
+                std::ostringstream line;
+                line << Localization::t(in.goodId) << " -" << std::fixed << std::setprecision(2) << in.required
+                    << " (" << Localization::t("input_have_label") << formatNumber(in.have) << ")";
+                uiText(window, { pos.x + 40.f, y }, line.str(), 16, producing ? sf::Color(160, 220, 160) : sf::Color(220, 140, 140));
+                y += 30.f;
+            }
+        }
     }
 
     if (!overlayFeedback_.empty()) {
@@ -3641,7 +4295,11 @@ void GameWorld::drawBankOverlay(sf::RenderWindow& window) {
 }
 
 void GameWorld::drawWarehouseOverlay(sf::RenderWindow& window) {
-    sf::Vector2f pos(400.f, 260.f), size(480.f, 300.f);
+    // Taller than before -- now leads with what's actually sitting in
+    // storage (see the scrollable list below) instead of jumping straight
+    // to the upgrade pitch, with Upgrade pushed down under the list so the
+    // reading order is "see what you have, then decide whether to expand".
+    sf::Vector2f pos(360.f, 110.f), size(560.f, 600.f);
     uiPanelBg(window, pos, size);
     uiText(window, { pos.x + 24.f, pos.y + 16.f }, Localization::t("menu_warehouse_header"), 20, sf::Color(232, 212, 120), true);
     uiButton(window, { pos.x + size.x - 120.f, pos.y + 14.f }, { 100.f, 34.f }, Localization::t("close_button"), [this]() { closeOverlay(); });
@@ -3650,16 +4308,50 @@ void GameWorld::drawWarehouseOverlay(sf::RenderWindow& window) {
     info << Localization::t("warehouse_level_label") << game_.warehouseLevel()
         << Localization::t("warehouse_cap_label") << formatNumber(game_.maxStockPerGood()) << ")";
     uiText(window, { pos.x + 24.f, pos.y + 70.f }, info.str(), 15);
-    uiText(window, { pos.x + 24.f, pos.y + 104.f }, Localization::t("warehouse_cost_prefix") + formatNumber(game_.warehouseNextCost()), 15);
 
-    uiButton(window, { pos.x + 24.f, pos.y + 160.f }, { 200.f, 44.f }, Localization::t("upgrade_button"), [this]() {
+    uiText(window, { pos.x + 24.f, pos.y + 104.f }, Localization::t("warehouse_inventory_header"), 15, sf::Color(200, 200, 200), true);
+
+    std::vector<GoodInfo> held;
+    for (const auto& g : game_.goodInfos()) {
+        if (g.stock > 0.0001) held.push_back(g);
+    }
+
+    constexpr float kListTopOffset = 132.f, kBottomReserved = 130.f;
+    float listTop = pos.y + kListTopOffset;
+    float listBottom = pos.y + size.y - kBottomReserved;
+
+    if (held.empty()) {
+        uiText(window, { pos.x + 24.f, listTop }, Localization::t("warehouse_empty_hint"), 14, sf::Color(160, 160, 160));
+    } else {
+        constexpr float rowH = 30.f;
+        float contentH = static_cast<float>(held.size()) * rowH;
+        float maxScroll = std::max(0.f, contentH - (listBottom - listTop));
+        overlayScrollOffset_ = std::clamp(overlayScrollOffset_, 0.f, maxScroll);
+
+        float rowY = listTop - overlayScrollOffset_;
+        for (const auto& g : held) {
+            if (rowY >= listTop - rowH && rowY <= listBottom) {
+                uiText(window, { pos.x + 24.f, rowY }, Localization::t(g.id), 14, sf::Color::White);
+                uiText(window, { pos.x + size.x - 160.f, rowY }, formatNumber(g.stock), 14, sf::Color(220, 220, 220));
+            }
+            rowY += rowH;
+        }
+        if (maxScroll > 0.f) {
+            uiText(window, { pos.x + size.x - 210.f, pos.y + kListTopOffset - 22.f }, Localization::t("scroll_hint"), 12, sf::Color(160, 160, 160));
+        }
+    }
+
+    float costY = pos.y + size.y - kBottomReserved + 14.f;
+    uiText(window, { pos.x + 24.f, costY }, Localization::t("warehouse_cost_prefix") + formatNumber(game_.warehouseNextCost()), 15);
+
+    uiButton(window, { pos.x + 24.f, costY + 34.f }, { 200.f, 44.f }, Localization::t("upgrade_button"), [this]() {
         ActionResult r = game_.tryUpgradeWarehouse();
         if (r.success) setFeedback(Localization::t("warehouse_upgraded_prefix") + std::to_string(game_.warehouseLevel()), true);
         else setFeedback(Localization::t(r.messageKey), false);
     });
 
     if (!overlayFeedback_.empty()) {
-        uiText(window, { pos.x + 24.f, pos.y + size.y - 34.f }, overlayFeedback_, 15, overlayFeedbackColor_);
+        uiText(window, { pos.x + 24.f, pos.y + size.y - 24.f }, overlayFeedback_, 15, overlayFeedbackColor_);
     }
 }
 
@@ -3736,9 +4428,6 @@ void GameWorld::run() {
     buildZones();
     currentZone_ = 0;
     playerPos_ = sf::Vector2f(620.f, 400.f);
-    // Baseline so an already-unlocked achievement from a loaded save doesn't
-    // falsely trigger the fanfare on the very first frame.
-    lastAchievementCount_ = game_.unlockedAchievementCount();
     // Baseline so a mid-cycle load doesn't fire a spurious transition on the
     // very first frame the season is actually checked (see the tick loop below).
     lastSeason_ = game_.currentSeason();
@@ -3820,13 +4509,17 @@ void GameWorld::run() {
                     // against service buildings (market, staff, ...): those
                     // aren't in businessInfos() at all, so isBusinessLocked()
                     // alone would silently say "not locked" for them too.
+                    // Routed through performBuildOrUpgrade rather than calling
+                    // tryUpgradeBusinessBulk directly so pressing U at an
+                    // unstarted plot starts construction (with feedback)
+                    // instead of silently failing.
                     if (const WorldBuilding* b = findNearbyBuilding(kInteractRadius)) {
                         bool isBusiness = false;
                         for (const auto& info : game_.businessInfos()) {
                             if (info.id == b->id) { isBusiness = true; break; }
                         }
                         if (isBusiness && !game_.isBusinessLocked(b->id)) {
-                            handleUpgradeResult(game_.tryUpgradeBusinessBulk(b->id, 1), b->id);
+                            performBuildOrUpgrade(b->id);
                         }
                     }
                 } else if (keyPressed->code == settings_.keys.minigame && currentOverlay_ == OverlayKind::None) {
@@ -3865,6 +4558,8 @@ void GameWorld::run() {
                         openOverlay(OverlayKind::Achievements);
                     } else if (howToPlayButtonBounds().contains(click)) {
                         openOverlay(OverlayKind::HowToPlay);
+                    } else if (recipeBookButtonBounds().contains(click)) {
+                        openOverlay(OverlayKind::RecipeBook);
                     } else {
                         bool handled = false;
                         for (auto& npc : zones_[currentZone_].npcs) {
@@ -3985,9 +4680,24 @@ void GameWorld::run() {
                 weatherMult = (game_.currentSeason() == Season::Winter) ? Game::kSnowPenaltyMultiplier : Game::kRainBonusMultiplier;
             }
             TickOutcome outcome = game_.tickBackground(weatherMult);
-            int nowAchievementCount = game_.unlockedAchievementCount();
-            if (nowAchievementCount > lastAchievementCount_ && achievementSound_) achievementSound_->play();
-            lastAchievementCount_ = nowAchievementCount;
+            // Queue any newly-unlocked achievements for the toast (see
+            // updateAchievementToast/drawAchievementToast) -- replaces the
+            // old "did the unlocked count go up" check with the actual ids,
+            // needed now that the toast has to say which one it was.
+            for (const std::string& id : game_.drainNewlyUnlockedAchievements()) {
+                achievementToastQueue_.push_back(id);
+            }
+            // Same idea for completed construction sites (see Business::
+            // constructionDaysRemaining) -- a general "X built!" toast even
+            // when the player isn't standing next to it.
+            {
+                std::vector<std::string> completed = game_.drainCompletedConstructions();
+                if (!completed.empty()) {
+                    std::string msg = Localization::t("construction_completed_prefix") + Localization::t(completed[0]);
+                    for (size_t i = 1; i < completed.size(); ++i) msg += ", " + Localization::t(completed[i]);
+                    setFeedback(msg, true);
+                }
+            }
             handleTickOutcome(outcome); // opens the death-notice overlay if outcome.died
 
             // The season can only actually change while the world tick above
@@ -4004,6 +4714,7 @@ void GameWorld::run() {
         }
         updateSeasonTransition(dt); // ticks (and, near the end, resolves) regardless of overlay state
         updateMusicCrossfade(dt);   // same -- background music keeps fading/playing through a paused menu
+        updateAchievementToast(dt); // same -- an unlock while a menu is open still counts down and shows
 
         // Ticks down regardless of overlay state: previously this only ran in
         // the "overlay open" branch above (feedback used to only ever be set
@@ -4057,9 +4768,11 @@ void GameWorld::run() {
         drawNetWorthPanel(window);
         drawAchievementsButton(window);
         drawHowToPlayButton(window);
+        drawRecipeBookButton(window);
         drawUpdateBanner(window);
         drawOverlayRoot(window); // drawn last so it sits on top of everything else
         drawSeasonTransitionOverlay(window); // drawn even later -- covers overlays too, so a season change is never missed
+        drawAchievementToast(window); // drawn last of all -- sits above overlays and the season transition alike
 
         window.display();
     }

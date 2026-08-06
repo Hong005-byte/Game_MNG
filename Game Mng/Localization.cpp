@@ -61,6 +61,10 @@ namespace {
         { "entering_short", { "Entering ", "进入 " } },
         { "achievements_button", { "Achievements", "成就" } },
         { "howtoplay_button", { "How to Play", "玩法" } },
+        { "recipebook_button", { "Recipes", "配方图鉴" } },
+        { "recipebook_header", { "Recipe Book -- click an item to see what it takes", "配方图鉴——点击物品查看所需材料" } },
+        { "recipebook_made_at_prefix", { "Made at: ", "制作地点: " } },
+        { "back_button", { "Back", "返回" } },
         { "howtoplay_title",  { "How to Play", "游戏玩法" } },
         { "howtoplay_body",
             { "Move with {MOVE} or the arrow keys (hold Shift to sprint).\n"
@@ -138,8 +142,8 @@ namespace {
 
         // Tutorial
         { "tutorial_title", { "Welcome to Tycoon Idle!", "欢迎来到经营人生!" } },
-        { "tutorial_body",  { "You've just turned 21 -- old enough to take over the family business. Good luck!\n\nMove with {MOVE} or the arrow keys (hold Shift to sprint).\nPress {E}, or click a building, to interact with it.\nPress {U} near a building to instantly upgrade it one level.\nPress {M} to show/hide the minimap.\nWalk off the edge of the screen to travel to a new area.\nClick the Achievements button (top-right) any time.\nYour town keeps running in the background, even while you walk around.\nPress Escape any time to pause, save, or open Settings.",
-                               "你刚满 21 岁——已经到了可以接手家业的年纪。祝你好运!\n\n使用 {MOVE} 或方向键移动(按住 Shift 可加速)。\n按 {E} 键,或点击建筑,即可与其互动。\n在建筑附近按 {U} 键可以直接升级一级。\n按 {M} 键可以显示/隐藏小地图。\n走到屏幕边缘可以前往新的区域。\n随时可以点击右上角的成就按钮。\n你在镇上走动的同时,经济系统也会一直在背后运行。\n随时按 Esc 键可以暂停、存档,或打开设置。" } },
+        { "tutorial_body",  { "You've just turned 21 -- old enough to take over the family business. Good luck!\n\nMove with {MOVE} or the arrow keys (hold Shift to sprint).\nPress {E}, or click a building, to interact with it.\nPress {U} near a building to instantly upgrade it one level.\nPress {M} to show/hide the minimap.\nWalk off the edge of the screen to travel to a new area.\nMost buildings need materials and a few days on-site before they're built -- only the Farm, Lumber Camp, Quarry, and Ore Mine are free and instant.\nBuild the Port, then commission a ship there to sail to Fisher's Isle.\nUnlocking an achievement pops up in the bottom-left corner.\nClick the Achievements button (top-right) any time.\nYour town keeps running in the background, even while you walk around.\nPress Escape any time to pause, save, or open Settings.",
+                               "你刚满 21 岁——已经到了可以接手家业的年纪。祝你好运!\n\n使用 {MOVE} 或方向键移动(按住 Shift 可加速)。\n按 {E} 键,或点击建筑,即可与其互动。\n在建筑附近按 {U} 键可以直接升级一级。\n按 {M} 键可以显示/隐藏小地图。\n走到屏幕边缘可以前往新的区域。\n大部分建筑都需要材料,并且要在工地上等上几天才能建成——只有农场、伐木场、采石场、矿场是免费且秒建的。\n建好港口后,在那里造一艘船,就能出海前往渔人岛。\n解锁成就时,左下角会弹出提示。\n随时可以点击右上角的成就按钮。\n你在镇上走动的同时,经济系统也会一直在背后运行。\n随时按 Esc 键可以暂停、存档,或打开设置。" } },
         { "tutorial_continue", { "Press any key or click to begin", "按任意键或点击开始" } },
 
         // Zone names
@@ -149,13 +153,17 @@ namespace {
         { "zone_valley",      { "Valley District", "山谷区" } },
         { "zone_harbor",      { "Harbor District", "海港区" } },
         { "zone_highlands",   { "Highlands District", "高地区" } },
+        { "zone_market",      { "Market Row", "集市区" } },
+        { "zone_fisher_isle", { "Fisher's Isle", "渔人岛" } },
 
         // Building labels
-        { "farm",        { "Wheat Farm", "麦田农场" } },
+        { "farm",        { "Farm", "农场" } }, // was "Wheat Farm"/"麦田农场" -- generic now that GameWorld::drawBuilding appends the actually-planted crop (see farmCropId()), since the field can be growing anything from strawberries to cabbage, not just wheat
         { "mine",        { "Ore Mine", "矿场" } },
         { "lumber",      { "Lumber Camp", "伐木场" } },
         { "quarry",      { "Quarry", "采石场" } },
         { "storefront",  { "Storefront", "商铺" } },
+        { "storefront_desc", { "Sells straight to walk-in customers -- pays cash directly, no market good involved.",
+                                "商铺直接向路过的顾客卖货,收入直接变成现金,不经过市场商品系统。" } },
         { "bakery",      { "Bakery", "面包坊" } },
         { "smelter",     { "Smelter", "冶炼厂" } },
         { "sawmill",     { "Sawmill", "锯木厂" } },
@@ -166,7 +174,6 @@ namespace {
         { "sheep",       { "Sheep Farm", "牧羊场" } },
         { "fishing",     { "Fishing Dock", "渔港" } },
         { "textile",     { "Textile Mill", "纺织厂" } },
-        { "smokehouse",  { "Smokehouse", "烟熏坊" } },
         { "tailor",      { "Tailor", "裁缝铺" } },
         { "orchard",     { "Orchard", "果园" } },
         { "herbgarden",  { "Herb Garden", "草药园" } },
@@ -191,8 +198,16 @@ namespace {
         { "seasalt",      { "Salt Flats", "盐田" } },
         { "pearlfarm",    { "Pearl Farm", "珍珠养殖场" } },
         { "shipyard",     { "Shipyard", "造船坞" } },
-        { "cannery",      { "Cannery", "罐头厂" } },
         { "pearlatelier", { "Pearl Atelier", "珍珠工坊" } },
+        { "port",         { "Port", "港口" } },
+
+        // Fisher's Isle (reached by sailing from the Port -- see zone_fisher_isle)
+        { "cannery",      { "Cannery", "罐头厂" } },
+        { "smokehouse",   { "Smokehouse", "熏鱼房" } },
+        { "deepsea",      { "Deep Sea Fishing", "远洋捕鱼场" } },
+        { "sushibar",     { "Sushi Bar", "寿司吧" } },
+        { "fishermanplatter", { "Fisherman's Platter", "渔夫拼盘坊" } },
+        { "island_ferry", { "Ferry", "渡船" } },
 
         // Highlands District
         { "dairyfarm", { "Dairy Farm", "奶牛场" } },
@@ -205,6 +220,7 @@ namespace {
         { "tannery",   { "Tannery", "制革厂" } },
         { "teahouse",  { "Tea House", "茶坊" } },
         { "linenmill", { "Linen Mill", "亚麻纺织厂" } },
+        { "giftbasket", { "Country Gift Basket", "田园礼篮坊" } },
 
         // Farm crop processors
         { "jamkitchen",    { "Jam Kitchen", "果酱厨房" } },
@@ -213,6 +229,12 @@ namespace {
         { "pieshop",       { "Pie Shop", "馅饼铺" } },
         { "roaststand",    { "Roast Stand", "烤薯摊" } },
         { "picklinghouse", { "Pickling House", "腌菜坊" } },
+
+        // Multi-input recipes (see BusinessType::extraInputs) -- Market Row's
+        // 3rd row.
+        { "honeyrefinery", { "Honey Refinery", "蜜糖坊" } },
+        { "cakeshop",      { "Cake Shop", "蛋糕坊" } },
+        { "artisanbakery", { "Artisan Bakery", "手工烘焙坊" } },
 
         // Legend
         { "legend_title",   { "Legend", "图例" } },
@@ -240,6 +262,8 @@ namespace {
         { "npc_dairymaid",   { "Dairymaid Elsie", "牧场女工艾尔西" } },
         { "npc_beekeeper",   { "Beekeeper Otto", "养蜂人奥托" } },
         { "npc_trapper",     { "Trapper Hollis", "猎人霍利斯" } },
+        { "npc_market_vendor", { "Vendor Coraline", "摊主柯拉琳" } },
+        { "npc_islander",      { "Islander Kai", "岛民凯" } },
 
         // Good (market commodity) names
         { "wheat",       { "Wheat", "小麦" } },
@@ -273,16 +297,23 @@ namespace {
         { "ships",         { "Ships", "船只" } },
         { "canned_fish",   { "Canned Fish", "罐头鱼" } },
         { "pearl_jewelry", { "Pearl Jewelry", "珍珠饰品" } },
+        { "tuna",          { "Tuna", "金枪鱼" } },
+        { "sushi",         { "Sushi", "寿司" } },
+        { "seafood_platter", { "Seafood Platter", "海鲜拼盘" } },
         { "milk",          { "Milk", "牛奶" } },
         { "cheese",        { "Cheese", "奶酪" } },
         { "honey",         { "Honey", "蜂蜜" } },
         { "mead",          { "Mead", "蜂蜜酒" } },
+        { "honey_syrup",   { "Honey Syrup", "蜜糖" } },
+        { "cake",          { "Cake", "蛋糕" } },
+        { "fruit_bread",   { "Fruit Bread", "果干蜂蜜面包" } },
         { "pelts",         { "Pelts", "兽皮" } },
         { "leather",       { "Leather", "皮革" } },
         { "tea_leaves",    { "Tea Leaves", "茶叶" } },
         { "tea",           { "Tea", "茶" } },
         { "flax",          { "Flax", "亚麻" } },
         { "linen",         { "Linen", "亚麻布" } },
+        { "gift_basket",   { "Gift Basket", "礼篮" } },
         { "strawberry",           { "Strawberry", "草莓" } },
         { "corn",                 { "Corn", "玉米" } },
         { "watermelon",           { "Watermelon", "西瓜" } },
@@ -331,6 +362,23 @@ namespace {
         { "ach_season_cycle_desc",     { "Live through Spring, Summer, Autumn, and Winter in one life.", "在同一代角色生涯中经历完整的春夏秋冬。" } },
         { "ach_master_farmer_name",    { "Master Farmer", "农事大师" } },
         { "ach_master_farmer_desc",    { "Grow every crop during its favorite season, in one life.", "在同一代角色生涯中,让每种作物都在其适宜季节种植过。" } },
+
+        { "ach_groundbreaking_name",   { "Groundbreaking", "破土动工" } },
+        { "ach_groundbreaking_desc",   { "Complete your first construction project.", "完成你的第一个建造项目。" } },
+        { "ach_master_builder_name",   { "Master Builder", "建筑大师" } },
+        { "ach_master_builder_desc",   { "Have 5 or more constructed businesses standing at once.", "同时拥有5个及以上已建成的产业。" } },
+        { "ach_harbormaster_name",     { "Harbormaster", "港务长" } },
+        { "ach_harbormaster_desc",     { "Build the Port.", "建成港口。" } },
+        { "ach_shipshape_name",        { "Shipshape", "整装待发" } },
+        { "ach_shipshape_desc",        { "Commission a ship at the Port.", "在港口建造一艘船。" } },
+        { "ach_set_sail_name",         { "Set Sail", "扬帆起航" } },
+        { "ach_set_sail_desc",         { "Sail to Fisher's Isle.", "出航前往渔人岛。" } },
+        { "ach_island_explorer_name",  { "Island Explorer", "海岛探索者" } },
+        { "ach_island_explorer_desc",  { "Own every business on Fisher's Isle.", "拥有渔人岛上的每一个产业。" } },
+        { "ach_market_row_regular_name", { "Market Row Regular", "集市常客" } },
+        { "ach_market_row_regular_desc", { "Own every stall in Market Row.", "拥有集市区的每一个摊位。" } },
+        { "ach_full_stock_name",       { "Full Stock", "货真价实" } },
+        { "ach_full_stock_desc",       { "Hold 10 or more different goods in the warehouse at once.", "仓库里同时存有10种及以上不同的商品。" } },
         { "ach_minigame_pro_name",     { "Minigame Pro", "小游戏能手" } },
         { "ach_minigame_pro_desc",     { "Win 5 minigames (fishing, mining, or chopping) in one life.", "本代内在小游戏(钓鱼/挖矿/伐木)中获胜 5 次。" } },
         { "ach_harbor_pioneer_name",   { "Harbor Pioneer", "扬帆起航" } },
@@ -342,6 +390,7 @@ namespace {
         { "ach_cat_life",     { "Life", "人生" } },
         { "ach_cat_season",   { "Seasons", "季节" } },
         { "ach_cat_minigame", { "Minigames", "小游戏" } },
+        { "ach_cat_maritime", { "Maritime", "航海" } },
 
         // Death / generation
         { "death_illness",       { "your untreated illness finally caught up with you", "你未经治疗的疾病最终还是要了你的命" } },
@@ -362,6 +411,8 @@ namespace {
 
         // Achievement unlock announcement
         { "achievement_prefix", { "[Achievement] ", "[成就] " } },
+        { "achievement_toast_header", { "Achievement Unlocked!", "成就达成!" } },
+        { "returned_to_harbor", { "Back at the Harbor District.", "已返回海港区。" } },
         { "reward_label",       { "reward $", "奖励 $" } },
 
         // Event log overflow
@@ -406,6 +457,7 @@ namespace {
         { "hire_worker_button",      { "Hire Worker", "雇佣工人" } },
         { "farm_action_prompt",      { "1) Upgrade level   2) Hire worker   3) Change crop   0) Cancel\nChoice: ", "1) 升级等级   2) 雇佣工人   3) 更换作物   0) 取消\n选择: " } },
         { "crop_picker_header",      { "\n-- Choose a Crop --\n", "\n-- 选择作物 --\n" } },
+        { "crop_switch_cost_prefix", { "Switching crops costs $", "切换作物需要花费 $" } },
         { "crop_choice_prompt",      { "Choice: ", "选择: " } },
         { "crop_changed_prefix",     { "Now growing ", "现在种植的是 " } },
         { "crop_favorite_prefix",    { " (favors ", " (适宜" } },
@@ -524,6 +576,8 @@ namespace {
         { "staff_focus_clear_option", { "0) Clear focus\n", "0) 取消专精\n" } },
         { "staff_focus_cleared",     { "Foreman focus cleared.\n", "已取消工头专精。\n" } },
         { "staff_focus_set_prefix",  { "Foreman now focused on ", "工头现在专精于 " } },
+        { "staff_focus_clarify",     { "Stacks with that business's own hired workers -- a separate bonus, not a duplicate.",
+                                        "这是独立于该产业自己雇佣的员工的额外加成,两者可以同时生效,并非重复功能。" } },
 
         // Sleep menu
         { "menu_sleep_header",   { "\n-- Sleep --\n", "\n-- 睡觉 --\n" } },
@@ -596,6 +650,8 @@ namespace {
         { "menu_warehouse_header",   { "\n-- Warehouse --\n", "\n-- 仓库 --\n" } },
         { "warehouse_level_label",   { "Warehouse level: ", "仓库等级: " } },
         { "warehouse_cap_label",     { "   (max per good: ", "   (每种商品上限: " } },
+        { "warehouse_inventory_header", { "Current Inventory", "现有库存" } },
+        { "warehouse_empty_hint",    { "The warehouse is empty so far.", "仓库目前还是空的。" } },
         { "warehouse_cost_prefix",   { "Upgrade cost: $", "升级花费: $" } },
         { "warehouse_upgrade_prompt", { "Upgrade? (1 = yes, 0 = back): ", "要升级吗?(1 = 是, 0 = 返回): " } },
         { "warehouse_upgraded_prefix", { "Warehouse upgraded to level ", "仓库已升级到 " } },
@@ -674,6 +730,27 @@ namespace {
         { "event_disaster_mid",   { " stockpile: lost ", " 库存损失了 " } },
         { "event_disaster_suffix", { " units.", " 个单位。" } },
         { "event_recession_prefix", { "A recession hit your finances hard: -$", "经济衰退重创了你的财务状况:-$" } },
+
+        // First-build construction (see Business::constructionDaysRemaining /
+        // Game::ConstructionInfo) -- the empty-plot signboard, the
+        // construction-site countdown, and the Businesses overlay's
+        // materials list + Start Construction button.
+        { "construction_plot_sign_prefix",        { "Planned: ", "预定建造: " } },
+        { "construction_site_days_left_prefix",   { "Under construction -- ", "施工中,还需 " } },
+        { "construction_site_days_left_suffix",   { " day(s) left", " 天完工" } },
+        { "construction_materials_header",        { "Materials needed:", "所需材料:" } },
+        { "input_have_label",                     { "have: ", "现有: " } },
+        { "start_construction_button",            { "Start Construction", "开始建造" } },
+        { "construction_started_prefix",          { "Construction started on ", "已开始建造 " } },
+        { "construction_completed_prefix",        { "Built: ", "已建成: " } },
+        { "cancel_construction_button",           { "Cancel Construction", "取消建造" } },
+        { "construction_cancelled_prefix",        { "Construction cancelled -- refunded $", "已取消建造,退回 $" } },
+        { "commission_ship_button",               { "Commission Ship", "建造船只" } },
+        { "ship_commissioned_prefix",              { "Ship commissioned! The Port can now sail to Fisher's Isle.", "船只已建成!现在可以从港口出航前往渔人岛了。" } },
+        { "sail_button",                          { "Sail to Fisher's Isle", "出航前往渔人岛" } },
+        { "arrived_at_isle",                      { "Arrived at Fisher's Isle.", "已抵达渔人岛。" } },
+        { "construction_missing_materials",       { "Not enough materials:", "材料不足:" } },
+        { "construction_in_progress_hint",        { "Already under construction -- just needs time.", "工地已在施工中,耐心等待完工即可。" } },
 
         // Overlay UI buttons
         { "close_button",   { "Close", "关闭" } },

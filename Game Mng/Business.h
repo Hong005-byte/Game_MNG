@@ -17,6 +17,13 @@ struct CropType {
     Season favoriteSeason; // active crop gets Game::kSeasonBonusMultiplier while this season is current
 };
 
+// One additional (beyond BusinessType::inputGoodId, the "primary" input)
+// good a multi-input recipe needs -- see BusinessType::extraInputs.
+struct InputRequirement {
+    std::string goodId;
+    double perOutput; // units of goodId consumed per unit of output produced, same meaning as inputPerOutput
+};
+
 // Static definition of a kind of business the player can build.
 struct BusinessType {
     std::string id;
@@ -32,6 +39,14 @@ struct BusinessType {
     std::string prerequisiteTypeId; // empty => always buildable; otherwise that
                                      // business must be built (level >= 1) first
     int tier = 1; // 1 = raw producer, 2 = processor, 3 = advanced good
+
+    // Extra goods a recipe needs beyond inputGoodId (the "primary" input) --
+    // empty for every single-input business (the vast majority). See
+    // Game::simulateElapsed's Pass 2 for how a multi-input recipe's actual
+    // output is bottlenecked by whichever input (primary or extra) is
+    // shortest, and BusinessInfo::inputs (Game.h) for the combined live
+    // "have vs need" list a UI reads to display all of them together.
+    std::vector<InputRequirement> extraInputs;
 };
 
 // The player's actual instance of a business (level 0 = not built yet).
@@ -46,8 +61,28 @@ struct Business {
     // it's currently planted with. Ignored by every other business.
     std::string cropId = "wheat";
 
+    // ---- First-build construction (see BusinessManager::requiresConstruction/
+    // buildMaterialsFor/buildDaysFor and Game::tryStartConstruction). Only
+    // meaningful while level == 0: 0 = an empty, unbuilt plot; > 0 = a
+    // construction site counting down in-game days (see Game::simulateElapsed).
+    // Once it reaches 0 the business becomes level 1 -- there is no separate
+    // "under construction" flag, the three world-map states (empty plot /
+    // site / finished) are derived from level + this field together. Doesn't
+    // apply at all to businesses BusinessManager::requiresConstruction()
+    // says don't need it (farm/lumber/quarry/mine) -- those still go
+    // straight from 0 to 1 via the plain cash purchase path. ----
+    double constructionDaysRemaining = 0.0;
+
     double nextCost(const BusinessType& type) const;
     double ratePerSecond(const BusinessType& type) const;
+};
+
+// One material good + quantity required to start construction on a business
+// (see BusinessManager::buildMaterialsFor). Consumed from the warehouse (not
+// purchased) the moment construction starts, on top of the usual cash cost.
+struct BuildMaterialCost {
+    std::string goodId;
+    double amount = 0.0;
 };
 
 // The management system: the catalogue of business types plus the player's
@@ -74,6 +109,22 @@ public:
 
     // True if `type` still needs its prerequisite built before it can be constructed.
     bool isLocked(const BusinessType& type) const;
+
+    // ---- First-build construction (see Business::constructionDaysRemaining
+    // and Game::tryStartConstruction/businessConstructionInfo). ----
+    // False only for the four always-free starters (farm/lumber/quarry/mine)
+    // -- everything else needs buildMaterialsFor() gathered up front and
+    // buildDaysFor() days of waiting before its first level completes.
+    bool requiresConstruction(const std::string& typeId) const;
+    // Computed from `type.baseCost` rather than 40 hand-authored recipes (see
+    // the comment above the definition for the exact formula/ratios).
+    // sawmill/mason/smelter -- the businesses that turn raw goods into the
+    // planks/bricks/iron_ingot everyone else builds with -- ask for wood+stone
+    // instead, so building the material source never needs the material itself.
+    std::vector<BuildMaterialCost> buildMaterialsFor(const BusinessType& type) const;
+    // 3-5 in-game days, biased by tier with a small per-id jitter so same-tier
+    // buildings don't all take an identical number of days.
+    int buildDaysFor(const BusinessType& type) const;
 
     void print() const;
 

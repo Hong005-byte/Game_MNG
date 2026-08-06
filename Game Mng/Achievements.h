@@ -23,6 +23,17 @@ struct GameStats {
     bool anyHighlandsBusinessOwned = false;
     bool allSeasonsWitnessed = false;  // true once Spring/Summer/Autumn/Winter have each occurred at least once this life
     bool allCropsWitnessedInSeason = false; // true once every CropType has grown during its favorite season at least once this life
+
+    // ---- Construction system (see Business::constructionDaysRemaining /
+    // BusinessManager::requiresConstruction) and Port -> Fisher's Isle. ----
+    bool anyConstructionCompleted = false; // at least one non-free-starter business finished construction
+    int constructionsCompletedCount = 0;   // how many non-free-starter businesses are currently built
+    bool portBuilt = false;
+    bool hasIslandShip = false;
+    bool hasVisitedIsland = false;
+    bool allIslandBusinessesOwned = false;    // all of Fisher's Isle's businesses built
+    bool allMarketRowBusinessesOwned = false; // all of Market Row's businesses built
+    int distinctGoodsInStock = 0;             // how many different market goods currently have stock > 0
 };
 
 struct Achievement {
