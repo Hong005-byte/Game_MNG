@@ -160,6 +160,9 @@ private:
     // -- empty = grid of every processed good, non-empty = detail view of
     // that one good's recipe. Reset to empty whenever the overlay (re)opens.
     std::string recipeBookSelectedGoodId_;
+    // OverlayKind::Eat's selected food (see drawEatOverlay/Game::foodOptions)
+    // -- reset to "wheat" whenever the overlay opens.
+    std::string eatSelectedGoodId_ = "wheat";
     // OverlayKind::WelcomeBack's collapsed/expanded toggle (see
     // drawWelcomeBackOverlay) -- starts collapsed (just a title banner),
     // clicking it reveals how long the player was away and what happened.
@@ -331,7 +334,7 @@ private:
     void handleTickOutcome(const TickOutcome& outcome); // shows the death overlay if outcome.died
     void performBuy(double qty);  // acts on the Market overlay's selectedGoodIndex_
     void performSell(double qty);
-    void performEat(double qty);
+    void performEat(const std::string& goodId, double qty);
     // Shared by the Businesses overlay's upgrade buttons and the near-a-
     // building keyboard shortcut: plays the upgrade chime on success, sets
     // the feedback toast either way.

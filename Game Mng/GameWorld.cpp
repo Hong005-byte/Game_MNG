@@ -1444,6 +1444,7 @@ void GameWorld::openOverlay(OverlayKind kind) {
     overlayScrollOffset_ = 0.f;
     if (kind == OverlayKind::RecipeBook) recipeBookSelectedGoodId_.clear(); // always start at the grid, not wherever it was left last time
     if (kind == OverlayKind::WelcomeBack) welcomeBackExpanded_ = false; // always starts collapsed
+    if (kind == OverlayKind::Eat) eatSelectedGoodId_ = "wheat"; // always start on wheat, not wherever it was left last time
 }
 
 void GameWorld::closeOverlay() {
@@ -2920,7 +2921,12 @@ void GameWorld::drawNetWorthPanel(sf::RenderWindow& window) {
 }
 
 void GameWorld::drawLifeStatusPanel(sf::RenderWindow& window) {
-    constexpr float panelW = 190.f, panelH = 104.f;
+    // Grows by one line while "well-rested" is active (see
+    // Game::wellRestedHoursRemaining/kWellRestedHours) -- most of the time
+    // there's nothing to show there, so the panel stays its normal size.
+    bool wellRested = game_.wellRestedHoursRemaining() > 0.0;
+    constexpr float panelW = 190.f, panelHBase = 104.f;
+    float panelH = wellRested ? panelHBase + 22.f : panelHBase;
     float panelX = static_cast<float>(windowSize_.x) - panelW - 10.f;
     float panelY = 54.f; // just below the Achievements/How to Play/Recipe Book button row (see *ButtonBounds, all at y:10-44)
 
@@ -2961,6 +2967,11 @@ void GameWorld::drawLifeStatusPanel(sf::RenderWindow& window) {
     std::string sickText = game_.isSick() ? Localization::t("status_sick_yes") : Localization::t("status_sick_no");
     uiText(window, { panelX + 10.f, panelY + 76.f }, Localization::t("status_sick_label") + sickText, 13,
         game_.isSick() ? sf::Color(230, 120, 120) : sf::Color(150, 220, 150), true);
+
+    if (wellRested) {
+        uiText(window, { panelX + 10.f, panelY + 96.f }, Localization::t("status_well_rested"), 12,
+            sf::Color(180, 200, 255), true);
+    }
 }
 
 void GameWorld::updateDayNightAndWeather(float dt) {
@@ -3828,10 +3839,19 @@ void GameWorld::performSell(double qty) {
     else setFeedback(Localization::t(r.messageKey), false);
 }
 
-void GameWorld::performEat(double qty) {
-    ActionResult r = game_.tryEat(qty);
-    if (r.success) setFeedback(Localization::t("ate_prefix") + formatNumber(qty), true);
-    else setFeedback(Localization::t(r.messageKey), false);
+void GameWorld::performEat(const std::string& goodId, double qty) {
+    ActionResult r = game_.tryEat(goodId, qty);
+    if (r.success) {
+        // r.amount, not the requested qty -- tryEat silently clamps to
+        // whatever's actually useful (never eats past 100 hunger), so the
+        // two can differ, especially for "All".
+        std::string msg = Localization::t("ate_prefix") + formatNumber(r.amount) + " " + Localization::t(goodId) +
+            Localization::t("ate_suffix") + std::to_string(static_cast<int>(game_.hunger())) + "/100";
+        if (r.varietyBonus) msg += Localization::t("ate_variety_bonus");
+        setFeedback(msg, true);
+    } else {
+        setFeedback(Localization::t(r.messageKey), false);
+    }
 }
 
 void GameWorld::handleUpgradeResult(const ActionResult& r, const std::string& businessId) {
@@ -4482,7 +4502,10 @@ void GameWorld::drawStaffOverlay(sf::RenderWindow& window) {
 }
 
 void GameWorld::drawSleepOverlay(sf::RenderWindow& window) {
-    sf::Vector2f pos(360.f, 260.f), size(560.f, 300.f);
+    // Taller than before -- the Bedroom upgrade section (see Game::bedroomLevel/
+    // tryUpgradeBedroom) lives at the bottom, under a divider, so sleeping
+    // itself stays the first thing the player sees and does.
+    sf::Vector2f pos(360.f, 190.f), size(560.f, 430.f);
     uiPanelBg(window, pos, size);
     uiText(window, { pos.x + 24.f, pos.y + 16.f }, Localization::t("menu_sleep_header"), 20, sf::Color(232, 212, 120), true);
     uiButton(window, { pos.x + size.x - 120.f, pos.y + 14.f }, { 100.f, 34.f }, Localization::t("close_button"), [this]() { closeOverlay(); });
@@ -4490,41 +4513,125 @@ void GameWorld::drawSleepOverlay(sf::RenderWindow& window) {
     uiText(window, { pos.x + 24.f, pos.y + 70.f }, Localization::t("sleep_desc_prefix"), 14);
     uiText(window, { pos.x + 24.f, pos.y + 100.f }, Localization::t("sleep_desc_suffix"), 14);
 
+    // Forecast warning (see Game::predictedHungerAfterSleep/predictedStarvingDaysAfterSleep)
+    // -- only shown when sleeping a full day would actually run hunger out or
+    // push starvingDays to a fatal streak, so a well-fed sleep looks exactly
+    // like it always did.
+    double predictedStarving = game_.predictedStarvingDaysAfterSleep();
+    if (predictedStarving >= game_.starvationDeathDays()) {
+        uiText(window, { pos.x + 24.f, pos.y + 128.f }, Localization::t("sleep_warning_fatal"), 13, sf::Color(230, 110, 110), true);
+    } else if (game_.predictedHungerAfterSleep() <= 0.0) {
+        uiText(window, { pos.x + 24.f, pos.y + 128.f }, Localization::t("sleep_warning_hunger"), 13, sf::Color(230, 170, 100), true);
+    }
+
     uiButton(window, { pos.x + 24.f, pos.y + 160.f }, { 200.f, 44.f }, Localization::t("sleep_button"), [this]() {
         TickOutcome outcome = game_.trySleep();
         if (outcome.died) { handleTickOutcome(outcome); return; }
-        setFeedback(Localization::t("sleep_woke"), true);
+        setFeedback(Localization::t("sleep_woke") + Localization::t("sleep_well_rested"), true);
     });
 
+    // ---- Bedroom upgrade (see Game.h's kBedroomMaxLevel and up): longer and
+    // stronger well-rested buff plus a standing cut to sickness chance, each
+    // level. Lives here rather than as its own world building since it only
+    // ever matters in the context of sleeping. ----
+    float bedY = pos.y + 226.f;
+    sf::RectangleShape divider(sf::Vector2f(size.x - 48.f, 1.f));
+    divider.setPosition(sf::Vector2f(pos.x + 24.f, bedY));
+    divider.setFillColor(sf::Color(90, 90, 100));
+    window.draw(divider);
+
+    uiText(window, { pos.x + 24.f, bedY + 14.f },
+        Localization::t("bedroom_level_prefix") + std::to_string(game_.bedroomLevel()) + "/" + std::to_string(Game::kBedroomMaxLevel),
+        15, sf::Color(232, 212, 120), true);
+    uiText(window, { pos.x + 24.f, bedY + 40.f },
+        Localization::t("bedroom_effect_prefix") + formatNumber(game_.bedroomWellRestedHours()) +
+        Localization::t("bedroom_effect_mid") + formatNumber(game_.bedroomWellRestedBonus() * 100.0) +
+        Localization::t("bedroom_effect_suffix"), 13, sf::Color(200, 200, 200));
+
+    if (game_.bedroomLevel() < Game::kBedroomMaxLevel) {
+        uiText(window, { pos.x + 24.f, bedY + 66.f }, Localization::t("bedroom_upgrade_cost_prefix") + formatNumber(game_.bedroomNextCost()), 14);
+        uiButton(window, { pos.x + 24.f, bedY + 92.f }, { 200.f, 40.f }, Localization::t("upgrade_button"), [this]() {
+            ActionResult r = game_.tryUpgradeBedroom();
+            if (r.success) setFeedback(Localization::t("bedroom_upgraded_prefix") + std::to_string(game_.bedroomLevel()), true);
+            else setFeedback(Localization::t(r.messageKey), false);
+        });
+    } else {
+        uiText(window, { pos.x + 24.f, bedY + 66.f }, Localization::t("bedroom_maxed"), 14, sf::Color(150, 220, 150));
+    }
+
     if (!overlayFeedback_.empty()) {
-        uiText(window, { pos.x + 24.f, pos.y + size.y - 34.f }, overlayFeedback_, 15, overlayFeedbackColor_);
+        uiText(window, { pos.x + 24.f, pos.y + size.y - 24.f }, overlayFeedback_, 15, overlayFeedbackColor_);
     }
 }
 
 void GameWorld::drawEatOverlay(sf::RenderWindow& window) {
-    sf::Vector2f pos(360.f, 260.f), size(560.f, 300.f);
+    // Taller than before -- wheat used to be the only edible good, so a
+    // fixed 3-button row was enough. Now there's a whole table of foods
+    // (see Game::foodOptions), each restoring a different amount, so this
+    // needs a scrollable list + a selection instead of just one flat panel.
+    sf::Vector2f pos(320.f, 130.f), size(640.f, 580.f);
     uiPanelBg(window, pos, size);
     uiText(window, { pos.x + 24.f, pos.y + 16.f }, Localization::t("menu_eat_header"), 20, sf::Color(232, 212, 120), true);
     uiButton(window, { pos.x + size.x - 120.f, pos.y + 14.f }, { 100.f, 34.f }, Localization::t("close_button"), [this]() { closeOverlay(); });
 
-    double wheatStock = 0.0;
-    for (const auto& g : game_.goodInfos()) {
-        if (g.id == "wheat") wheatStock = g.stock;
+    uiText(window, { pos.x + 24.f, pos.y + 56.f }, Localization::t("hunger_label") + std::to_string(static_cast<int>(game_.hunger())) + "/100", 16, sf::Color(232, 212, 120), true);
+
+    std::vector<FoodOption> foods = game_.foodOptions();
+    if (eatSelectedGoodId_.empty()) eatSelectedGoodId_ = "wheat";
+
+    constexpr float rowH = 34.f;
+    float listTop = pos.y + 96.f, listBottom = pos.y + size.y - 140.f;
+    float contentH = static_cast<float>(foods.size()) * rowH;
+    float maxScroll = std::max(0.f, contentH - (listBottom - listTop));
+    overlayScrollOffset_ = std::clamp(overlayScrollOffset_, 0.f, maxScroll);
+
+    float rowY = listTop - overlayScrollOffset_;
+    beginClip(window, sf::FloatRect(sf::Vector2f(pos.x, listTop), sf::Vector2f(size.x, listBottom - listTop)));
+    for (const auto& f : foods) {
+        if (rowY < listTop - rowH || rowY > listBottom) { rowY += rowH; continue; }
+        bool selected = f.goodId == eatSelectedGoodId_;
+        bool haveAny = f.stock > 0.0;
+        sf::RectangleShape rowBg(sf::Vector2f(size.x - 48.f, rowH - 4.f));
+        rowBg.setPosition(sf::Vector2f(pos.x + 24.f, rowY));
+        rowBg.setFillColor(selected ? sf::Color(90, 76, 130) : sf::Color(50, 52, 62));
+        window.draw(rowBg);
+
+        float clickTop = std::max(rowY, listTop), clickBottom = std::min(rowY + (rowH - 4.f), listBottom);
+        if (clickBottom > clickTop) {
+            std::string goodId = f.goodId;
+            overlayClickRegions_.push_back(ClickRegion{
+                sf::FloatRect(sf::Vector2f(pos.x + 24.f, clickTop), sf::Vector2f(size.x - 48.f, clickBottom - clickTop)),
+                [this, goodId]() { eatSelectedGoodId_ = goodId; } });
+        }
+
+        uiText(window, { pos.x + 32.f, rowY + 8.f }, Localization::t(f.goodId), 14, haveAny ? sf::Color::White : sf::Color(150, 150, 150));
+        uiText(window, { pos.x + 300.f, rowY + 8.f }, Localization::t("eat_have_prefix") + formatNumber(f.stock), 13, sf::Color(200, 200, 200));
+        uiText(window, { pos.x + 440.f, rowY + 8.f }, "+" + formatNumber(f.hungerRestorePerUnit), 13, sf::Color(160, 220, 160));
+        rowY += rowH;
+    }
+    endClip(window);
+    if (maxScroll > 0.f) {
+        uiText(window, { pos.x + size.x - 210.f, listTop - 20.f }, Localization::t("scroll_hint"), 12, sf::Color(160, 160, 160));
     }
 
-    uiText(window, { pos.x + 24.f, pos.y + 70.f }, Localization::t("hunger_label") + std::to_string(static_cast<int>(game_.hunger())) + "/100", 15);
-    uiText(window, { pos.x + 24.f, pos.y + 100.f },
-        Localization::t("eat_have_prefix") + formatNumber(wheatStock) + Localization::t("eat_have_mid")
-        + std::to_string(static_cast<int>(game_.hungerRestorePerUnit())) + Localization::t("eat_have_suffix"), 14);
+    double selectedStock = 0.0, selectedRestore = 0.0;
+    for (const auto& f : foods) if (f.goodId == eatSelectedGoodId_) { selectedStock = f.stock; selectedRestore = f.hungerRestorePerUnit; break; }
 
-    float btnY = pos.y + 150.f, btnW = 90.f, btnH = 44.f, gap = 12.f;
-    uiButton(window, { pos.x + 24.f, btnY }, { btnW, btnH }, Localization::t("qty_1"), [this]() { performEat(1.0); });
-    uiButton(window, { pos.x + 24.f + (btnW + gap), btnY }, { btnW, btnH }, Localization::t("qty_10"), [this]() { performEat(10.0); });
+    float infoY = listBottom + 14.f;
+    uiText(window, { pos.x + 24.f, infoY },
+        Localization::t("eat_selected_prefix") + Localization::t(eatSelectedGoodId_) + Localization::t("eat_have_mid") +
+        formatNumber(selectedRestore) + Localization::t("eat_have_suffix"), 14, sf::Color(232, 212, 120), true);
+
+    float btnY = infoY + 34.f, btnW = 90.f, btnH = 44.f, gap = 12.f;
+    uiButton(window, { pos.x + 24.f, btnY }, { btnW, btnH }, Localization::t("qty_1"),
+        [this]() { performEat(eatSelectedGoodId_, 1.0); }, selectedStock > 0.0);
+    uiButton(window, { pos.x + 24.f + (btnW + gap), btnY }, { btnW, btnH }, Localization::t("qty_10"),
+        [this]() { performEat(eatSelectedGoodId_, 10.0); }, selectedStock > 0.0);
     uiButton(window, { pos.x + 24.f + 2.f * (btnW + gap), btnY }, { btnW, btnH }, Localization::t("qty_all"),
-        [this, wheatStock]() { performEat(wheatStock); }, wheatStock > 0.0);
+        [this, selectedStock]() { performEat(eatSelectedGoodId_, selectedStock); }, selectedStock > 0.0);
 
     if (!overlayFeedback_.empty()) {
-        uiText(window, { pos.x + 24.f, pos.y + size.y - 34.f }, overlayFeedback_, 15, overlayFeedbackColor_);
+        uiText(window, { pos.x + 24.f, pos.y + size.y - 30.f }, overlayFeedback_, 15, overlayFeedbackColor_);
     }
 }
 
@@ -4851,6 +4958,13 @@ void GameWorld::drawWelcomeBackOverlay(sf::RenderWindow& window) {
         Localization::t("welcomeback_away_prefix") + info.elapsedFormatted, 16, sf::Color(220, 220, 220));
     uiText(window, { pos.x + 24.f, pos.y + 86.f },
         Localization::t("idle_earnings_prefix") + formatNumber(info.idleEarnings), 16, sf::Color(150, 220, 150), true);
+
+    // Offline safety net (see Game::kOfflineSafetyMarginDays): the character
+    // survived being neglected while the app was closed, but only barely --
+    // called out loudly here rather than left to blend into the event log.
+    if (info.nearFatalWhileAway) {
+        uiText(window, { pos.x + 24.f, pos.y + 114.f }, Localization::t("welcome_back_near_fatal"), 14, sf::Color(230, 110, 110), true);
+    }
 
     constexpr float lineH = 22.f, contentTop = 150.f, contentBottom = 20.f;
     float visibleH = size.y - contentTop - contentBottom;

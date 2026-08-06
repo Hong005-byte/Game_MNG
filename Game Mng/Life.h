@@ -1,4 +1,5 @@
 #pragma once
+#include <algorithm>
 
 // Tracks the player-character's passage of time: in-game age, two needs
 // (energy from sleep, hunger from food) that cause a soft production penalty
@@ -13,16 +14,23 @@ class Life {
 public:
     static constexpr double kTimeCompression = 10.0;
     static constexpr double kGameSecondsPerDay = 86400.0;
-    // Calendar: 2 in-game months per season (see Game::kGameDaysPerSeason,
-    // derived from kDaysPerYear below), 4 seasons per year -> an 8-month
-    // year instead of a real-world 12-month one, so a character's whole life
-    // plays out over less real playtime. kDaysPerYear is the one source of
-    // truth both this class's ageYears() and Game's season cycle read from.
+    // Calendar: 1 in-game month per season (see Game::kGameDaysPerSeason,
+    // derived from kDaysPerYear below), 4 seasons per year -> a 4-month,
+    // 120-day year instead of a real-world 12-month one, so a character's
+    // whole life plays out over less real playtime -- reaching kMaxAgeYears
+    // (100) no longer takes an unreasonable amount of sleeping/fast-forwarding.
+    // kDaysPerYear is the one source of truth both this class's ageYears()
+    // and Game's season cycle read from.
     static constexpr double kDaysPerMonth = 30.0;
-    static constexpr double kMonthsPerYear = 8.0;
-    static constexpr double kDaysPerYear = kDaysPerMonth * kMonthsPerYear; // 240
+    static constexpr double kMonthsPerYear = 4.0;
+    static constexpr double kDaysPerYear = kDaysPerMonth * kMonthsPerYear; // 120 -- a season is exactly one 30-day month
     static constexpr double kMaxAgeYears = 100.0;
-    static constexpr double kHungerRestorePerUnit = 5.0; // hunger restored per unit of food eaten
+    // Wheat's own hunger-restore value specifically -- see Game::foodOptions/
+    // tryEat for the full per-good table (bread, cake, ... each restore
+    // more). Wheat is the cheapest/easiest good in the game to have lying
+    // around (any Farm produces it automatically), so it's deliberately the
+    // worst "food" -- a fallback snack, not a real meal.
+    static constexpr double kHungerRestorePerUnit = 3.0;
 
     // New characters (and every reborn generation -- see Game::handleDeath's
     // `life_ = Life();`) start as young adults rather than newborns.
@@ -67,6 +75,24 @@ public:
     // Age-based efficiency multiplier: 1.0 during the prime years, tapering
     // toward kAgeEfficiencyFloor outside that range. See kPrimeAgeStart/End.
     double ageEfficiency() const;
+
+    // Read-only forecasts for "what would advanceReal(hours*3600, ..., hungerDrainMult)
+    // do to hunger/starvingDays" without actually mutating state -- lets a UI
+    // (Game::menuSleep/GameWorld's Sleep overlay) warn the player *before* they
+    // commit to a long sleep that would run their hunger out overnight, instead
+    // of them finding out only after waking up (or not waking up at all). Mirrors
+    // advanceReal's own math exactly (including its closed-form "hours spent at
+    // zero hunger" calc) so the prediction and the real outcome never disagree.
+    double predictedHungerAfter(double hours, double hungerDrainMult = 1.0) const {
+        double hungerDrainPerHour = kHungerDrainPerGameHour * hungerDrainMult;
+        return std::max(0.0, hunger - hungerDrainPerHour * hours);
+    }
+    double predictedStarvingDaysAfter(double hours, double hungerDrainMult = 1.0) const {
+        double hungerDrainPerHour = kHungerDrainPerGameHour * hungerDrainMult;
+        double hoursToZeroHunger = (hunger > 0.0) ? hunger / hungerDrainPerHour : 0.0;
+        double hoursAtZeroHunger = std::max(0.0, hours - hoursToZeroHunger);
+        return (hoursAtZeroHunger > 0.0) ? (starvingDays + hoursAtZeroHunger / 24.0) : 0.0;
+    }
 
 private:
     static constexpr double kEnergyDrainPerGameHour = 100.0 / 24.0; // empty after 1 day awake

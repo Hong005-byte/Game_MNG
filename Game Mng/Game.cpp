@@ -46,6 +46,43 @@ namespace {
         return 1.0;
     }
 
+    // Foods the player can eat to restore hunger (see Game::tryEat/
+    // foodOptions) -- curated to goods that actually make sense as "food",
+    // not every tradable good (no tools/furniture/jewelry/planks/etc. here).
+    // Wheat is deliberately the worst value -- see Life::kHungerRestorePerUnit's
+    // own comment -- everything else is an actual cooked/prepared dish and
+    // restores more, roughly scaled by how much processing it took: simple
+    // tier-2 single-ingredient goods in the middle, tier-3 multi-ingredient
+    // recipes (fruit_bread, cake, seafood_platter, gift_basket) at the top.
+    struct FoodDef { const char* goodId; double hungerRestorePerUnit; };
+    constexpr FoodDef kFoodDefs[] = {
+        { "wheat",                Life::kHungerRestorePerUnit },
+        { "bread",                10.0 },
+        { "cheese",               12.0 },
+        { "honey_syrup",          10.0 },
+        { "preserves",            10.0 },
+        { "strawberry_jam",       10.0 },
+        { "popcorn",               8.0 },
+        { "sauerkraut",            8.0 },
+        { "pumpkin_pie",          18.0 },
+        { "roasted_sweet_potato", 14.0 },
+        { "watermelon_juice",      8.0 },
+        { "tea",                   6.0 },
+        { "mead",                  8.0 },
+        { "canned_fish",          14.0 },
+        { "smoked_fish",          14.0 },
+        { "sushi",                22.0 },
+        { "seafood_platter",      32.0 },
+        { "gift_basket",          25.0 },
+        { "cake",                 35.0 },
+        { "fruit_bread",          30.0 },
+    };
+
+    double hungerRestoreForFood(const std::string& goodId) {
+        for (const auto& f : kFoodDefs) if (goodId == f.goodId) return f.hungerRestorePerUnit;
+        return 0.0; // not a recognized food good
+    }
+
     // No cap on offline catch-up: aging/energy/hunger and the economy all
     // continue advancing however long the game was closed, so a character
     // genuinely keeps aging while you're away. Market and event simulation
@@ -98,7 +135,7 @@ Game::Game() {
     lastTickEpoch_ = nowEpoch();
 }
 
-bool Game::simulateElapsed(long long seconds, std::vector<std::string>& eventLog, double weatherMult) {
+bool Game::simulateElapsed(long long seconds, std::vector<std::string>& eventLog, double weatherMult, bool allowDeath) {
     if (seconds <= 0) return false;
 
     double legacyMult = 1.0 + static_cast<double>(legacyProdLevel_) * kLegacyProdBonusPerLevel;
@@ -117,7 +154,21 @@ bool Game::simulateElapsed(long long seconds, std::vector<std::string>& eventLog
         dailyYieldVariance_ = kDailyYieldVarianceMin + t * (kDailyYieldVarianceMax - kDailyYieldVarianceMin);
     }
 
-    double mult = staff_.multiplier() * life_.productionMultiplier() * life_.ageEfficiency() * legacyMult * dailyYieldVariance_ * kEconomyPaceMultiplier;
+    // Real-seconds -> game-days conversion, computed up front so both the
+    // well-rested countdown below and Pass 0's construction countdown (which
+    // used to compute this separately) share the exact same number.
+    double daysElapsed = static_cast<double>(seconds) * Life::kTimeCompression / Life::kGameSecondsPerDay;
+
+    // Well-rested (see Game.h's kWellRestedHours/kWellRestedProductionBonus):
+    // ticks down in step with the rest of the calendar, using *last* interval's
+    // remaining time for this interval's bonus (consumed after, mirroring how
+    // life_.advanceReal is applied last so this interval's production used
+    // last interval's energy/hunger) -- then drains by however many in-game
+    // hours this interval actually covered.
+    double wellRestedMult = (wellRestedHoursRemaining_ > 0.0) ? (1.0 + bedroomWellRestedBonus()) : 1.0;
+    wellRestedHoursRemaining_ = std::max(0.0, wellRestedHoursRemaining_ - daysElapsed * 24.0);
+
+    double mult = staff_.multiplier() * life_.productionMultiplier() * life_.ageEfficiency() * legacyMult * dailyYieldVariance_ * kEconomyPaceMultiplier * wellRestedMult;
 
     // The focused business (see trySetStaffFocus) gets an extra staff-scaled
     // multiplier stacked on top of the shared `mult` every business gets.
@@ -135,7 +186,6 @@ bool Game::simulateElapsed(long long seconds, std::vector<std::string>& eventLog
     // ageDays (Life.cpp), so a construction site's countdown moves in step
     // with the rest of the calendar regardless of how big this `seconds`
     // chunk is (a single tick, a fast-forward, or an offline catch-up).
-    double daysElapsed = static_cast<double>(seconds) * Life::kTimeCompression / Life::kGameSecondsPerDay;
     for (auto& b : businessManager_.businesses()) {
         if (b.constructionDaysRemaining <= 0.0) continue;
         b.constructionDaysRemaining -= daysElapsed;
@@ -159,11 +209,15 @@ bool Game::simulateElapsed(long long seconds, std::vector<std::string>& eventLog
     double winterNegation = legacySeasonNegation();
     double seasonProdMult = (season == Season::Autumn) ? kAutumnProductionMultiplier : 1.0;
     double seasonEnergyDrainMult = (season == Season::Summer) ? kSummerEnergyDrainMultiplier : 1.0;
-    double seasonHungerDrainMult = (season == Season::Winter)
-        ? (1.0 + (kWinterHungerDrainMultiplier - 1.0) * (1.0 - winterNegation)) : 1.0;
+    double seasonHungerDrainMult = seasonHungerDrainMultiplier(season);
     double seasonSicknessMult = 1.0;
     if (season == Season::Winter) seasonSicknessMult = 1.0 + (kWinterSicknessMultiplier - 1.0) * (1.0 - winterNegation);
     else if (season == Season::Spring) seasonSicknessMult = kSpringSicknessMultiplier;
+    // Bedroom (see Game.h's kBedroomSicknessReductionPerLevel): a comfier bed
+    // is a standing, level-scaled cut to how often illness strikes at all --
+    // stacks multiplicatively with the season nudge above rather than
+    // replacing it, same as every other multiplier in this function.
+    seasonSicknessMult *= std::max(0.0, 1.0 - static_cast<double>(bedroomLevel_) * kBedroomSicknessReductionPerLevel);
 
     for (auto& b : businessManager_.businesses()) {
         if (b.level <= 0) continue;
@@ -299,6 +353,16 @@ bool Game::simulateElapsed(long long seconds, std::vector<std::string>& eventLog
     // jump, production still runs for the whole interval even if neglect
     // would have been fatal partway through. Acceptable simplification for
     // a prototype; flag if you want it clamped precisely like age used to be.
+    if (!allowDeath) {
+        // Offline safety net (see Game.h's kOfflineSafetyMarginDays and
+        // simulateElapsed's doc comment): clamp instead of killing. Neglect
+        // still landed exactly where it would have -- the character just
+        // comes back one bad day away from actually dying instead of already
+        // dead, since the player never got a chance to react while away.
+        life_.sickDays = std::min(life_.sickDays, Life::kSicknessDeathDays - kOfflineSafetyMarginDays);
+        life_.starvingDays = std::min(life_.starvingDays, Life::kStarvationDeathDays - kOfflineSafetyMarginDays);
+        return false;
+    }
     if (life_.sickDays >= Life::kSicknessDeathDays) {
         deathCause_ = Localization::t("death_illness");
         return true;
@@ -383,6 +447,9 @@ void Game::handleDeath() {
     peakMoney_ = money_;
     bankBalance_ = 0.0;    // resets like everything else this life built up; only Legacy survives death
     warehouseLevel_ = 0;
+    bedroomLevel_ = 0;
+    wellRestedHoursRemaining_ = 0.0;
+    lastFoodEatenId_.clear();
     contracts_.clear();
     market_ = Market();
     businessManager_ = BusinessManager();
@@ -974,9 +1041,41 @@ void Game::menuSleep() {
 
     std::cout << Localization::t("menu_sleep_header");
     std::cout << Localization::t("sleep_desc_prefix") << formatDuration(kOneGameDaySeconds) << Localization::t("sleep_desc_suffix");
-    std::cout << Localization::t("sleep_prompt");
+
+    // Forecast, not a hard block -- same "warn, don't stop" philosophy as
+    // everything else here (see kVarietyBonusMultiplier's comment). Only
+    // shown when it would actually matter, so a well-fed sleep stays as
+    // quick as it always was.
+    double predictedHunger = predictedHungerAfterSleep();
+    double predictedStarving = predictedStarvingDaysAfterSleep();
+    if (predictedStarving >= Life::kStarvationDeathDays) {
+        std::cout << Localization::t("sleep_warning_fatal");
+    } else if (predictedHunger <= 0.0) {
+        std::cout << Localization::t("sleep_warning_hunger");
+    }
+
+    // Bedroom (see Game.h's kBedroomMaxLevel and up): a cash upgrade reached
+    // right from this menu, since it only ever matters in the context of
+    // sleeping -- no separate world building needed for it.
+    std::cout << Localization::t("bedroom_level_prefix") << bedroomLevel_ << "/" << kBedroomMaxLevel
+        << Localization::t("bedroom_effect_prefix") << formatNumber(bedroomWellRestedHours())
+        << Localization::t("bedroom_effect_mid") << formatNumber(bedroomWellRestedBonus() * 100.0)
+        << Localization::t("bedroom_effect_suffix");
+    if (bedroomLevel_ < kBedroomMaxLevel) {
+        std::cout << Localization::t("bedroom_upgrade_cost_prefix") << formatNumber(bedroomNextCost()) << Localization::t("bedroom_upgrade_cost_suffix");
+    }
+
+    std::cout << Localization::t("sleep_prompt2");
     int choice;
-    if (!readInt(choice) || choice != 1) return;
+    if (!readInt(choice)) return;
+    if (choice == 2) {
+        ActionResult r = tryUpgradeBedroom();
+        if (r.success) std::cout << Localization::t("bedroom_upgraded_prefix") << bedroomLevel_ << ".\n";
+        else if (r.messageKey == "bedroom_maxed") std::cout << Localization::t("bedroom_maxed");
+        else std::cout << Localization::t("not_enough_cash_prefix") << formatNumber(r.amount) << ".\n";
+        return;
+    }
+    if (choice != 1) return;
 
     std::vector<std::string> log;
     bool died = simulateElapsed(kOneGameDaySeconds, log);
@@ -988,30 +1087,47 @@ void Game::menuSleep() {
         handleDeath();
     } else {
         life_.energy = 100.0;
+        wellRestedHoursRemaining_ = bedroomWellRestedHours();
         std::cout << Localization::t("sleep_woke");
+        std::cout << Localization::t("sleep_well_rested");
     }
 }
 
 void Game::menuEat() {
-    Good* wheat = market_.find("wheat");
     std::cout << Localization::t("menu_eat_header");
-    if (!wheat) {
+    std::cout << Localization::t("hunger_label") << std::fixed << std::setprecision(0) << life_.hunger << "/100\n";
+
+    // Numbered list of every food actually in stock -- wheat is always
+    // first (see kFoodDefs) but far from the only option now (see
+    // Game::foodOptions/tryEat).
+    std::vector<FoodOption> foods = foodOptions();
+    std::vector<size_t> available;
+    for (size_t i = 0; i < foods.size(); ++i) {
+        if (foods[i].stock <= 0.0) continue;
+        available.push_back(i);
+        std::cout << available.size() << ") " << Localization::t(foods[i].goodId) << " - " << formatNumber(foods[i].stock)
+            << Localization::t("eat_have_mid") << std::fixed << std::setprecision(1) << foods[i].hungerRestorePerUnit << Localization::t("eat_have_suffix");
+    }
+    if (available.empty()) {
         std::cout << Localization::t("no_food_source");
         return;
     }
-    std::cout << Localization::t("hunger_label") << std::fixed << std::setprecision(0) << life_.hunger << "/100\n";
-    std::cout << Localization::t("eat_have_prefix") << formatNumber(wheat->stock)
-        << Localization::t("eat_have_mid") << std::fixed << std::setprecision(1) << Life::kHungerRestorePerUnit << Localization::t("eat_have_suffix");
+    std::cout << Localization::t("eat_pick_prompt");
+    int pick;
+    if (!readInt(pick) || pick < 1 || pick > static_cast<int>(available.size())) return;
+    const FoodOption& chosen = foods[available[static_cast<size_t>(pick - 1)]];
+
     std::cout << Localization::t("eat_prompt");
     double qty;
     if (!readDouble(qty) || qty <= 0) return;
-    if (qty > wheat->stock) {
-        std::cout << Localization::t("dont_have_wheat");
-        return;
+    ActionResult r = tryEat(chosen.goodId, qty);
+    if (r.success) {
+        std::cout << Localization::t("ate_prefix") << formatNumber(r.amount) << " " << Localization::t(chosen.goodId)
+            << Localization::t("ate_suffix") << std::fixed << std::setprecision(0) << life_.hunger << "/100.\n";
+        if (r.varietyBonus) std::cout << Localization::t("ate_variety_bonus");
+    } else {
+        std::cout << Localization::t(r.messageKey) << "\n";
     }
-    wheat->stock -= qty;
-    life_.hunger = std::min(100.0, life_.hunger + qty * Life::kHungerRestorePerUnit);
-    std::cout << Localization::t("ate_prefix") << formatNumber(qty) << Localization::t("ate_suffix") << std::fixed << std::setprecision(0) << life_.hunger << "/100.\n";
 }
 
 void Game::menuDoctor() {
@@ -1098,6 +1214,21 @@ double Game::doctorTreatmentCost() const {
     return kDoctorCost;
 }
 
+double Game::seasonHungerDrainMultiplier(Season season) const {
+    if (season != Season::Winter) return 1.0;
+    return 1.0 + (kWinterHungerDrainMultiplier - 1.0) * (1.0 - legacySeasonNegation());
+}
+
+double Game::predictedHungerAfterSleep() const {
+    static const double kHoursPerGameDay = Life::kGameSecondsPerDay / 3600.0; // 24
+    return life_.predictedHungerAfter(kHoursPerGameDay, seasonHungerDrainMultiplier(currentSeason()));
+}
+
+double Game::predictedStarvingDaysAfterSleep() const {
+    static const double kHoursPerGameDay = Life::kGameSecondsPerDay / 3600.0; // 24
+    return life_.predictedStarvingDaysAfter(kHoursPerGameDay, seasonHungerDrainMultiplier(currentSeason()));
+}
+
 double Game::upkeepPerSecond() const {
     int totalLevels = 0;
     for (const auto& b : businessManager_.businesses()) totalLevels += b.level;
@@ -1168,6 +1299,19 @@ std::vector<GoodInfo> Game::goodInfos() const {
     std::vector<GoodInfo> result;
     for (const auto& g : market_.goods()) {
         result.push_back(GoodInfo{ g.id, g.price, g.stock });
+    }
+    return result;
+}
+
+std::vector<FoodOption> Game::foodOptions() const {
+    std::vector<FoodOption> result;
+    result.reserve(sizeof(kFoodDefs) / sizeof(kFoodDefs[0]));
+    for (const auto& f : kFoodDefs) {
+        double stock = 0.0;
+        for (const auto& g : market_.goods()) {
+            if (g.id == f.goodId) { stock = g.stock; break; }
+        }
+        result.push_back(FoodOption{ f.goodId, f.hungerRestorePerUnit, stock });
     }
     return result;
 }
@@ -1717,6 +1861,30 @@ ActionResult Game::tryUpgradeWarehouse() {
     return result;
 }
 
+double Game::bedroomNextCost() const {
+    return kBedroomBaseCost * std::pow(kBedroomCostGrowth, static_cast<double>(bedroomLevel_));
+}
+
+ActionResult Game::tryUpgradeBedroom() {
+    ActionResult result;
+    if (bedroomLevel_ >= kBedroomMaxLevel) {
+        result.messageKey = "bedroom_maxed";
+        return result;
+    }
+    double cost = bedroomNextCost();
+    if (money_ < cost) {
+        result.messageKey = "not_enough_cash_prefix";
+        result.amount = cost;
+        return result;
+    }
+    money_ -= cost;
+    bedroomLevel_ += 1;
+    result.success = true;
+    result.amount = cost;
+    result.count = bedroomLevel_;
+    return result;
+}
+
 ActionResult Game::trySignContract(const std::string& goodId) {
     ActionResult result;
     Good* g = market_.find(goodId);
@@ -1772,21 +1940,48 @@ ActionResult Game::tryFulfillQuest(const std::string& goodId, double qty, double
     return result;
 }
 
-ActionResult Game::tryEat(double qty) {
+ActionResult Game::tryEat(const std::string& goodId, double qty) {
     ActionResult result;
-    Good* wheat = market_.find("wheat");
-    if (!wheat) {
+    double restorePerUnit = hungerRestoreForFood(goodId);
+    if (restorePerUnit <= 0.0) {
         result.messageKey = "no_food_source";
         return result;
     }
-    if (qty <= 0 || qty > wheat->stock) {
-        result.messageKey = "dont_have_wheat";
+    Good* g = market_.find(goodId);
+    if (!g) {
+        result.messageKey = "no_food_source";
         return result;
     }
-    wheat->stock -= qty;
-    life_.hunger = std::min(100.0, life_.hunger + qty * Life::kHungerRestorePerUnit);
+    if (qty <= 0 || qty > g->stock) {
+        result.messageKey = "dont_have_that_food";
+        return result;
+    }
+    if (life_.hunger >= 100.0) {
+        result.messageKey = "not_hungry";
+        return result;
+    }
+
+    // "Varied diet" bonus (see Game.h's kVarietyBonusMultiplier): eating
+    // something other than whatever was eaten last restores extra hunger --
+    // a nudge to actually rotate through the food a production chain
+    // unlocks instead of always eating the single cheapest option.
+    bool varietyBonus = !lastFoodEatenId_.empty() && lastFoodEatenId_ != goodId;
+    double effectiveRestorePerUnit = restorePerUnit * (varietyBonus ? kVarietyBonusMultiplier : 1.0);
+
+    // Clamp to however much is actually useful -- eating past 100 hunger
+    // just destroys food for zero benefit. The Eat overlay's "All" button
+    // used to hand this the *entire* stock of whatever was selected
+    // unconditionally, which is exactly how a full warehouse of wheat could
+    // vanish in one click for barely any actual hunger restored.
+    double neededQty = (100.0 - life_.hunger) / effectiveRestorePerUnit;
+    qty = std::min(qty, neededQty);
+    g->stock -= qty;
+    life_.hunger = std::min(100.0, life_.hunger + qty * effectiveRestorePerUnit);
+    lastFoodEatenId_ = goodId;
     result.success = true;
     result.amount = qty;
+    result.goodId = goodId;
+    result.varietyBonus = varietyBonus;
     return result;
 }
 
@@ -1824,6 +2019,7 @@ TickOutcome Game::trySleep() {
         outcome.generation = generation_;
     } else {
         life_.energy = 100.0;
+        wellRestedHoursRemaining_ = bedroomWellRestedHours();
     }
     checkAchievements();
     return outcome;
@@ -1907,6 +2103,7 @@ void Game::load() {
     difficulty_ = getI("difficulty", difficulty_);
     bankBalance_ = getD("bankBalance", bankBalance_);
     warehouseLevel_ = getI("warehouseLevel", warehouseLevel_);
+    bedroomLevel_ = getI("bedroomLevel", bedroomLevel_);
     contracts_.clear();
     int contractCount = getI("contract.count", 0);
     for (int i = 0; i < contractCount && i < kMaxContracts; ++i) {
@@ -1984,6 +2181,7 @@ void Game::save() const {
     out << "difficulty=" << difficulty_ << "\n";
     out << "bankBalance=" << bankBalance_ << "\n";
     out << "warehouseLevel=" << warehouseLevel_ << "\n";
+    out << "bedroomLevel=" << bedroomLevel_ << "\n";
     out << "contract.count=" << contracts_.size() << "\n";
     for (size_t i = 0; i < contracts_.size(); ++i) {
         out << "contract." << i << ".goodId=" << contracts_[i].goodId << "\n";
@@ -2032,7 +2230,9 @@ void Game::startSession() {
     if (elapsed > 0) {
         double moneyBefore = money_;
         std::vector<std::string> log;
-        bool died = simulateElapsed(elapsed, log);
+        // allowDeath = false: offline neglect is capped, not fatal outright
+        // -- see simulateElapsed's doc comment / kOfflineSafetyMarginDays.
+        bool died = simulateElapsed(elapsed, log, 1.0, /*allowDeath=*/false);
         std::cout << Localization::t("welcome_back_prefix") << formatDuration(elapsed) << Localization::t("welcome_back_suffix");
         std::cout << Localization::t("idle_earnings_prefix") << formatNumber(money_ - moneyBefore) << "\n";
         printEventLog(log);
@@ -2043,7 +2243,11 @@ void Game::startSession() {
         lastWelcomeBack_.elapsedFormatted = formatDuration(elapsed);
         lastWelcomeBack_.idleEarnings = money_ - moneyBefore;
         lastWelcomeBack_.eventLog = log;
-        if (died) handleDeath();
+        lastWelcomeBack_.nearFatalWhileAway =
+            life_.sickDays >= Life::kSicknessDeathDays - kOfflineSafetyMarginDays - 1e-6 ||
+            life_.starvingDays >= Life::kStarvationDeathDays - kOfflineSafetyMarginDays - 1e-6;
+        if (lastWelcomeBack_.nearFatalWhileAway) std::cout << Localization::t("welcome_back_near_fatal");
+        if (died) handleDeath(); // allowDeath=false above means this can't actually happen anymore, but keep the plumbing honest
         else lastTickEpoch_ = now;
     } else {
         lastTickEpoch_ = now;

@@ -58,6 +58,15 @@ struct ConstructionInfo {
     std::vector<BuildMaterialInfo> materials; // only meaningful pre-construction (level 0, not yet started)
 };
 
+// One good the player can eat (see Game::foodOptions/tryEat and Game.cpp's
+// kFoodDefs table) -- `stock` is filled in live from the market, everything
+// else is that food's fixed definition.
+struct FoodOption {
+    std::string goodId;
+    double hungerRestorePerUnit = 0.0;
+    double stock = 0.0;
+};
+
 // Read-only snapshot of the Storefront's auto-sell config (see
 // Business::autoSellGoodId/autoSellThreshold, Game::storefrontAutoSellInfo,
 // and GameWorld::drawAutoSellOverlay). `capacityPerDay` is already resolved
@@ -107,6 +116,14 @@ struct WelcomeBackInfo {
     std::string elapsedFormatted; // e.g. "2d 3h 15m 42s" -- already formatted, see formatDuration in Game.cpp
     double idleEarnings = 0.0;
     std::vector<std::string> eventLog; // same lines printEventLog would otherwise print to std::cout
+    // True if offline neglect (untreated illness or starvation) would have
+    // been fatal during this catch-up -- see Game::kOfflineSafetyMarginDays.
+    // The character survives regardless (offline death is capped, not
+    // prevented outright: unlike a live sleep/fast-forward, the player had no
+    // chance to react while the app was closed), but comes back one bad day
+    // away from actually dying, so this needs to be surfaced loudly rather
+    // than buried in the eventLog.
+    bool nearFatalWhileAway = false;
 };
 
 // A signed price-lock contract: `lockedPrice` was the good's market price at
@@ -136,6 +153,11 @@ struct ActionResult {
     int count = 0;
     std::string goodId;
     bool rare = false; // tryMinigameBonus only -- true if a seasonal "rare catch" roll doubled `amount`
+    // tryEat only -- true if this meal was a different good than the previous
+    // one eaten this life, earning the "varied diet" hunger-restore bonus (see
+    // Game::kVarietyBonusMultiplier). Lets the UI call out the bonus instead of
+    // the player only ever noticing the restored amount was a bit higher.
+    bool varietyBonus = false;
 };
 
 // Result of any time-advancing action that could cause death (background
@@ -266,7 +288,58 @@ public:
     double starvationDeathDays() const { return Life::kStarvationDeathDays; }
     double ageEfficiency() const { return life_.ageEfficiency(); }
     double lifeProductionMultiplier() const { return life_.productionMultiplier(); }
-    double hungerRestorePerUnit() const { return Life::kHungerRestorePerUnit; }
+
+    // ---- "Well-rested": a small, temporary production bonus granted every
+    // time trySleep()/menuSleep() successfully restores energy to 100 -- makes
+    // sleeping (previously just a chore to undo the energy penalty) an
+    // actively good thing to do before a grinding session, not merely neutral.
+    // Decays with in-game time in simulateElapsed, same clock as everything
+    // else here; not persisted across save/load, same as dailyYieldVariance_. ----
+    static constexpr double kWellRestedHours = 8.0;          // in-game hours the bonus lasts
+    static constexpr double kWellRestedProductionBonus = 0.10; // +10% production while active
+    double wellRestedHoursRemaining() const { return wellRestedHoursRemaining_; }
+
+    // ---- Bedroom: a cash-only comfort upgrade reached from the Sleep menu
+    // (see menuSleep()/GameWorld::drawSleepOverlay) -- makes the well-rested
+    // buff above longer and stronger, and gives a small standing cut to how
+    // often illness strikes at all (a comfier bed -> a healthier sleep).
+    // Capped like the Legacy tracks rather than scaling forever -- meant to
+    // feel like furnishing one room, not another endless grind. Resets to 0
+    // on death/rebirth, same as warehouseLevel_ (an heir keeps the cash and a
+    // business foothold, not the fixtures). ----
+    static constexpr int kBedroomMaxLevel = 5;
+    static constexpr double kBedroomExtraHoursPerLevel = 1.5;          // added to kWellRestedHours, per level
+    static constexpr double kBedroomExtraBonusPerLevel = 0.02;         // added to kWellRestedProductionBonus, per level
+    static constexpr double kBedroomSicknessReductionPerLevel = 0.05; // relative cut to sickness chance, per level
+    int bedroomLevel() const { return bedroomLevel_; }
+    double bedroomNextCost() const;
+    // How long/strong the well-rested buff is at the *current* bedroom level
+    // -- what trySleep()/menuSleep() actually grant on waking up.
+    double bedroomWellRestedHours() const { return kWellRestedHours + static_cast<double>(bedroomLevel_) * kBedroomExtraHoursPerLevel; }
+    double bedroomWellRestedBonus() const { return kWellRestedProductionBonus + static_cast<double>(bedroomLevel_) * kBedroomExtraBonusPerLevel; }
+    ActionResult tryUpgradeBedroom();
+
+    // How close to the fatal threshold offline neglect is allowed to land the
+    // character (see simulateElapsed's `allowDeath` param) -- half an
+    // in-game day of margin, close enough that reopening the app still feels
+    // urgent rather than risk-free, far enough that it's never a hair-trigger
+    // false alarm from float rounding.
+    static constexpr double kOfflineSafetyMarginDays = 0.5;
+
+    // ---- Pre-sleep forecast (see Life::predictedHungerAfter/predictedStarvingDaysAfter):
+    // what hunger/starvingDays would look like after committing to a full
+    // in-game day of sleep, given today's season's hunger-drain multiplier --
+    // lets menuSleep/GameWorld's Sleep overlay warn *before* the player sleeps
+    // through their own starvation instead of only finding out afterward. ----
+    double predictedHungerAfterSleep() const;
+    double predictedStarvingDaysAfterSleep() const;
+
+    // Every good the player can eat (see Game.cpp's kFoodDefs), each with its
+    // own hunger-restore value and current warehouse stock -- wheat is
+    // always first (cheapest/most available) and everything else is an
+    // actual prepared dish worth more per unit. Replaces the old
+    // wheat-only hungerRestorePerUnit() accessor.
+    std::vector<FoodOption> foodOptions() const;
 
     // ---- Seasons: derived from life_.ageDays (already persisted, already
     // resets each generation) rather than tracked separately. Drives the
@@ -498,7 +571,12 @@ public:
     ActionResult tryBuyGood(const std::string& goodId, double qty);
     ActionResult trySellGood(const std::string& goodId, double qty);
     ActionResult tryHireStaff();
-    ActionResult tryEat(double qty);
+    // Silently clamps qty down to however much is actually useful (never
+    // eats past 100 hunger, wasting food for zero benefit) -- same
+    // "clamped, not rejected" philosophy tryBuyGood already uses for
+    // warehouse room. result.amount is the actual quantity eaten, which the
+    // caller should report instead of whatever qty it originally asked for.
+    ActionResult tryEat(const std::string& goodId, double qty);
     ActionResult tryVisitDoctor();
     TickOutcome trySleep();
     TickOutcome tryFastForward(double minutes);
@@ -565,6 +643,13 @@ private:
 
     static constexpr double kCropSwitchCost = 20.0; // flat fee to replant the Farm with a different crop
 
+    // ---- "Varied diet" (see tryEat): eating a different food than whatever
+    // was eaten last restores extra hunger, a small nudge to actually use the
+    // higher-tier foods a production chain unlocks instead of just living off
+    // whichever one is cheapest. Not a penalty for repeating -- repeating just
+    // forfeits the bonus, same "carrot, not stick" spirit as kWellRestedHours. ----
+    static constexpr double kVarietyBonusMultiplier = 1.15;
+
     static constexpr double kMinigameHitBonus = 15.0;  // good stock added on a hit (fishing/mining timing bar, lumber chopping)
     static constexpr double kMinigameMissBonus = 3.0;  // good stock added on a miss -- never a total whiff
 
@@ -585,6 +670,8 @@ private:
 
     static constexpr double kWarehouseBaseCost = 300.0;
     static constexpr double kWarehouseCostGrowth = 1.25;
+    static constexpr double kBedroomBaseCost = 400.0;
+    static constexpr double kBedroomCostGrowth = 1.8; // steeper than Warehouse -- capped at kBedroomMaxLevel, so it doesn't need to stay affordable forever
     static constexpr double kBaseStorageCap = 2000.0;      // per good, before any warehouse levels
     static constexpr double kStorageCapPerLevel = 1500.0;
 
@@ -593,6 +680,7 @@ private:
     double money_ = 200.0;
     double bankBalance_ = 0.0;
     int warehouseLevel_ = 0;
+    int bedroomLevel_ = 0;
     std::vector<ContractInfo> contracts_;
     double peakMoney_ = 200.0;                        // resets each generation
     std::vector<GenerationRecord> generationHistory_; // persists across deaths, bounded to kMaxHistoryEntries
@@ -621,6 +709,12 @@ private:
     double dailyYieldVariance_ = 1.0;
     long long dailyYieldVarianceDay_ = -1;
 
+    // ---- Well-rested buff countdown (see kWellRestedHours/kWellRestedProductionBonus)
+    // and last-eaten-food tracking (see kVarietyBonusMultiplier) -- both transient
+    // flavor state, deliberately not saved, same as dailyYieldVariance_ above. ----
+    double wellRestedHoursRemaining_ = 0.0;
+    std::string lastFoodEatenId_;
+
     // ---- Transient UI event queues (see drainNewlyUnlockedAchievements/
     // drainCompletedConstructions) -- never saved, just drained by GameWorld
     // once per frame to drive toasts. ----
@@ -644,7 +738,16 @@ private:
     // catch-up and manual fast-forward. Any event flavor text is appended to
     // `eventLog`. Returns true if the character died of neglect (untreated
     // illness or starvation) during this call — see deathCause_ for which.
-    bool simulateElapsed(long long seconds, std::vector<std::string>& eventLog, double weatherMult = 1.0);
+    //
+    // `allowDeath = false` is the offline safety net (see startSession(),
+    // the only caller that ever passes it): neglect still accumulates
+    // exactly as normal, but sickDays/starvingDays are clamped just short of
+    // the fatal threshold instead of actually killing the character, since
+    // -- unlike a live sleep/fast-forward the player explicitly chose --
+    // they had no chance to react while the app was closed. Every other
+    // caller (live ticking, sleeping, fast-forwarding) leaves this true, so
+    // neglect during an active session is exactly as lethal as it always was.
+    bool simulateElapsed(long long seconds, std::vector<std::string>& eventLog, double weatherMult = 1.0, bool allowDeath = true);
 
     // Ticks the clock forward to "now" based on real elapsed time. Returns
     // true if the character died during this call.
@@ -655,6 +758,12 @@ private:
 
     void checkAchievements();
     void printEventLog(const std::vector<std::string>& log) const;
+
+    // Winter's hunger-drain multiplier (softened by the Legacy season track),
+    // 1.0 every other season -- factored out of simulateElapsed so
+    // predictedHungerAfterSleep()/predictedStarvingDaysAfterSleep() can use
+    // the exact same number instead of drifting out of sync with it.
+    double seasonHungerDrainMultiplier(Season season) const;
 
     void printStatus() const;
     void menuBusinesses();

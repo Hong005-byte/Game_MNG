@@ -148,6 +148,7 @@ namespace {
         { "status_sick_label",   { "Sick: ", "生病: " } },
         { "status_sick_yes",     { "Yes", "是" } },
         { "status_sick_no",      { "No", "否" } },
+        { "status_well_rested",  { "Well-rested: +10% production", "精神饱满: 产出 +10%" } },
 
         // Tutorial
         { "tutorial_title", { "Welcome to Tycoon Idle!", "欢迎来到经营人生!" } },
@@ -625,21 +626,43 @@ namespace {
         { "menu_sleep_header",   { "\n-- Sleep --\n", "\n-- 睡觉 --\n" } },
         { "sleep_desc_prefix",   { "Sleeping skips ahead one full in-game day (", "睡觉会跳过完整的一个游戏日(现实中约 " } },
         { "sleep_desc_suffix",   { " of real time) and fully restores your energy. Hunger keeps ticking down as normal.\n", "),并完全恢复体力。饥饿度仍会照常下降。\n" } },
+        { "sleep_warning_fatal", { "WARNING: at this rate, sleeping now will starve you badly enough to be fatal. Eat something first!\n", "警告: 按目前的速度,现在睡觉会饿到足以致命。先吃点东西吧!\n" } },
+        { "sleep_warning_hunger", { "Note: your hunger will hit 0 partway through the night. You'll wake up starving.\n", "注意: 睡到一半你的饥饿度就会降到 0,醒来时会处于饥饿状态。\n" } },
         { "sleep_prompt",        { "Go to sleep? (1 = yes, 0 = back): ", "要睡觉吗?(1 = 是, 0 = 返回): " } },
+        { "sleep_prompt2",       { "1) Sleep  2) Upgrade Bedroom  0) Back: ", "1) 睡觉  2) 升级卧室  0) 返回: " } },
         { "sleep_died",          { "You fall asleep... and don't wake up.\n", "你睡着了……却再也没有醒来。\n" } },
         { "sleep_woke",          { "You wake up refreshed. Energy restored to 100.\n", "你醒来时精神饱满,体力恢复到 100。\n" } },
+        { "sleep_well_rested",   { "You feel well-rested! Production is up for the next few hours.\n", "你感觉精神饱满!接下来几小时产出会提升。\n" } },
 
-        // Eat menu
+        // Bedroom upgrade (reached from the Sleep menu -- see Game::bedroomLevel/tryUpgradeBedroom)
+        { "bedroom_level_prefix",        { "Bedroom: Lv ", "卧室: 等级 " } },
+        { "bedroom_effect_prefix",       { " -- sleeping grants a ", " —— 睡觉可获得 " } },
+        { "bedroom_effect_mid",          { "-hour well-rested buff (+", " 小时的精神饱满加成(产出 +" } },
+        { "bedroom_effect_suffix",       { "% production)\n", "%)\n" } },
+        { "bedroom_upgrade_cost_prefix", { "Upgrade cost: $", "升级花费: $" } },
+        { "bedroom_upgrade_cost_suffix", { "\n", "\n" } },
+        { "bedroom_upgraded_prefix",     { "Bedroom upgraded to level ", "卧室已升级到 " } },
+        { "bedroom_maxed",               { "Bedroom is already at its maximum level.\n", "卧室已经是最高等级了。\n" } },
+
+        // Eat menu -- wheat used to be the only edible good (see
+        // Game.cpp's kFoodDefs for the full table it grew into), so these
+        // used to just say "Wheat" outright; now the food's own name is
+        // inserted between eat_have_prefix/eat_have_mid and between
+        // ate_prefix/ate_suffix instead.
         { "menu_eat_header",     { "\n-- Eat --\n", "\n-- 吃饭 --\n" } },
-        { "no_food_source",      { "No food source available.\n", "没有可用的食物来源。\n" } },
+        { "no_food_source",      { "No food available -- you have none of anything edible right now.\n", "现在没有任何可以吃的东西。\n" } },
         { "hunger_label",        { "Hunger: ", "饥饿度: " } },
         { "eat_have_prefix",     { "You have ", "你有 " } },
-        { "eat_have_mid",        { " Wheat (each unit restores ", " 小麦(每单位恢复 " } },
-        { "eat_have_suffix",     { " hunger).\n", " 点饥饿度)。\n" } },
+        { "eat_have_mid",        { " (each unit restores ", " (每单位恢复 " } },
+        { "eat_have_suffix",     { " hunger)\n", " 点饥饿度)\n" } },
+        { "eat_pick_prompt",     { "Pick a food number (0 to go back): ", "选择食物编号(0 返回): " } },
         { "eat_prompt",          { "Eat how many units? (0 to go back): ", "要吃多少单位?(0 返回): " } },
-        { "dont_have_wheat",     { "You don't have that much wheat.\n", "你没有那么多小麦。\n" } },
+        { "dont_have_that_food", { "You don't have that much of that.\n", "你没有那么多这种食物。\n" } },
+        { "not_hungry",          { "You're already full -- no need to eat right now.\n", "你已经吃饱了,现在不需要再吃。\n" } },
         { "ate_prefix",          { "Ate ", "已食用 " } },
-        { "ate_suffix",          { " Wheat. Hunger is now ", " 单位小麦,饥饿度现在是 " } },
+        { "ate_suffix",          { ". Hunger is now ", "。饥饿度现在是 " } },
+        { "ate_variety_bonus",   { " (+15% varied diet bonus!)\n", "(+15% 饮食多样化加成!)\n" } },
+        { "eat_selected_prefix", { "Selected: ", "已选择: " } },
 
         // Doctor menu
         { "menu_doctor_header",     { "\n-- See a Doctor --\n", "\n-- 看医生 --\n" } },
@@ -738,6 +761,10 @@ namespace {
         { "welcome_back_prefix",  { "Welcome back! You were away for ", "欢迎回来!你离开了 " } },
         { "welcome_back_suffix",  { ".\n", "。\n" } },
         { "idle_earnings_prefix", { "Idle earnings: $", "挂机收入: $" } },
+        // Offline safety net (see Game::kOfflineSafetyMarginDays/WelcomeBackInfo::
+        // nearFatalWhileAway) -- shown both to the console and the in-window
+        // Welcome Back overlay when neglect while away almost killed the character.
+        { "welcome_back_near_fatal", { "You barely survived while you were away -- eat and/or see a doctor RIGHT NOW.\n", "你离开期间差点没能撑过来——现在立刻去吃东西和/或看医生。\n" } },
 
         // In-window Welcome Back overlay (see GameWorld::drawWelcomeBackOverlay) --
         // the graphical counterpart to the console welcome_back_prefix lines
