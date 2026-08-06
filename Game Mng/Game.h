@@ -58,6 +58,19 @@ struct ConstructionInfo {
     std::vector<BuildMaterialInfo> materials; // only meaningful pre-construction (level 0, not yet started)
 };
 
+// Read-only snapshot of the Storefront's auto-sell config (see
+// Business::autoSellGoodId/autoSellThreshold, Game::storefrontAutoSellInfo,
+// and GameWorld::drawAutoSellOverlay). `capacityPerDay` is already resolved
+// from the Storefront's current level (see Game::autoSellCapacityForLevel)
+// so the UI doesn't need to duplicate that table.
+struct StorefrontAutoSellInfo {
+    bool built = false;          // false if the Storefront itself isn't built yet (level 0)
+    int level = 0;
+    std::string goodId;          // empty = auto-sell not configured/disabled
+    double threshold = 0.0;
+    double capacityPerDay = 0.0; // units of goodId it can sell per in-game day once triggered
+};
+
 // Read-only snapshot of one market good.
 struct GoodInfo {
     std::string id;
@@ -132,6 +145,14 @@ struct TickOutcome {
     bool died = false;
     std::string deathMessage;
     int generation = 0;
+    // Flavor/disaster event lines rolled during this tick (price surges/
+    // crashes, windfalls, theft, spoilage, market-wide crashes/booms,
+    // warehouse disasters -- see EventSystem::roll). Game::tickBackground()
+    // used to only ever std::cout these (fine for the console UI, invisible
+    // once the SFML window covers it) -- GameWorld now queues them as toasts
+    // instead, the same fix already applied to the offline "Welcome Back"
+    // report (see WelcomeBackInfo).
+    std::vector<std::string> eventLog;
 };
 
 // Top-level game object: owns the player's cash, the market, the businesses,
@@ -346,6 +367,20 @@ public:
     // all, whether it's already under way, and (if not yet started) the
     // material shopping list with current warehouse stock alongside it.
     ConstructionInfo businessConstructionInfo(const std::string& businessId) const;
+
+    // ---- Storefront auto-sell (see Business::autoSellGoodId/
+    // autoSellThreshold and simulateElapsed's Pass 3). Continuously sells a
+    // chosen good from the warehouse once its market price reaches a
+    // player-set threshold -- capacity (units/in-game day) scales with the
+    // Storefront's own level, 3 at level 1 doubling up to 48 at level 5,
+    // capped there even if the Storefront is leveled further for its normal
+    // cash income (see kAutoSellMaxLevel/autoSellCapacityForLevel). ----
+    StorefrontAutoSellInfo storefrontAutoSellInfo() const;
+    // Pass an empty goodId to disable auto-sell entirely (keeps whatever
+    // threshold was last set, in case they re-enable the same good later).
+    ActionResult trySetStorefrontAutoSell(const std::string& goodId, double threshold);
+    static constexpr int kAutoSellMaxLevel = 5;
+    double autoSellCapacityForLevel(int level) const;
     // Spends the cash cost (same BusinessType::baseCost as a normal first
     // level) plus every required material from the warehouse, then starts
     // the countdown -- level stays 0 until simulateElapsed ticks it to

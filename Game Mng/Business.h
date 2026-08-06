@@ -61,6 +61,15 @@ struct Business {
     // it's currently planted with. Ignored by every other business.
     std::string cropId = "wheat";
 
+    // Only meaningful for the "storefront" business -- its auto-sell config
+    // (see Game::trySetStorefrontAutoSell/simulateElapsed's Pass 3 and
+    // GameWorld::drawAutoSellOverlay). Empty goodId = auto-sell disabled.
+    // Continuously sells autoSellGoodId from the warehouse, but only once
+    // its current market price has reached this threshold -- the player
+    // still has to judge the market themselves, same as signing a Contract.
+    std::string autoSellGoodId;
+    double autoSellThreshold = 0.0;
+
     // ---- First-build construction (see BusinessManager::requiresConstruction/
     // buildMaterialsFor/buildDaysFor and Game::tryStartConstruction). Only
     // meaningful while level == 0: 0 = an empty, unbuilt plot; > 0 = a

@@ -142,6 +142,13 @@ namespace {
               "随时按 Esc 键可以暂停、存档,或打开设置(音量/画面大小/按键绑定)。" } },
         { "networth_panel_title", { "Net Worth", "净资产" } },
 
+        // Always-visible life status panel (see GameWorld::drawLifeStatusPanel)
+        { "status_energy_label", { "Energy", "体力" } },
+        { "status_hunger_label", { "Hunger", "饱食度" } },
+        { "status_sick_label",   { "Sick: ", "生病: " } },
+        { "status_sick_yes",     { "Yes", "是" } },
+        { "status_sick_no",      { "No", "否" } },
+
         // Tutorial
         { "tutorial_title", { "Welcome to Tycoon Idle!", "欢迎来到经营人生!" } },
         { "tutorial_body",  { "You've just turned 21 -- old enough to take over the family business. Good luck!\n\nMove with {MOVE} or the arrow keys (hold Shift to sprint).\nPress {E}, or click a building, to interact with it.\nPress {U} near a building to instantly upgrade it one level.\nPress {M} to show/hide the minimap.\nWalk off the edge of the screen to travel to a new area.\nMost buildings need materials and a few days on-site before they're built -- only the Farm, Lumber Camp, Quarry, and Ore Mine are free and instant.\nBuild the Port, then commission a ship there to sail to Fisher's Isle.\nUnlocking an achievement pops up in the bottom-left corner.\nClick the Achievements button (top-right) any time.\nYour town keeps running in the background, even while you walk around.\nPress Escape any time to pause, save, or open Settings.",
@@ -166,6 +173,39 @@ namespace {
         { "storefront",  { "Storefront", "商铺" } },
         { "storefront_desc", { "Sells straight to walk-in customers -- pays cash directly, no market good involved.",
                                 "商铺直接向路过的顾客卖货,收入直接变成现金,不经过市场商品系统。" } },
+
+        // Storefront auto-sell (see Business::autoSellGoodId/autoSellThreshold,
+        // Game::trySetStorefrontAutoSell, GameWorld::drawAutoSellOverlay). This
+        // is a *separate* feature from storefront_desc's flat cash income above
+        // -- the Storefront keeps generating its own passive cash regardless of
+        // whether auto-sell is configured, this just adds automatic selling of
+        // one chosen warehouse good on top of that.
+        { "autosell_configure_button", { "Configure Auto-Sell", "设置自动售卖" } },
+        { "autosell_summary_prefix",   { "Auto-sell: ", "自动售卖: " } },
+        { "autosell_per_day_suffix",   { "/day", "个/天" } },
+        { "autosell_disabled_label",   { "Auto-sell is off.", "自动售卖尚未开启。" } },
+        { "autosell_not_built",        { "Build the Storefront first.", "请先建造商铺。" } },
+        { "autosell_title",            { "Storefront Auto-Sell", "商铺自动售卖设置" } },
+        { "autosell_desc_line1", { "Pick one good below and set a threshold price -- once its market price reaches or exceeds that threshold, the Storefront automatically sells it from your warehouse for you.",
+                                    "在下面选一种商品并设定一个门槛价格——一旦该商品的市场价格达到或超过这个门槛,商铺就会自动帮你从仓库里把它卖掉。" } },
+        { "autosell_desc_line2", { "The threshold is entirely up to you -- this panel won't tell you whether a price is good. Check the Market panel's current price and trend yourself before deciding.",
+                                    "门槛价格完全由你自己判断——这个面板不会替你评估价格好坏,请自己先去市场面板看看当前价格和走势,再决定门槛怎么设。" } },
+        { "autosell_desc_line3", { "How much it can sell per in-game day depends on the Storefront's level: 3 at level 1, doubling each level, capping at 48/day from level 5 onward.",
+                                    "每天最多能卖出多少取决于商铺等级:1级3个,每升一级翻倍,到5级封顶48个/天(超过5级也维持这个上限)。" } },
+        { "autosell_level_prefix",        { "Storefront Lv.", "商铺等级 " } },
+        { "autosell_capacity_prefix",     { " -- up to ", " —— 每天最多卖出 " } },
+        { "autosell_pick_good_label",     { "Choose a good to auto-sell:", "选择要自动售卖的商品:" } },
+        { "autosell_selected_prefix",     { "Selected: ", "已选择: " } },
+        { "autosell_current_price_prefix",{ "Current market price: ", "当前市场价: " } },
+        { "autosell_threshold_prefix",    { "Sell threshold: ", "售卖门槛: " } },
+        { "autosell_status_armed",        { "Price has reached the threshold -- selling now.", "价格已达到门槛,正在自动售卖。" } },
+        { "autosell_status_waiting",      { "Waiting for the price to reach the threshold.", "等待价格达到门槛中。" } },
+        { "autosell_minus10pct",          { "-10%", "-10%" } },
+        { "autosell_minus1pct",           { "-1%", "-1%" } },
+        { "autosell_plus1pct",            { "+1%", "+1%" } },
+        { "autosell_plus10pct",           { "+10%", "+10%" } },
+        { "autosell_set_to_current_button", { "Set Threshold = Current Price", "门槛设为当前价格" } },
+        { "autosell_disable_button",      { "Disable Auto-Sell", "禁用自动售卖" } },
         { "bakery",      { "Bakery", "面包坊" } },
         { "smelter",     { "Smelter", "冶炼厂" } },
         { "sawmill",     { "Sawmill", "锯木厂" } },
@@ -604,8 +644,15 @@ namespace {
         // Doctor menu
         { "menu_doctor_header",     { "\n-- See a Doctor --\n", "\n-- 看医生 --\n" } },
         { "not_sick",               { "You're not sick. Nothing to treat.\n", "你没有生病,没什么可以治疗的。\n" } },
+        { "doctor_desc_line1", { "Getting sick is random and unrelated to hunger/energy -- it can happen on any given day, though Winter makes it noticeably more likely and Spring noticeably less.",
+                                   "生病是随机事件,跟饥饿度/体力没有直接关系——任何一天都可能发生,不过冬天概率明显更高、春天明显更低。" } },
+        { "doctor_desc_line2", { "While sick, every business's output is stuck at 70% until you're treated -- and if it drags on long enough without treatment, it's fatal.",
+                                   "生病期间,所有产业的产出都会被锁在70%,直到治好为止——而且拖得太久不治疗是会死人的。" } },
+        { "doctor_desc_line3", { "Come back here and pay to be treated the moment you notice you're sick (see the status panel in the top-right of the screen) -- there's no reason to wait it out.",
+                                   "一发现自己生病了(看屏幕右上角的状态面板)就该回来这里花钱治疗——没有理由硬扛。" } },
         { "sick_for_prefix",        { "You've been sick for ", "你已经病了 " } },
         { "sick_for_suffix",        { " in-game days (fatal at ", " 个游戏日(达到 " } },
+        { "sick_penalty_note",      { "All business output is at 70% while sick.", "生病期间所有产业产出都只有正常的70%。" } },
         { "sick_for_suffix2",       { " days untreated).\n", " 天未治疗会致命)。\n" } },
         { "treatment_cost_prefix",  { "Treatment costs $", "治疗费用 $" } },
         { "treatment_cost_suffix",  { ". Get treated? (1 = yes, 0 = back): ", "。要接受治疗吗?(1 = 是, 0 = 返回): " } },

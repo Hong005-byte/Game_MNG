@@ -244,6 +244,38 @@ bool Game::simulateElapsed(long long seconds, std::vector<std::string>& eventLog
         }
     }
 
+    // Pass 3: Storefront auto-sell (see Business::autoSellGoodId/
+    // autoSellThreshold and GameWorld::drawAutoSellOverlay) -- runs after
+    // Pass 1/2 so it can sell goods produced/processed this same tick.
+    // Unlike production, this sells *from* the warehouse, gated on the
+    // good's current market price having actually reached the threshold
+    // the player set (never peeks at a future price) -- capacity scales
+    // with in-game days elapsed this tick, same as construction progress
+    // above, so a long offline catch-up doesn't get stuck selling only a
+    // handful of units regardless of how much time actually passed.
+    if (Business* storefront = businessManager_.find("storefront")) {
+        if (storefront->level > 0 && !storefront->autoSellGoodId.empty()) {
+            if (Good* g = market_.find(storefront->autoSellGoodId)) {
+                if (g->stock > 0.0 && g->price >= storefront->autoSellThreshold) {
+                    double qty = std::min(g->stock, autoSellCapacityForLevel(storefront->level) * daysElapsed);
+                    if (qty > 0.0) {
+                        double moneyBeforeAutoSell = money_;
+                        if (market_.sell(storefront->autoSellGoodId, qty, money_)) {
+                            double revenue = money_ - moneyBeforeAutoSell;
+                            double seasonMult = seasonalGoodSellMultiplier(storefront->autoSellGoodId, season);
+                            if (seasonMult != 1.0) {
+                                double bonus = revenue * (seasonMult - 1.0);
+                                money_ += bonus;
+                                revenue += bonus;
+                            }
+                            totalTradeRevenue_ += revenue;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Upkeep: charged after this interval's production, so a business's very
     // first tick of income can help cover its own keep rather than the tax
     // applying to money that hasn't been earned yet.
@@ -1227,6 +1259,42 @@ ConstructionInfo Game::businessConstructionInfo(const std::string& businessId) c
     return info;
 }
 
+double Game::autoSellCapacityForLevel(int level) const {
+    int cappedLevel = std::clamp(level, 0, kAutoSellMaxLevel);
+    if (cappedLevel <= 0) return 0.0;
+    // 3, 6, 12, 24, 48 -- doubles each level, capped at level 5's value.
+    return 3.0 * std::pow(2.0, static_cast<double>(cappedLevel - 1));
+}
+
+StorefrontAutoSellInfo Game::storefrontAutoSellInfo() const {
+    StorefrontAutoSellInfo info;
+    const Business* b = businessManager_.find("storefront");
+    if (!b) return info;
+    info.built = b->level > 0;
+    info.level = b->level;
+    info.goodId = b->autoSellGoodId;
+    info.threshold = b->autoSellThreshold;
+    info.capacityPerDay = autoSellCapacityForLevel(b->level);
+    return info;
+}
+
+ActionResult Game::trySetStorefrontAutoSell(const std::string& goodId, double threshold) {
+    ActionResult result;
+    Business* b = businessManager_.find("storefront");
+    if (!b || b->level <= 0) {
+        result.messageKey = "autosell_not_built";
+        return result;
+    }
+    if (!goodId.empty() && !market_.find(goodId)) {
+        result.messageKey = "invalid_good_number";
+        return result;
+    }
+    b->autoSellGoodId = goodId;
+    b->autoSellThreshold = std::max(0.0, threshold);
+    result.success = true;
+    return result;
+}
+
 ActionResult Game::tryStartConstruction(const std::string& businessId) {
     ActionResult result;
     Business* b = businessManager_.find(businessId);
@@ -1874,6 +1942,10 @@ void Game::load() {
         // which is exactly right: an old save's level-0 business just shows
         // up as an unstarted empty plot under the new system, no migration needed.
         b.constructionDaysRemaining = getD("business." + b.typeId + ".construction_days_remaining", b.constructionDaysRemaining);
+        // Missing on older saves -> defaults to "" (auto-sell disabled),
+        // same no-migration-needed reasoning as construction_days_remaining above.
+        b.autoSellGoodId = getS("business." + b.typeId + ".autosell_good", b.autoSellGoodId);
+        b.autoSellThreshold = getD("business." + b.typeId + ".autosell_threshold", b.autoSellThreshold);
     }
     for (auto& a : achievements_.achievements()) {
         a.unlocked = getI("achievement." + a.id + ".unlocked", a.unlocked ? 1 : 0) != 0;
@@ -1938,6 +2010,8 @@ void Game::save() const {
         out << "business." << b.typeId << ".workers=" << b.workers << "\n";
         out << "business." << b.typeId << ".crop=" << b.cropId << "\n";
         out << "business." << b.typeId << ".construction_days_remaining=" << b.constructionDaysRemaining << "\n";
+        out << "business." << b.typeId << ".autosell_good=" << b.autoSellGoodId << "\n";
+        out << "business." << b.typeId << ".autosell_threshold=" << b.autoSellThreshold << "\n";
     }
     for (const auto& a : achievements_.achievements()) {
         out << "achievement." << a.id << ".unlocked=" << (a.unlocked ? 1 : 0) << "\n";
@@ -1981,7 +2055,8 @@ TickOutcome Game::tickBackground(double weatherMult) {
     TickOutcome outcome;
     std::vector<std::string> log;
     bool died = tickToNow(log, weatherMult);
-    printEventLog(log);
+    printEventLog(log); // console-mode parity -- harmless no-op-equivalent for the GUI, which reads outcome.eventLog instead
+    outcome.eventLog = std::move(log);
     if (died) {
         outcome.died = true;
         outcome.deathMessage = deathCause_;

@@ -1458,6 +1458,15 @@ void GameWorld::setFeedback(const std::string& text, bool success) {
 }
 
 void GameWorld::handleTickOutcome(const TickOutcome& outcome) {
+    // Queue any flavor/disaster events rolled this tick as toasts (see
+    // drawEventToast) -- previously these only ever printed to a console
+    // window the player isn't looking at once the SFML window is open,
+    // which is exactly why "my wood keeps disappearing and I don't see why"
+    // reports happen: a spoilage/warehouse-disaster event silently eats
+    // stock with zero on-screen indication. Queued even on the death path
+    // below (whatever happened this tick still happened).
+    for (const auto& line : outcome.eventLog) eventToastQueue_.push_back(line);
+
     if (!outcome.died) return;
     deathNoticeMessage_ = outcome.deathMessage;
     deathNoticeGeneration_ = outcome.generation;
@@ -2910,6 +2919,50 @@ void GameWorld::drawNetWorthPanel(sf::RenderWindow& window) {
     window.draw(current);
 }
 
+void GameWorld::drawLifeStatusPanel(sf::RenderWindow& window) {
+    constexpr float panelW = 190.f, panelH = 104.f;
+    float panelX = static_cast<float>(windowSize_.x) - panelW - 10.f;
+    float panelY = 54.f; // just below the Achievements/How to Play/Recipe Book button row (see *ButtonBounds, all at y:10-44)
+
+    sf::RectangleShape bg(sf::Vector2f(panelW, panelH));
+    bg.setPosition(sf::Vector2f(panelX, panelY));
+    bg.setFillColor(sf::Color(0, 0, 0, 150));
+    window.draw(bg);
+
+    if (!fontLoaded_) return;
+
+    // Same red/orange/green bands as Life::productionMultiplier's own
+    // thresholds (<=0 halves output, otherwise fine) -- 30% is just an
+    // early warning, not itself a mechanical threshold.
+    auto barColor = [](double pct) {
+        if (pct <= 0.0) return sf::Color(220, 90, 90);
+        if (pct < 30.0) return sf::Color(230, 160, 70);
+        return sf::Color(130, 210, 130);
+    };
+    auto drawStat = [&](float y, const std::string& labelKey, double pct) {
+        uiText(window, { panelX + 10.f, y }, Localization::t(labelKey), 12, sf::Color(200, 200, 200));
+        sf::RectangleShape barBg(sf::Vector2f(panelW - 20.f, 10.f));
+        barBg.setPosition(sf::Vector2f(panelX + 10.f, y + 16.f));
+        barBg.setFillColor(sf::Color(50, 50, 56));
+        window.draw(barBg);
+        float frac = static_cast<float>(std::clamp(pct, 0.0, 100.0) / 100.0);
+        if (frac > 0.f) {
+            sf::RectangleShape barFill(sf::Vector2f((panelW - 20.f) * frac, 10.f));
+            barFill.setPosition(sf::Vector2f(panelX + 10.f, y + 16.f));
+            barFill.setFillColor(barColor(pct));
+            window.draw(barFill);
+        }
+    };
+
+    drawStat(panelY + 8.f, "status_energy_label", game_.energy());
+    drawStat(panelY + 40.f, "status_hunger_label", game_.hunger());
+
+    // Sickness is binary, not a 0-100 bar -- just a colored yes/no line.
+    std::string sickText = game_.isSick() ? Localization::t("status_sick_yes") : Localization::t("status_sick_no");
+    uiText(window, { panelX + 10.f, panelY + 76.f }, Localization::t("status_sick_label") + sickText, 13,
+        game_.isSick() ? sf::Color(230, 120, 120) : sf::Color(150, 220, 150), true);
+}
+
 void GameWorld::updateDayNightAndWeather(float dt) {
     dayNightTimer_ += dt;
     if (dayNightTimer_ >= kDayNightCycleSeconds) dayNightTimer_ -= kDayNightCycleSeconds;
@@ -3143,6 +3196,44 @@ void GameWorld::drawAchievementToast(sf::RenderWindow& window) {
 
     uiText(window, { pos.x + 62.f, pos.y + 12.f }, Localization::t("achievement_toast_header"), 13, sf::Color(232, 212, 120), true);
     uiText(window, { pos.x + 62.f, pos.y + 34.f }, Localization::t("ach_" + currentAchievementToastId_ + "_name"), 15, sf::Color::White, true);
+}
+
+void GameWorld::updateEventToast(float dt) {
+    if (!currentEventToast_.empty()) {
+        eventToastTimer_ -= dt;
+        if (eventToastTimer_ <= 0.f) currentEventToast_.clear();
+        return; // one at a time, same as the achievement toast
+    }
+    if (!eventToastQueue_.empty()) {
+        currentEventToast_ = eventToastQueue_.front();
+        eventToastQueue_.erase(eventToastQueue_.begin());
+        eventToastTimer_ = kEventToastSeconds;
+    }
+}
+
+void GameWorld::drawEventToast(sf::RenderWindow& window) {
+    if (currentEventToast_.empty() || !fontLoaded_) return;
+
+    // Bottom-right, mirroring the achievement toast's bottom-left -- width
+    // sized to the actual line (these vary a lot more in length than an
+    // achievement name), clamped so a pathologically long line can't run
+    // off the left edge of the window.
+    sf::Text text(font_, toSfString(currentEventToast_), 14);
+    sf::FloatRect bounds = text.getLocalBounds();
+    float boxW = std::clamp(bounds.size.x + 32.f, 220.f, 520.f);
+    sf::Vector2f size(boxW, 50.f);
+    sf::Vector2f pos(static_cast<float>(windowSize_.x) - size.x - 16.f, static_cast<float>(windowSize_.y) - size.y - 16.f - 54.f);
+
+    sf::RectangleShape bg(size);
+    bg.setPosition(pos);
+    bg.setFillColor(sf::Color(30, 32, 40, 235));
+    bg.setOutlineThickness(3.f);
+    bg.setOutlineColor(sf::Color(150, 170, 220));
+    window.draw(bg);
+
+    text.setPosition(sf::Vector2f(pos.x + 14.f, pos.y + size.y / 2.f - 9.f));
+    text.setFillColor(sf::Color(225, 230, 245));
+    window.draw(text);
 }
 
 void GameWorld::drawSeasonTransitionOverlay(sf::RenderWindow& window) {
@@ -3811,6 +3902,7 @@ void GameWorld::drawOverlayRoot(sf::RenderWindow& window) {
         case OverlayKind::Pause:        drawPauseOverlay(window); break;
         case OverlayKind::Settings:     drawSettingsOverlay(window); break;
         case OverlayKind::WelcomeBack:  drawWelcomeBackOverlay(window); break;
+        case OverlayKind::AutoSell:     drawAutoSellOverlay(window); break;
         default: break;
     }
 }
@@ -4029,6 +4121,22 @@ void GameWorld::drawBusinessesOverlay(sf::RenderWindow& window) {
                         setFeedback(Localization::t("arrived_at_isle"), true);
                     });
             }
+        }
+
+        // The Storefront alone gets an auto-sell config button (see
+        // Business::autoSellGoodId/autoSellThreshold and
+        // drawAutoSellOverlay), same "shown beside hire-worker" placement as
+        // the Farm's crop picker and Port's ship button above.
+        if (info->id == "storefront") {
+            uiButton(window, { pos.x + 24.f + 240.f + 16.f, y }, { 240.f, 40.f }, Localization::t("autosell_configure_button"),
+                [this]() { openOverlay(OverlayKind::AutoSell); });
+            y += 46.f;
+            StorefrontAutoSellInfo as = game_.storefrontAutoSellInfo();
+            std::string summary = as.goodId.empty()
+                ? Localization::t("autosell_disabled_label")
+                : Localization::t("autosell_summary_prefix") + Localization::t(as.goodId) +
+                  " @ $" + formatNumber(as.threshold) + " (" + formatNumber(as.capacityPerDay) + Localization::t("autosell_per_day_suffix") + ")";
+            uiText(window, { pos.x + 24.f, y }, summary, 14, sf::Color(232, 212, 120));
         }
     }
 
@@ -4421,23 +4529,32 @@ void GameWorld::drawEatOverlay(sf::RenderWindow& window) {
 }
 
 void GameWorld::drawDoctorOverlay(sf::RenderWindow& window) {
-    sf::Vector2f pos(360.f, 260.f), size(560.f, 300.f);
+    // Taller than before -- this used to just say "You're not sick" and stop,
+    // with no explanation of what illness even is, what it costs you while
+    // it's active, or that it can kill you. Always shows the same 3-line
+    // explainer regardless of sick/not-sick, then the sick-only status below.
+    sf::Vector2f pos(340.f, 190.f), size(600.f, 440.f);
     uiPanelBg(window, pos, size);
     uiText(window, { pos.x + 24.f, pos.y + 16.f }, Localization::t("menu_doctor_header"), 20, sf::Color(232, 212, 120), true);
     uiButton(window, { pos.x + size.x - 120.f, pos.y + 14.f }, { 100.f, 34.f }, Localization::t("close_button"), [this]() { closeOverlay(); });
 
+    uiText(window, { pos.x + 24.f, pos.y + 56.f }, Localization::t("doctor_desc_line1"), 13, sf::Color(210, 210, 210));
+    uiText(window, { pos.x + 24.f, pos.y + 78.f }, Localization::t("doctor_desc_line2"), 13, sf::Color(210, 210, 210));
+    uiText(window, { pos.x + 24.f, pos.y + 100.f }, Localization::t("doctor_desc_line3"), 13, sf::Color(210, 210, 210));
+
     if (!game_.isSick()) {
-        uiText(window, { pos.x + 24.f, pos.y + 80.f }, Localization::t("not_sick"), 15);
+        uiText(window, { pos.x + 24.f, pos.y + 150.f }, Localization::t("not_sick"), 15, sf::Color(150, 220, 150));
         return;
     }
 
     std::ostringstream info;
     info << Localization::t("sick_for_prefix") << std::fixed << std::setprecision(1) << game_.sickDays()
         << Localization::t("sick_for_suffix") << game_.sicknessDeathDays();
-    uiText(window, { pos.x + 24.f, pos.y + 70.f }, info.str(), 14);
-    uiText(window, { pos.x + 24.f, pos.y + 100.f }, Localization::t("treatment_cost_prefix") + formatNumber(game_.doctorTreatmentCost()), 15);
+    uiText(window, { pos.x + 24.f, pos.y + 150.f }, info.str(), 14, sf::Color(230, 170, 100));
+    uiText(window, { pos.x + 24.f, pos.y + 176.f }, Localization::t("sick_penalty_note"), 13, sf::Color(220, 140, 140));
+    uiText(window, { pos.x + 24.f, pos.y + 208.f }, Localization::t("treatment_cost_prefix") + formatNumber(game_.doctorTreatmentCost()), 15);
 
-    uiButton(window, { pos.x + 24.f, pos.y + 160.f }, { 200.f, 44.f }, Localization::t("treat_button"), [this]() {
+    uiButton(window, { pos.x + 24.f, pos.y + 260.f }, { 200.f, 44.f }, Localization::t("treat_button"), [this]() {
         ActionResult r = game_.tryVisitDoctor();
         if (r.success) setFeedback(Localization::t("all_better"), true);
         else setFeedback(Localization::t(r.messageKey), false);
@@ -4758,6 +4875,131 @@ void GameWorld::drawWelcomeBackOverlay(sf::RenderWindow& window) {
         if (maxScroll > 0.f) {
             uiText(window, { pos.x + size.x - 210.f, pos.y + contentTop - 22.f }, Localization::t("scroll_hint"), 12, sf::Color(160, 160, 160));
         }
+    }
+}
+
+void GameWorld::drawAutoSellOverlay(sf::RenderWindow& window) {
+    sf::Vector2f pos(100.f, 40.f), size(1080.f, 740.f);
+    uiPanelBg(window, pos, size);
+    uiText(window, { pos.x + 24.f, pos.y + 16.f }, Localization::t("autosell_title"), 20, sf::Color(232, 212, 120), true);
+    uiButton(window, { pos.x + size.x - 130.f, pos.y + 14.f }, { 110.f, 36.f }, Localization::t("close_button"), [this]() { closeOverlay(); });
+
+    // Full explanation up front, not just a label -- this is a mechanic with
+    // real rules (threshold direction, no price hints baked in, capacity
+    // scaling), not something a bare "Auto-Sell" button name would convey.
+    uiText(window, { pos.x + 24.f, pos.y + 50.f }, Localization::t("autosell_desc_line1"), 13, sf::Color(210, 210, 210));
+    uiText(window, { pos.x + 24.f, pos.y + 70.f }, Localization::t("autosell_desc_line2"), 13, sf::Color(210, 210, 210));
+    uiText(window, { pos.x + 24.f, pos.y + 90.f }, Localization::t("autosell_desc_line3"), 13, sf::Color(210, 210, 210));
+
+    StorefrontAutoSellInfo as = game_.storefrontAutoSellInfo();
+    if (!as.built) {
+        uiText(window, { pos.x + 24.f, pos.y + 130.f }, Localization::t("autosell_not_built"), 15, sf::Color(220, 140, 140));
+        return;
+    }
+
+    uiText(window, { pos.x + 24.f, pos.y + 122.f },
+        Localization::t("autosell_level_prefix") + std::to_string(as.level) +
+        Localization::t("autosell_capacity_prefix") + formatNumber(as.capacityPerDay) + Localization::t("autosell_per_day_suffix"),
+        14, sf::Color(200, 220, 255), true);
+
+    // ---- Left: scrollable goods list (name + current price), click to select ----
+    constexpr float listW = 560.f, rowH = 32.f;
+    float listTop = pos.y + 160.f, listBottom = pos.y + size.y - 24.f;
+    auto goods = game_.goodInfos();
+
+    uiText(window, { pos.x + 24.f, listTop - 24.f }, Localization::t("autosell_pick_good_label"), 13, sf::Color(200, 200, 200));
+
+    float contentH = static_cast<float>(goods.size()) * rowH;
+    float maxScroll = std::max(0.f, contentH - (listBottom - listTop));
+    overlayScrollOffset_ = std::clamp(overlayScrollOffset_, 0.f, maxScroll);
+
+    float rowY = listTop - overlayScrollOffset_;
+    beginClip(window, sf::FloatRect(sf::Vector2f(pos.x, listTop), sf::Vector2f(listW, listBottom - listTop)));
+    for (size_t i = 0; i < goods.size(); ++i) {
+        if (rowY < listTop - rowH || rowY > listBottom) { rowY += rowH; continue; }
+        const auto& g = goods[i];
+        bool selected = g.id == as.goodId;
+        sf::RectangleShape rowBg(sf::Vector2f(listW - 12.f, rowH - 4.f));
+        rowBg.setPosition(sf::Vector2f(pos.x + 24.f, rowY));
+        rowBg.setFillColor(selected ? sf::Color(90, 76, 130) : sf::Color(50, 52, 62));
+        window.draw(rowBg);
+
+        float clickTop = std::max(rowY, listTop), clickBottom = std::min(rowY + (rowH - 4.f), listBottom);
+        if (clickBottom > clickTop) {
+            std::string goodId = g.id;
+            double currentPrice = g.price;
+            overlayClickRegions_.push_back(ClickRegion{
+                sf::FloatRect(sf::Vector2f(pos.x + 24.f, clickTop), sf::Vector2f(listW - 12.f, clickBottom - clickTop)),
+                [this, goodId, currentPrice]() {
+                    // Selecting a good defaults its threshold to the price it's
+                    // at right now -- a starting point the player then nudges
+                    // with the +/-% buttons below, not a suggestion that this
+                    // particular number is "good".
+                    ActionResult r = game_.trySetStorefrontAutoSell(goodId, currentPrice);
+                    if (!r.success) setFeedback(Localization::t(r.messageKey), false);
+                } });
+        }
+
+        uiText(window, { pos.x + 32.f, rowY + 6.f }, Localization::t(g.id), 14, sf::Color::White);
+        uiText(window, { pos.x + 24.f + listW - 120.f, rowY + 6.f }, "$" + formatNumber(g.price), 14, sf::Color(200, 220, 200));
+        rowY += rowH;
+    }
+    endClip(window);
+    if (maxScroll > 0.f) {
+        uiText(window, { pos.x + 24.f, listTop - 24.f + 200.f }, Localization::t("scroll_hint"), 12, sf::Color(160, 160, 160));
+    }
+
+    // ---- Right: current selection + threshold controls ----
+    float rx = pos.x + 24.f + listW + 24.f, ry = listTop;
+    float rw = pos.x + size.x - 24.f - rx;
+
+    if (as.goodId.empty()) {
+        uiText(window, { rx, ry }, Localization::t("autosell_disabled_label"), 16, sf::Color(200, 200, 200), true);
+    } else {
+        double currentPrice = 0.0;
+        for (const auto& g : goods) if (g.id == as.goodId) { currentPrice = g.price; break; }
+
+        uiText(window, { rx, ry }, Localization::t("autosell_selected_prefix") + Localization::t(as.goodId), 16, sf::Color(232, 212, 120), true);
+        ry += 30.f;
+        uiText(window, { rx, ry }, Localization::t("autosell_current_price_prefix") + "$" + formatNumber(currentPrice), 14, sf::Color(200, 220, 200));
+        ry += 24.f;
+        bool armed = currentPrice >= as.threshold;
+        uiText(window, { rx, ry }, Localization::t("autosell_threshold_prefix") + "$" + formatNumber(as.threshold), 16,
+            armed ? sf::Color(150, 220, 150) : sf::Color(230, 170, 100), true);
+        ry += 22.f;
+        uiText(window, { rx, ry }, Localization::t(armed ? "autosell_status_armed" : "autosell_status_waiting"), 12,
+            armed ? sf::Color(150, 220, 150) : sf::Color(180, 180, 180));
+        ry += 34.f;
+
+        auto adjustBtn = [&](float x, float w, const std::string& label, double factorOrDelta, bool isPercent) {
+            uiButton(window, { x, ry }, { w, 36.f }, label, [this, factorOrDelta, isPercent]() {
+                StorefrontAutoSellInfo cur = game_.storefrontAutoSellInfo();
+                if (cur.goodId.empty()) return;
+                double next = isPercent ? cur.threshold * (1.0 + factorOrDelta) : cur.threshold + factorOrDelta;
+                game_.trySetStorefrontAutoSell(cur.goodId, std::max(0.0, next));
+            });
+        };
+        float bw = (rw - 3.f * 8.f) / 4.f;
+        adjustBtn(rx, bw, Localization::t("autosell_minus10pct"), -0.10, true);
+        adjustBtn(rx + (bw + 8.f), bw, Localization::t("autosell_minus1pct"), -0.01, true);
+        adjustBtn(rx + 2.f * (bw + 8.f), bw, Localization::t("autosell_plus1pct"), 0.01, true);
+        adjustBtn(rx + 3.f * (bw + 8.f), bw, Localization::t("autosell_plus10pct"), 0.10, true);
+        ry += 46.f;
+
+        uiButton(window, { rx, ry }, { rw, 38.f }, Localization::t("autosell_set_to_current_button"),
+            [this, currentPrice]() {
+                StorefrontAutoSellInfo cur = game_.storefrontAutoSellInfo();
+                if (cur.goodId.empty()) return;
+                game_.trySetStorefrontAutoSell(cur.goodId, currentPrice);
+            });
+        ry += 54.f;
+
+        uiButton(window, { rx, ry }, { rw, 40.f }, Localization::t("autosell_disable_button"),
+            [this]() { game_.trySetStorefrontAutoSell("", 0.0); });
+    }
+
+    if (!overlayFeedback_.empty()) {
+        uiText(window, { pos.x + 24.f, pos.y + size.y - 30.f }, overlayFeedback_, 15, overlayFeedbackColor_);
     }
 }
 
@@ -5906,6 +6148,7 @@ void GameWorld::run() {
         updateSeasonTransition(dt); // ticks (and, near the end, resolves) regardless of overlay state
         updateMusicCrossfade(dt);   // same -- background music keeps fading/playing through a paused menu
         updateAchievementToast(dt); // same -- an unlock while a menu is open still counts down and shows
+        updateEventToast(dt);       // same -- a queued event line still counts down and shows through a paused menu
 
         // Ticks down regardless of overlay state: previously this only ran in
         // the "overlay open" branch above (feedback used to only ever be set
@@ -5952,6 +6195,7 @@ void GameWorld::run() {
         if (showMinimap_) drawMinimap(window);
         drawHud(window);
         drawNetWorthPanel(window);
+        drawLifeStatusPanel(window);
         drawAchievementsButton(window);
         drawHowToPlayButton(window);
         drawRecipeBookButton(window);
@@ -5959,6 +6203,7 @@ void GameWorld::run() {
         drawOverlayRoot(window); // drawn last so it sits on top of everything else
         drawSeasonTransitionOverlay(window); // drawn even later -- covers overlays too, so a season change is never missed
         drawAchievementToast(window); // drawn last of all -- sits above overlays and the season transition alike
+        drawEventToast(window);       // same layer, opposite corner
 
         window.display();
     }

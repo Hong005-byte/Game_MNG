@@ -97,7 +97,8 @@ enum class OverlayKind {
     Brewing,        // alchemist or winery -- memorize-then-repeat a color sequence
     Pause,          // opened by Escape from the walking-around world -- "save or keep playing", plus a way into Settings
     Settings,       // volume/resolution/fullscreen/key rebinding -- reached from Pause
-    WelcomeBack     // shown once at startup if Game::lastWelcomeBack() has anything to report -- see drawWelcomeBackOverlay
+    WelcomeBack,    // shown once at startup if Game::lastWelcomeBack() has anything to report -- see drawWelcomeBackOverlay
+    AutoSell        // Storefront's auto-sell configuration -- see drawAutoSellOverlay
 };
 
 // Market overlay's category filter (see drawMarketOverlay) -- the goods list
@@ -258,6 +259,18 @@ private:
     std::vector<std::string> achievementToastQueue_; // ids waiting to be shown, oldest first
     std::string currentAchievementToastId_;          // empty = nothing currently shown
     float achievementToastTimer_ = 0.f;              // counts down while currentAchievementToastId_ is non-empty
+
+    // ---- Live event toast (see handleTickOutcome/drawEventToast): same
+    // queue-one-at-a-time idea as the achievement toast above, but for
+    // TickOutcome::eventLog (price surges/crashes, windfalls, theft,
+    // spoilage, market-wide crashes/booms, warehouse disasters) -- these
+    // used to only ever print to a console window hidden behind the SFML
+    // one, so a spoilage/disaster event during live play had zero on-screen
+    // indication at all. ----
+    static constexpr float kEventToastSeconds = 4.f; // a beat longer than the achievement toast -- these lines run longer
+    std::vector<std::string> eventToastQueue_;
+    std::string currentEventToast_;
+    float eventToastTimer_ = 0.f;
 
     // Ambient weather noise (synthesized white noise, looped) -- plays while
     // raining_ is true (see updateDayNightAndWeather), covering both the
@@ -461,6 +474,13 @@ private:
     void drawMinimap(sf::RenderWindow& window);
     void drawHud(sf::RenderWindow& window);
     void drawNetWorthPanel(sf::RenderWindow& window);
+    // Always-visible energy/hunger bars + sick status, top-right below the
+    // Achievements/How to Play/Recipe Book button row -- previously the only
+    // way to notice you were hungry/sick was to already have opened the
+    // Eat/Doctor overlay, so a slow-burning problem could go unnoticed
+    // until production was already halved (see Life::productionMultiplier)
+    // or worse.
+    void drawLifeStatusPanel(sf::RenderWindow& window);
     void updateDayNightAndWeather(float dt);
     sf::Color dayNightTint() const;
     sf::Color seasonTint() const; // subtle per-season wash, layered under the day/night tint
@@ -478,6 +498,8 @@ private:
     // updateSeasonTransition.
     void updateAchievementToast(float dt);
     void drawAchievementToast(sf::RenderWindow& window);
+    void updateEventToast(float dt);
+    void drawEventToast(sf::RenderWindow& window);
     void drawAchievementsButton(sf::RenderWindow& window);
     void drawTutorial(sf::RenderWindow& window);
 
@@ -549,6 +571,7 @@ private:
     void drawPauseOverlay(sf::RenderWindow& window);
     void drawSettingsOverlay(sf::RenderWindow& window);
     void drawWelcomeBackOverlay(sf::RenderWindow& window);
+    void drawAutoSellOverlay(sf::RenderWindow& window);
     void drawHowToPlayOverlay(sf::RenderWindow& window);
     void drawCropPickerOverlay(sf::RenderWindow& window);
     void drawTimingMinigameOverlay(sf::RenderWindow& window);
