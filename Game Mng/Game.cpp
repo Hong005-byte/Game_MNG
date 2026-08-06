@@ -1528,14 +1528,19 @@ ActionResult Game::tryBuyGood(const std::string& goodId, double qty) {
         result.messageKey = "warehouse_full";
         return result;
     }
-    double cost = g->price * qty;
+    // Pre-trade estimate, only for the "can't afford" message below --
+    // Market::buy() charges its own post-impact price (see its comment), so
+    // the actual cost on a successful buy is read back from the money
+    // delta instead of this estimate, which would otherwise under-report it.
+    double estimatedCost = g->price * qty;
+    double moneyBefore = money_;
     if (!market_.buy(goodId, qty, money_)) {
         result.messageKey = "cant_afford_prefix";
-        result.amount = cost;
+        result.amount = estimatedCost;
         return result;
     }
     result.success = true;
-    result.amount = cost;
+    result.amount = moneyBefore - money_;
     checkAchievements();
     return result;
 }
@@ -1551,11 +1556,16 @@ ActionResult Game::trySellGood(const std::string& goodId, double qty) {
         result.messageKey = "invalid_good_number";
         return result;
     }
-    double revenue = g->price * qty;
+    double moneyBefore = money_;
     if (!market_.sell(goodId, qty, money_)) {
         result.messageKey = "dont_have_that_much_prefix";
         return result;
     }
+    // Actual revenue Market::sell() just paid (post-impact price, see its
+    // comment) -- read back from the money delta rather than recomputed
+    // from g->price, which by now reflects the *post*-trade price, not what
+    // this sale was actually paid at.
+    double revenue = money_ - moneyBefore;
     // Seasonal demand bonus/penalty for a handful of goods (see
     // seasonalGoodSellMultiplier) -- added on top of what Market::sell
     // already paid, so the underlying price random-walk stays untouched.

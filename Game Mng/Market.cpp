@@ -137,25 +137,42 @@ void Market::advance(int steps) {
 bool Market::buy(const std::string& id, double quantity, double& money) {
     Good* g = find(id);
     if (!g || quantity <= 0) return false;
-    double cost = g->price * quantity;
+    // The price impact below must be folded into `cost` itself, not applied
+    // to g->price only *after* charging the pre-impact price -- charging the
+    // old (lower) price and only then pushing the price up let a buy
+    // immediately followed by selling the same quantity back cash out at
+    // the new (higher) price, pocketing the impact as risk-free profit on
+    // every round trip (this is the exact "buy < sell, so just buy-sell
+    // forever" bug reported against this code). Computing the impacted
+    // price first and charging *that* means the trade always pays its own
+    // slippage -- a round trip nets a loss (or a wash for tiny quantities),
+    // never a gain, same as any real market-impact model.
+    double impactedPrice = g->price * (1.0 + kImpactPerUnit * std::sqrt(quantity));
+    double cost = impactedPrice * quantity;
     if (cost > money) return false;
 
     money -= cost;
     g->stock += quantity;
-    g->price *= (1.0 + kImpactPerUnit * std::sqrt(quantity));
+    g->price = impactedPrice;
     return true;
 }
 
 bool Market::sell(const std::string& id, double quantity, double& money) {
     Good* g = find(id);
     if (!g || quantity <= 0 || quantity > g->stock + 1e-9) return false;
-    double revenue = g->price * quantity;
+    // Mirrors buy() above -- sell at the post-impact (lower) price, not the
+    // pre-impact one, so a sell-then-buy-back round trip can't profit off
+    // the same gap. The floor clamp is applied to the impacted price before
+    // revenue is computed from it too (previously the floor only affected
+    // the *next* trade, so a single large sell could still cash out at an
+    // unclamped price one tick before the floor caught it).
+    double floor = g->basePrice * kPriceFloorFrac;
+    double impactedPrice = std::max(floor, g->price * (1.0 - kImpactPerUnit * std::sqrt(quantity)));
+    double revenue = impactedPrice * quantity;
 
     g->stock -= quantity;
     money += revenue;
-    double floor = g->basePrice * kPriceFloorFrac;
-    g->price *= (1.0 - kImpactPerUnit * std::sqrt(quantity));
-    if (g->price < floor) g->price = floor;
+    g->price = impactedPrice;
     return true;
 }
 
