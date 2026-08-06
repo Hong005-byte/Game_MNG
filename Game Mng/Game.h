@@ -83,6 +83,19 @@ struct GenerationRecord {
     std::string cause;
 };
 
+// What happened while the player was away, captured by startSession()'s
+// offline catch-up so a graphical front end (GameWorld's Welcome Back
+// overlay) can show it instead of it only ever going to std::cout, which is
+// invisible once a GUI window covers the console. `elapsedSeconds <= 0`
+// means either this is a brand new save or no real time passed since the
+// last tick (nothing to report).
+struct WelcomeBackInfo {
+    long long elapsedSeconds = 0;
+    std::string elapsedFormatted; // e.g. "2d 3h 15m 42s" -- already formatted, see formatDuration in Game.cpp
+    double idleEarnings = 0.0;
+    std::vector<std::string> eventLog; // same lines printEventLog would otherwise print to std::cout
+};
+
 // A signed price-lock contract: `lockedPrice` was the good's market price at
 // the moment it was signed. Fulfilling it later sells all current stock of
 // that good at `lockedPrice` regardless of where the market price has since
@@ -165,6 +178,11 @@ public:
     // Callers driving their own loop (e.g. a graphical view) call this once
     // up front, then tickBackground() every frame instead of runConsoleLoop().
     void startSession();
+    // Whatever startSession() found on this most recent call (empty/zeroed
+    // if nothing happened -- see WelcomeBackInfo). GameWorld reads this once
+    // right after construction to decide whether to open its Welcome Back
+    // overlay.
+    const WelcomeBackInfo& lastWelcomeBack() const { return lastWelcomeBack_; }
 
     // The classic interactive text menu loop (assumes startSession() already ran).
     void runConsoleLoop();
@@ -210,6 +228,14 @@ public:
     double money() const { return money_; }
     int generation() const { return generation_; }
     double ageYears() const { return life_.ageYears(); }
+    // Whole in-game days lived so far this generation (life_.ageDays starts
+    // at kStartingAgeYears * kDaysPerYear and advances by exactly 1.0 per
+    // trySleep()/tryFastForward()/tickToNow() call worth of a real day --
+    // see Life::advanceReal). Exposed as its own HUD figure since ageYears()
+    // alone (1 decimal place) barely visibly moves for a handful of days,
+    // making a few sleeps look like "nothing happened" even though the
+    // underlying math already advanced correctly.
+    int totalDaysElapsed() const { return static_cast<int>(life_.ageDays); }
     double energy() const { return life_.energy; }
     double hunger() const { return life_.hunger; }
     bool isSick() const { return life_.sick; }
@@ -566,6 +592,7 @@ private:
     std::vector<std::string> pendingAchievementPopups_;
     std::vector<std::string> completedConstructionEvents_;
     long long lastTickEpoch_ = 0;
+    WelcomeBackInfo lastWelcomeBack_; // populated by startSession(), read once by GameWorld -- see lastWelcomeBack()
     std::string deathCause_; // set by simulateElapsed right before it returns true
     int generation_ = 1; // incremented on each death/rebirth; persists across lives
 

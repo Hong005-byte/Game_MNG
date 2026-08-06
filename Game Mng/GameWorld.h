@@ -5,6 +5,7 @@
 #include <vector>
 #include <optional>
 #include <functional>
+#include <unordered_map>
 #include "Game.h"
 #include "Settings.h"
 
@@ -24,7 +25,7 @@ struct WorldBuilding {
 
 // Non-interactive scenery. Trees block movement (obstacles); bushes/patches don't.
 struct Decoration {
-    enum class Kind { Tree, Bush, GrassPatch, Path, Water };
+    enum class Kind { Tree, Bush, GrassPatch, Path, Water, Sand };
     Kind kind;
     sf::Vector2f position;
     sf::Vector2f size; // used by Path/GrassPatch/Water; trees/bushes use position as center
@@ -39,6 +40,7 @@ struct Npc {
     sf::Vector2f pos;
     sf::Vector2f target;
     float wanderTimer = 0.f;
+    bool isWalking = false; // set fresh each frame in updateNpcs -- drives drawNpc's walk bob (see drawPixelPerson)
     sf::Color color;
     std::vector<std::string> linesEn;
     std::vector<std::string> linesZh;
@@ -94,8 +96,20 @@ enum class OverlayKind {
     Chopping,       // lumber (Lumber Camp) -- a different mash-to-target mechanic
     Brewing,        // alchemist or winery -- memorize-then-repeat a color sequence
     Pause,          // opened by Escape from the walking-around world -- "save or keep playing", plus a way into Settings
-    Settings        // volume/resolution/fullscreen/key rebinding -- reached from Pause
+    Settings,       // volume/resolution/fullscreen/key rebinding -- reached from Pause
+    WelcomeBack     // shown once at startup if Game::lastWelcomeBack() has anything to report -- see drawWelcomeBackOverlay
 };
+
+// Market overlay's category filter (see drawMarketOverlay) -- the goods list
+// outgrew a flat 61-entry list, so it's tabbed by production tier (matches
+// BusinessInfo::tier: 1 = raw, 2/3 = processed) plus an "owned" tab for
+// whatever's actually sitting in the warehouse right now.
+enum class MarketFilter { All, Raw, Processed, Owned };
+// Market overlay's sort order for the same list -- cycled by one button
+// (see drawMarketOverlay). Default is registration order (roughly "raw
+// materials first, then each district's chain"), the others are the ones
+// worth sorting a price list by.
+enum class MarketSort { Default, NameAsc, PriceHighLow, PriceLowHigh, StockHighLow, StockLowHigh };
 
 // A clickable rectangle registered by whichever overlay is currently drawn,
 // rebuilt fresh every frame since content (business list length, etc.) can change.
@@ -124,6 +138,8 @@ private:
     std::vector<Zone> zones_;
     int currentZone_ = 0;
     sf::Vector2f playerPos_;
+    bool playerFacingLeft_ = false; // last horizontal move direction -- drawPlayer mirrors the pixel sprite off of this
+    float playerWalkTimer_ = 0.f; // advances only while actually moving -- drives drawPlayer's walk bob (see drawPixelPerson)
     sf::Font font_;
     bool fontLoaded_ = false;
     sf::Vector2u windowSize_{ 1280u, 820u }; // logical resolution -- every drawing coordinate in this file is in this space, regardless of the real window size below
@@ -143,6 +159,10 @@ private:
     // -- empty = grid of every processed good, non-empty = detail view of
     // that one good's recipe. Reset to empty whenever the overlay (re)opens.
     std::string recipeBookSelectedGoodId_;
+    // OverlayKind::WelcomeBack's collapsed/expanded toggle (see
+    // drawWelcomeBackOverlay) -- starts collapsed (just a title banner),
+    // clicking it reveals how long the player was away and what happened.
+    bool welcomeBackExpanded_ = false;
 
     // ---- Timing-bar minigames (see OverlayKind::TimingMinigame /
     // drawTimingMinigameOverlay): an indicator sweeps back and forth over a
@@ -271,6 +291,8 @@ private:
     OverlayKind currentOverlay_ = OverlayKind::None;
     std::vector<ClickRegion> overlayClickRegions_;
     int selectedGoodIndex_ = 0;       // Market overlay: which good is selected for buy/sell
+    MarketFilter marketFilter_ = MarketFilter::All; // Market overlay: which category tab is active
+    MarketSort marketSort_ = MarketSort::Default;   // Market overlay: which sort order is active
     std::string focusedBusinessId_;   // Businesses overlay: which single building was walked up to
     std::string overlayFeedback_;     // transient result text ("Upgraded!", "Not enough cash", ...)
     sf::Color overlayFeedbackColor_ = sf::Color::White;
@@ -325,6 +347,7 @@ private:
     // size so NPCs (see updateNpcs) can reuse the same checks as the player.
     bool collidesWithBuilding(sf::Vector2f pos, float size) const;
     bool collidesWithTree(sf::Vector2f pos, float size) const;
+    bool collidesWithWater(sf::Vector2f pos, float size) const; // water is impassable terrain, same rectangle test as collidesWithBuilding
     sf::FloatRect achievementsButtonBounds() const;
     sf::FloatRect howToPlayButtonBounds() const;
     sf::FloatRect recipeBookButtonBounds() const;
@@ -335,6 +358,53 @@ private:
     // a small color-block icon + name, 3 per row; clicking one switches to a
     // detail view of that good's recipe (see recipeBookSelectedGoodId_).
     void drawRecipeBookOverlay(sf::RenderWindow& window);
+    // Draws one Recipe Book grid cell's icon: the same gold-outlined card
+    // background as before, then either a hand-authored pixel-art picture
+    // (see goodIconDefs() in GameWorld.cpp) for goods common/iconic enough to
+    // be worth drawing by hand, or a generic shaded pixel "crate" tinted from
+    // `accent` (still chunky/pixelated, just not a hand-drawn shape) for
+    // everything else -- either way, no more flat single-color squares.
+    void drawGoodIcon(sf::RenderWindow& window, const std::string& goodId, sf::Vector2f pos, float size, sf::Color accent);
+    // ---- Pixel-art world rendering ----
+    // Batched pixel-grid primitives (one sf::VertexArray draw call each,
+    // rather than one RectangleShape per pixel) used for anything drawn every
+    // frame that there can be several of on screen at once (buildings,
+    // player, NPCs, trees) -- see the "Pixel-art world rendering" block in
+    // GameWorld.cpp for the shared role-char convention (matches the Recipe
+    // Book icons' O/H/B/S/A/D roles, just looked up through an explicit
+    // palette here instead of one derived from a single seed color).
+    void drawPixelSprite(sf::RenderWindow& window, const std::vector<std::string>& rows, sf::FloatRect area,
+        const std::unordered_map<char, sf::Color>& palette, bool flipX = false);
+    // A textured rectangle -- highlight band on top, shadow band on bottom,
+    // sparse darker speckle pixels for grit -- standing in for what used to
+    // be a single flat RectangleShape fill. `seedPos` just needs to be stable
+    // per instance (building position works) so the speckle pattern doesn't
+    // jitter frame to frame; it isn't a screen position transform.
+    void drawPixelPanel(sf::RenderWindow& window, sf::Vector2f pos, sf::Vector2f size, sf::Color baseColor,
+        sf::Color outlineColor, sf::Vector2f seedPos, float pixelSize = 7.f);
+    // Hand pixel-art replacements for what used to be smooth ConvexShape
+    // silhouettes -- Cottage/Workshop-family peaked roofs and the Mine/Gold
+    // Mine rock mound, respectively. Each stretches its fixed pixel pattern
+    // to fill `area`, same convention as drawPixelSprite.
+    void drawPixelRoof(sf::RenderWindow& window, sf::FloatRect area, sf::Color roofColor);
+    void drawPixelMound(sf::RenderWindow& window, sf::FloatRect area, sf::Color rockColor);
+    // A small round shaded pixel blob (wool puff, fruit canopy, herb tuft,
+    // grape cluster, ...) standing in for what used to be a plain smooth
+    // CircleShape dot -- one shared mask, tinted per call.
+    void drawPixelBlob(sf::RenderWindow& window, sf::Vector2f center, float radius, sf::Color baseColor);
+    void drawPlayer(sf::RenderWindow& window, sf::Vector2f pos, bool facingLeft, float walkPhase);
+    // Shared by the player and every Npc -- same pixel-person shape, just a
+    // different shirt color (npc.color, or the player's signature yellow).
+    // `walkPhase` is a radians accumulator that only advances while actually
+    // moving (see playerWalkTimer_/Npc::isWalking) -- 0 holds the "legs
+    // together" standing pose; sin(walkPhase) alternates legs apart/together
+    // and also drives a small vertical bob.
+    void drawPixelPerson(sf::RenderWindow& window, sf::Vector2f pos, sf::Color shirtColor, bool flipX, float walkPhase);
+    // A soft squashed-ellipse shadow under a sprite's feet -- drawn before
+    // the sprite itself. Without this, a flat-shaded pixel cutout (player/
+    // NPC/tree/bush) reads as floating/pasted onto the ground rather than
+    // actually standing on it; this is the cheap fix for that.
+    void drawGroundShadow(sf::RenderWindow& window, sf::Vector2f feetCenter, float radiusX);
 
     void drawZone(sf::RenderWindow& window);
     void drawBuilding(sf::RenderWindow& window, const WorldBuilding& b);
@@ -356,9 +426,23 @@ private:
     // drawAccentGlyph in GameWorld.cpp) so buildings sharing a base shape
     // still read as visually distinct.
     void drawFieldShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor);
+    // Shared boxy shed + lean-to roof (+ optional chimney) that drawWorkshopShape
+    // and all 8 themed shapes below build on top of.
+    void drawWorkshopBody(sf::RenderWindow& window, const WorldBuilding& b, bool alwaysSmokes);
     void drawWorkshopShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor);
     void drawDockShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor);
     void drawServiceHallShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor);
+    // 8 themed sub-archetypes carved out of what used to be one generic
+    // Workshop shape for all 33 remaining processors (see isOvenId etc. in
+    // GameWorld.cpp) -- grouped by what the business actually makes.
+    void drawOvenShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor);
+    void drawStallShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor);
+    void drawForgeShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor);
+    void drawSawmillShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor);
+    void drawFiberShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor);
+    void drawMasonGemShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor);
+    void drawBreweryShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor);
+    void drawSmokehouseShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor);
     void drawAccentGlyph(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color color);
     void drawTree(sf::RenderWindow& window, sf::Vector2f pos);
     void drawBush(sf::RenderWindow& window, sf::Vector2f pos);
@@ -427,6 +511,19 @@ private:
         std::function<void()> onClick, bool enabled = true);
     void uiText(sf::RenderWindow& window, sf::Vector2f pos, const std::string& text, unsigned int size,
         sf::Color color = sf::Color::White, bool bold = false);
+    // Hard-crops subsequent drawing to `region` (same logical windowSize_
+    // coordinate space as every draw call in this file) by installing a view
+    // whose viewport is the matching sub-rectangle of gameView_'s own
+    // viewport. Every scrollable list/grid (Achievements, Market, Staff's
+    // focus grid, Tree, How to Play, Recipe Book, Warehouse) wraps its rows
+    // in beginClip/endClip now, so a row that's only half-scrolled into view
+    // gets cut off at the panel edge instead of drawing past it -- previously
+    // those loops only skipped rows that were *fully* out of view, so a
+    // partially visible one still drew its whole background block outside
+    // the panel bounds while scrolling. Always pair with endClip, including
+    // on early-return paths, or every later draw call stays clipped/offset.
+    void beginClip(sf::RenderWindow& window, sf::FloatRect region);
+    void endClip(sf::RenderWindow& window);
     // Substitutes {MOVE}/{E}/{U}/{M}/{F} placeholders in help text (hud_help/
     // tutorial_body/howtoplay_body) with whatever settings_.keys actually
     // binds right now, so rebinding a key doesn't leave the on-screen
@@ -451,6 +548,7 @@ private:
     void drawContractsOverlay(sf::RenderWindow& window);
     void drawPauseOverlay(sf::RenderWindow& window);
     void drawSettingsOverlay(sf::RenderWindow& window);
+    void drawWelcomeBackOverlay(sf::RenderWindow& window);
     void drawHowToPlayOverlay(sf::RenderWindow& window);
     void drawCropPickerOverlay(sf::RenderWindow& window);
     void drawTimingMinigameOverlay(sf::RenderWindow& window);

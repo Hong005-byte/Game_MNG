@@ -1941,6 +1941,7 @@ void Game::run() {
 
 void Game::startSession() {
     load();
+    lastWelcomeBack_ = WelcomeBackInfo{}; // reset -- a fresh/just-loaded session with nothing to report yet
 
     long long now = nowEpoch();
     long long elapsed = std::max<long long>(0, now - lastTickEpoch_);
@@ -1951,6 +1952,13 @@ void Game::startSession() {
         std::cout << Localization::t("welcome_back_prefix") << formatDuration(elapsed) << Localization::t("welcome_back_suffix");
         std::cout << Localization::t("idle_earnings_prefix") << formatNumber(money_ - moneyBefore) << "\n";
         printEventLog(log);
+        // Same information, captured for GameWorld's Welcome Back overlay --
+        // std::cout above is invisible once the SFML window covers the
+        // console, so the graphical front end needs its own copy of this.
+        lastWelcomeBack_.elapsedSeconds = elapsed;
+        lastWelcomeBack_.elapsedFormatted = formatDuration(elapsed);
+        lastWelcomeBack_.idleEarnings = money_ - moneyBefore;
+        lastWelcomeBack_.eventLog = log;
         if (died) handleDeath();
         else lastTickEpoch_ = now;
     } else {

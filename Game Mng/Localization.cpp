@@ -43,6 +43,8 @@ namespace {
         { "hud_generation", { "Generation", "世代" } },
         { "hud_cash",       { "Cash", "现金" } },
         { "hud_age",        { "Age", "年龄" } },
+        { "hud_day_prefix", { "Day ", "第" } },
+        { "hud_day_suffix", { "", "天" } },
         { "hud_years",      { "yrs", "岁" } },
         { "hud_season_prefix", { "Season: ", "季节: " } },
         { "season_spring",  { "Spring", "春季" } },
@@ -689,6 +691,14 @@ namespace {
         { "welcome_back_prefix",  { "Welcome back! You were away for ", "欢迎回来!你离开了 " } },
         { "welcome_back_suffix",  { ".\n", "。\n" } },
         { "idle_earnings_prefix", { "Idle earnings: $", "挂机收入: $" } },
+
+        // In-window Welcome Back overlay (see GameWorld::drawWelcomeBackOverlay) --
+        // the graphical counterpart to the console welcome_back_prefix lines
+        // above, which are invisible once the SFML window covers the console.
+        { "welcomeback_title",        { "Welcome Back!", "欢迎回来!" } },
+        { "welcomeback_hint",         { "Click to see what happened while you were away", "点击查看你离开期间发生了什么" } },
+        { "welcomeback_away_prefix",  { "You were away for ", "你离开了 " } },
+        { "welcomeback_nothing_happened", { "Nothing eventful happened.", "没有发生什么特别的事。" } },
         { "saved",                { "Saved.\n", "已保存。\n" } },
         { "input_closed",         { "\nInput closed, saving and exiting.\n", "\n输入已关闭,正在保存并退出。\n" } },
         { "please_enter_number",  { "Please enter a number.\n", "请输入一个数字。\n" } },
@@ -710,6 +720,20 @@ namespace {
         { "cash_label",   { "$ (cash)", "$ (现金)" } },
         { "tree_header",  { "Production Tree (indented items unlock once their parent is built)", "产业树(缩进项目会在其上级建成后解锁)" } },
         { "scroll_hint",  { "Scroll with the mouse wheel", "用鼠标滚轮滚动查看" } },
+
+        // Market overlay filter/sort bar (see drawMarketOverlay/MarketFilter/MarketSort)
+        { "market_filter_all",       { "All", "全部" } },
+        { "market_filter_raw",       { "Raw Materials", "原材料" } },
+        { "market_filter_processed", { "Processed", "加工品" } },
+        { "market_filter_owned",     { "In Stock", "已持有" } },
+        { "market_sort_prefix",      { "Sort: ", "排序: " } },
+        { "market_sort_default",     { "Default", "默认" } },
+        { "market_sort_name",        { "Name A-Z", "名称 A-Z" } },
+        { "market_sort_price_desc",  { "Price High-Low", "价格 高-低" } },
+        { "market_sort_price_asc",   { "Price Low-High", "价格 低-高" } },
+        { "market_sort_stock_desc",  { "Quantity High-Low", "数量 高-低" } },
+        { "market_sort_stock_asc",   { "Quantity Low-High", "数量 低-高" } },
+        { "market_filter_empty_hint", { "No goods match this filter.", "没有符合此筛选条件的商品。" } },
         { "rate_note",    { "* base rate per level -- actual output also includes Staff/Worker/Season bonuses",
                              "* 未加成的基础值——实际产出还会包含员工处/雇工/季节加成" } },
         { "tree_level_prefix", { "Lv.", "等级" } },
