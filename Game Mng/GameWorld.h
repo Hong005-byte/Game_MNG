@@ -24,11 +24,14 @@ struct WorldBuilding {
 };
 
 // Non-interactive scenery. Trees block movement (obstacles); bushes/patches don't.
+// Lamp is a freestanding street lamp -- purely cosmetic like Bush, doesn't
+// block movement (its post is thin enough that colliding with it would feel
+// unfair given how many now line the paths).
 struct Decoration {
-    enum class Kind { Tree, Bush, GrassPatch, Path, Water, Sand };
+    enum class Kind { Tree, Bush, GrassPatch, Path, Water, Sand, Lamp };
     Kind kind;
     sf::Vector2f position;
-    sf::Vector2f size; // used by Path/GrassPatch/Water; trees/bushes use position as center
+    sf::Vector2f size; // used by Path/GrassPatch/Water; trees/bushes/lamps use position as center
 };
 
 // A wandering villager with a few localized dialogue lines, and occasionally
@@ -390,24 +393,24 @@ private:
     // Book icons' O/H/B/S/A/D roles, just looked up through an explicit
     // palette here instead of one derived from a single seed color).
     void drawPixelSprite(sf::RenderWindow& window, const std::vector<std::string>& rows, sf::FloatRect area,
-        const std::unordered_map<char, sf::Color>& palette, bool flipX = false);
+        const std::unordered_map<char, sf::Color>& palette, bool flipX = false, const sf::RenderStates& states = sf::RenderStates::Default);
     // A textured rectangle -- highlight band on top, shadow band on bottom,
     // sparse darker speckle pixels for grit -- standing in for what used to
     // be a single flat RectangleShape fill. `seedPos` just needs to be stable
     // per instance (building position works) so the speckle pattern doesn't
     // jitter frame to frame; it isn't a screen position transform.
     void drawPixelPanel(sf::RenderWindow& window, sf::Vector2f pos, sf::Vector2f size, sf::Color baseColor,
-        sf::Color outlineColor, sf::Vector2f seedPos, float pixelSize = 7.f);
+        sf::Color outlineColor, sf::Vector2f seedPos, float pixelSize = 4.5f, const sf::RenderStates& states = sf::RenderStates::Default);
     // Hand pixel-art replacements for what used to be smooth ConvexShape
     // silhouettes -- Cottage/Workshop-family peaked roofs and the Mine/Gold
     // Mine rock mound, respectively. Each stretches its fixed pixel pattern
     // to fill `area`, same convention as drawPixelSprite.
-    void drawPixelRoof(sf::RenderWindow& window, sf::FloatRect area, sf::Color roofColor);
-    void drawPixelMound(sf::RenderWindow& window, sf::FloatRect area, sf::Color rockColor);
+    void drawPixelRoof(sf::RenderWindow& window, sf::FloatRect area, sf::Color roofColor, const sf::RenderStates& states = sf::RenderStates::Default);
+    void drawPixelMound(sf::RenderWindow& window, sf::FloatRect area, sf::Color rockColor, const sf::RenderStates& states = sf::RenderStates::Default);
     // A small round shaded pixel blob (wool puff, fruit canopy, herb tuft,
     // grape cluster, ...) standing in for what used to be a plain smooth
     // CircleShape dot -- one shared mask, tinted per call.
-    void drawPixelBlob(sf::RenderWindow& window, sf::Vector2f center, float radius, sf::Color baseColor);
+    void drawPixelBlob(sf::RenderWindow& window, sf::Vector2f center, float radius, sf::Color baseColor, const sf::RenderStates& states = sf::RenderStates::Default);
     void drawPlayer(sf::RenderWindow& window, sf::Vector2f pos, bool facingLeft, float walkPhase);
     // Shared by the player and every Npc -- same pixel-person shape, just a
     // different shirt color (npc.color, or the player's signature yellow).
@@ -415,55 +418,104 @@ private:
     // moving (see playerWalkTimer_/Npc::isWalking) -- 0 holds the "legs
     // together" standing pose; sin(walkPhase) alternates legs apart/together
     // and also drives a small vertical bob.
-    void drawPixelPerson(sf::RenderWindow& window, sf::Vector2f pos, sf::Color shirtColor, bool flipX, float walkPhase);
+    void drawPixelPerson(sf::RenderWindow& window, sf::Vector2f pos, sf::Color shirtColor, bool flipX, float walkPhase, const sf::RenderStates& states = sf::RenderStates::Default);
     // A soft squashed-ellipse shadow under a sprite's feet -- drawn before
     // the sprite itself. Without this, a flat-shaded pixel cutout (player/
     // NPC/tree/bush) reads as floating/pasted onto the ground rather than
     // actually standing on it; this is the cheap fix for that.
-    void drawGroundShadow(sf::RenderWindow& window, sf::Vector2f feetCenter, float radiusX);
+    void drawGroundShadow(sf::RenderWindow& window, sf::Vector2f feetCenter, float radiusX, const sf::RenderStates& states = sf::RenderStates::Default);
+    // Cheap stand-in for a real bloom pass (this codebase has no shader/
+    // RenderTexture pipeline) -- 3 concentric circles fading outward from
+    // `color`'s own alpha, layered around an already-drawn emissive element
+    // (a lit window, an oven mouth, a forge's furnace glow). `radius` is the
+    // reference "core" size the rings scale from.
+    void drawGlow(sf::RenderWindow& window, sf::Vector2f center, float radius, sf::Color color, const sf::RenderStates& states = sf::RenderStates::Default);
+
+    // ---- "Building shell" kit (2026-08-07 detail pass) -- higher-detail,
+    // fully procedural (not hand-typed ASCII grids, so there's no risk of a
+    // silhouette typo) replacements for the flat single-tone wall/roof/
+    // window/door a building used to be built from. Reused across every
+    // building archetype the same way a real tileset/asset-pack kit would
+    // be -- each call site still varies color/size/count per building, so
+    // buildings stay visually distinct without each one needing its own
+    // hand-authored art.
+    // Plaster wall with a timber cross-beam frame (vertical studs + top/
+    // bottom rails) over it -- replaces a flat drawPixelPanel fill for any
+    // building wall that should read as half-timbered construction.
+    void drawTimberWall(sf::RenderWindow& window, sf::Vector2f pos, sf::Vector2f size, sf::Color plasterColor,
+        sf::Color beamColor, sf::Vector2f seedPos, const sf::RenderStates& states = sf::RenderStates::Default);
+    // A peaked gable roof, silhouette computed from `area` (not a fixed
+    // stretched ASCII pattern like the old drawPixelRoof) with individual
+    // shaded/coursed shingle texture instead of 3 flat bands.
+    void drawGableRoof(sf::RenderWindow& window, sf::FloatRect area, sf::Color roofColor, sf::Vector2f seedPos,
+        const sf::RenderStates& states = sf::RenderStates::Default);
+    // Same shingle-coursing texture as drawGableRoof but as a plain
+    // rectangle band, for a lean-to/fascia roof instead of a full gable.
+    void drawLeanToRoof(sf::RenderWindow& window, sf::Vector2f pos, sf::Vector2f size, sf::Color roofColor,
+        sf::Vector2f seedPos, const sf::RenderStates& states = sf::RenderStates::Default);
+    // A proper multi-pane window -- dark frame, glass, cross mullion, and a
+    // corner glint -- replacing a single flat-colored rectangle.
+    void drawPaneWindow(sf::RenderWindow& window, sf::Vector2f pos, sf::Vector2f size,
+        const sf::RenderStates& states = sf::RenderStates::Default);
+    // A stone foundation trim band -- individually toned/outlined blocks,
+    // for the base of a building wall to sit on.
+    void drawStoneTrim(sf::RenderWindow& window, sf::Vector2f pos, sf::Vector2f size, sf::Vector2f seedPos,
+        const sf::RenderStates& states = sf::RenderStates::Default);
+    // A paneled door with a handle, replacing a flat rectangle.
+    void drawPaneledDoor(sf::RenderWindow& window, sf::Vector2f pos, sf::Vector2f size, sf::Color doorColor,
+        const sf::RenderStates& states = sf::RenderStates::Default);
+    // A small window-box planter with a few flower blobs (reuses
+    // drawPixelBlob) -- purely a decorative accent under a window.
+    void drawFlowerBox(sf::RenderWindow& window, sf::Vector2f pos, sf::Vector2f size, sf::Vector2f seedPos,
+        const sf::RenderStates& states = sf::RenderStates::Default);
 
     void drawZone(sf::RenderWindow& window);
-    void drawBuilding(sf::RenderWindow& window, const WorldBuilding& b);
-    void drawCottageShape(sf::RenderWindow& window, const WorldBuilding& b);
-    void drawFarmShape(sf::RenderWindow& window, const WorldBuilding& b);
-    void drawMineShape(sf::RenderWindow& window, const WorldBuilding& b);
-    void drawLumberShape(sf::RenderWindow& window, const WorldBuilding& b);
-    void drawQuarryShape(sf::RenderWindow& window, const WorldBuilding& b);
+    void drawBuilding(sf::RenderWindow& window, const WorldBuilding& b, const sf::RenderStates& states = sf::RenderStates::Default);
+    void drawCottageShape(sf::RenderWindow& window, const WorldBuilding& b, const sf::RenderStates& states = sf::RenderStates::Default);
+    void drawFarmShape(sf::RenderWindow& window, const WorldBuilding& b, const sf::RenderStates& states = sf::RenderStates::Default);
+    void drawMineShape(sf::RenderWindow& window, const WorldBuilding& b, const sf::RenderStates& states = sf::RenderStates::Default);
+    void drawLumberShape(sf::RenderWindow& window, const WorldBuilding& b, const sf::RenderStates& states = sf::RenderStates::Default);
+    void drawQuarryShape(sf::RenderWindow& window, const WorldBuilding& b, const sf::RenderStates& states = sf::RenderStates::Default);
     // Dedicated shapes for the other single-building tier-1 producers that
     // (like the farm/mine/lumber/quarry above) are common/important enough
     // to earn their own look rather than sharing an archetype.
-    void drawPastureShape(sf::RenderWindow& window, const WorldBuilding& b);    // sheep
-    void drawOrchardShape(sf::RenderWindow& window, const WorldBuilding& b);    // orchard
-    void drawHerbGardenShape(sf::RenderWindow& window, const WorldBuilding& b); // herbgarden
-    void drawVineyardShape(sf::RenderWindow& window, const WorldBuilding& b);   // vineyard
-    void drawGoldMineShape(sf::RenderWindow& window, const WorldBuilding& b);   // goldmine
+    void drawPastureShape(sf::RenderWindow& window, const WorldBuilding& b, const sf::RenderStates& states = sf::RenderStates::Default);    // sheep
+    void drawOrchardShape(sf::RenderWindow& window, const WorldBuilding& b, const sf::RenderStates& states = sf::RenderStates::Default);    // orchard
+    void drawHerbGardenShape(sf::RenderWindow& window, const WorldBuilding& b, const sf::RenderStates& states = sf::RenderStates::Default); // herbgarden
+    void drawVineyardShape(sf::RenderWindow& window, const WorldBuilding& b, const sf::RenderStates& states = sf::RenderStates::Default);   // vineyard
+    void drawGoldMineShape(sf::RenderWindow& window, const WorldBuilding& b, const sf::RenderStates& states = sf::RenderStates::Default);   // goldmine
     // Reusable archetypes shared by many building ids, each taking a small
     // "accent glyph" kind + color (see the Accent constants and
     // drawAccentGlyph in GameWorld.cpp) so buildings sharing a base shape
     // still read as visually distinct.
-    void drawFieldShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor);
+    void drawFieldShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor, const sf::RenderStates& states = sf::RenderStates::Default);
     // Shared boxy shed + lean-to roof (+ optional chimney) that drawWorkshopShape
     // and all 8 themed shapes below build on top of.
-    void drawWorkshopBody(sf::RenderWindow& window, const WorldBuilding& b, bool alwaysSmokes);
-    void drawWorkshopShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor);
-    void drawDockShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor);
-    void drawServiceHallShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor);
+    void drawWorkshopBody(sf::RenderWindow& window, const WorldBuilding& b, bool alwaysSmokes, const sf::RenderStates& states = sf::RenderStates::Default);
+    void drawWorkshopShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor, const sf::RenderStates& states = sf::RenderStates::Default);
+    void drawDockShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor, const sf::RenderStates& states = sf::RenderStates::Default);
+    void drawServiceHallShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor, const sf::RenderStates& states = sf::RenderStates::Default);
     // 8 themed sub-archetypes carved out of what used to be one generic
     // Workshop shape for all 33 remaining processors (see isOvenId etc. in
     // GameWorld.cpp) -- grouped by what the business actually makes.
-    void drawOvenShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor);
-    void drawStallShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor);
-    void drawForgeShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor);
-    void drawSawmillShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor);
-    void drawFiberShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor);
-    void drawMasonGemShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor);
-    void drawBreweryShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor);
-    void drawSmokehouseShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor);
-    void drawAccentGlyph(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color color);
-    void drawTree(sf::RenderWindow& window, sf::Vector2f pos);
-    void drawBush(sf::RenderWindow& window, sf::Vector2f pos);
-    void drawNpc(sf::RenderWindow& window, const Npc& npc);
-    void drawLockOverlay(sf::RenderWindow& window, const WorldBuilding& b);
+    void drawOvenShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor, const sf::RenderStates& states = sf::RenderStates::Default);
+    void drawStallShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor, const sf::RenderStates& states = sf::RenderStates::Default);
+    void drawForgeShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor, const sf::RenderStates& states = sf::RenderStates::Default);
+    void drawSawmillShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor, const sf::RenderStates& states = sf::RenderStates::Default);
+    void drawFiberShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor, const sf::RenderStates& states = sf::RenderStates::Default);
+    void drawMasonGemShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor, const sf::RenderStates& states = sf::RenderStates::Default);
+    void drawBreweryShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor, const sf::RenderStates& states = sf::RenderStates::Default);
+    void drawSmokehouseShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor, const sf::RenderStates& states = sf::RenderStates::Default);
+    void drawAccentGlyph(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color color, const sf::RenderStates& states = sf::RenderStates::Default);
+    void drawTree(sf::RenderWindow& window, sf::Vector2f pos, const sf::RenderStates& states = sf::RenderStates::Default);
+    void drawBush(sf::RenderWindow& window, sf::Vector2f pos, const sf::RenderStates& states = sf::RenderStates::Default);
+    // A freestanding pole + lantern head -- glass panel and drawGlow halo
+    // both scale with nightFactor() so it reads as "off" (a plain dark
+    // lantern) by day and lit at night, same idea as the cottage window/oven/
+    // forge glows but starting from near-zero instead of already-lit.
+    void drawLamp(sf::RenderWindow& window, sf::Vector2f pos, const sf::RenderStates& states = sf::RenderStates::Default);
+    void drawNpc(sf::RenderWindow& window, const Npc& npc, const sf::RenderStates& states = sf::RenderStates::Default);
+    void drawLockOverlay(sf::RenderWindow& window, const WorldBuilding& b, const sf::RenderStates& states = sf::RenderStates::Default);
     // First-build construction (see Business::constructionDaysRemaining /
     // Game::ConstructionInfo): drawn instead of the building's normal shape
     // while level == 0 and requiresConstruction() is true -- an unstarted
@@ -471,8 +523,8 @@ private:
     // scaffolding/progress-bar site. Neither applies to the 4 free starters
     // or to a prerequisite-locked building (that still just gets
     // drawLockOverlay on top of its full shape, unchanged).
-    void drawEmptyPlotShape(sf::RenderWindow& window, const WorldBuilding& b, const ConstructionInfo& ci);
-    void drawConstructionSiteShape(sf::RenderWindow& window, const WorldBuilding& b, const ConstructionInfo& ci);
+    void drawEmptyPlotShape(sf::RenderWindow& window, const WorldBuilding& b, const ConstructionInfo& ci, const sf::RenderStates& states = sf::RenderStates::Default);
+    void drawConstructionSiteShape(sf::RenderWindow& window, const WorldBuilding& b, const ConstructionInfo& ci, const sf::RenderStates& states = sf::RenderStates::Default);
     void drawLegend(sf::RenderWindow& window);
     void drawMinimap(sf::RenderWindow& window);
     void drawHud(sf::RenderWindow& window);
@@ -487,11 +539,29 @@ private:
     void updateDayNightAndWeather(float dt);
     sf::Color dayNightTint() const;
     sf::Color seasonTint() const; // subtle per-season wash, layered under the day/night tint
+    // 0 at midday, ramping up through dusk to 1 at full night, back down
+    // through dawn -- same dayNightTimer_/kDayNightCycleSeconds keyframe
+    // interpolation dayNightTint() already does, just returning a plain
+    // brightness scalar instead of a tint color. Used to make lit windows/
+    // ovens/forges and lamp posts actually glow brighter after dark instead
+    // of shining at the same flat intensity around the clock.
+    float nightFactor() const;
     void drawDayNightOverlay(sf::RenderWindow& window);
     void drawWeather(sf::RenderWindow& window);
     // Always-on per-season ambience (snow/leaves/petals/heat haze) -- distinct
     // from drawWeather's occasional rain/snow event above.
     void drawSeasonalAmbient(sf::RenderWindow& window);
+    // Warm, season/weather-independent drifting light dust -- same
+    // deterministic index+timer trick as drawSeasonalAmbient's particles,
+    // just always the same warm color instead of swapping per season.
+    void drawLightMotes(sf::RenderWindow& window);
+    // Soft dark bands top/bottom of the screen -- a cheap stand-in for the
+    // tilt-shift "miniature diorama" edge blur real HD-2D games use (no blur
+    // shader in this codebase -- see drawGlow's comment for the same
+    // reasoning). Screen-space, part of the same "world atmosphere" batch as
+    // drawDayNightOverlay/drawWeather/drawSeasonalAmbient -- drawn before the
+    // HUD/legend/minimap/overlays, which stay fully readable regardless.
+    void drawVignette(sf::RenderWindow& window);
     // Ticks seasonTransitionTimer_ (called every frame, even while an overlay
     // has paused the world) and draws the sweeping color-block wipe while active.
     void updateSeasonTransition(float dt);
@@ -549,6 +619,16 @@ private:
     // on early-return paths, or every later draw call stays clipped/offset.
     void beginClip(sf::RenderWindow& window, sf::FloatRect region);
     void endClip(sf::RenderWindow& window);
+    // The oblique "diorama" world camera (see kObliqueVerticalScale/
+    // kObliqueShearX in GameWorld.cpp): a shear+compress sf::Transform,
+    // pivoted around the center of the fixed windowSize_ logical canvas so
+    // the room stays centered instead of drifting off-screen. sf::View can't
+    // express a shear, so this is applied per-draw-call via sf::RenderStates
+    // to every world-content draw (drawZone/drawPlayer and everything they
+    // call) rather than to gameView_ -- UI overlays (beginClip/endClip),
+    // the minimap, HUD, and screen-space weather/day-night overlays never
+    // see this and stay exactly as before.
+    sf::Transform worldObliqueTransform() const;
     // Substitutes {MOVE}/{E}/{U}/{M}/{F} placeholders in help text (hud_help/
     // tutorial_body/howtoplay_body) with whatever settings_.keys actually
     // binds right now, so rebinding a key doesn't leave the on-screen
@@ -618,5 +698,5 @@ private:
     // timer has elapsed. Collection itself happens inline in the E-key
     // handler (mirrors how NPC talk / building interact already work).
     void updateForaging(float dt);
-    void drawForageable(sf::RenderWindow& window, const Forageable& f);
+    void drawForageable(sf::RenderWindow& window, const Forageable& f, const sf::RenderStates& states = sf::RenderStates::Default);
 };

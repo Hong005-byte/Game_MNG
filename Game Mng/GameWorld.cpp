@@ -47,6 +47,39 @@ namespace {
     }
     constexpr float kTreeRadius = 16.f;
     constexpr float kEdgeMargin = 24.f; // how far from the entry edge a player lands after a zone transition
+
+    // ---- Oblique "diorama" world camera (see GameWorld::worldObliqueTransform) ----
+    // SFML's sf::View is translate/rotate/zoom/viewport only -- it cannot
+    // express a shear, so a tilted-camera look would be applied per-draw-call
+    // via an sf::RenderStates transform (see the "Pixel-art world rendering"
+    // block below), never touching gameView_ itself. Tried at
+    // kObliqueVerticalScale=0.78/kObliqueShearX=-0.22 -- the flat "cabinet
+    // projection" shear (no true vanishing-point perspective, since
+    // sf::Transform is affine-only) didn't read as the Octopath-style depth
+    // the user was after, just squashed. Reverted to identity (no visual
+    // change) rather than ripping the infrastructure out -- the Y-sorted
+    // draw order and inverse-transform click-fix it motivated are worth
+    // keeping regardless (they're real fixes: the player can correctly walk
+    // in front of/behind a tree or building now, which never worked before).
+    // Effort is redirected to a lighting/atmosphere pass instead (warm color
+    // grading, soft glows, directional shadows) -- see the season-ambient
+    // particle block and drawDayNightOverlay for the existing screen-space
+    // overlay technique that pass will extend.
+    constexpr float kObliqueVerticalScale = 1.0f;
+    constexpr float kObliqueShearX = 0.0f;
+
+    // ---- Warm lighting/atmosphere pass (see drawGroundShadow's directional
+    // offset, drawGlow, drawLightMotes, drawVignette, and the warm grade in
+    // drawDayNightOverlay) -- all cheap layered-shape tricks, no shaders.
+    // One shared "sun" direction so every directional shadow in the game
+    // leans the same way, like a single light source. Roughly unit length;
+    // doesn't need to be exact for a flat offset like this.
+    constexpr sf::Vector2f kLightDirection(0.55f, 0.83f); // shadows point this way -- light comes from the upper-left
+    // Was 9 -- fine for a 100px+ building, but for a 16-26px tree/bush/person
+    // it shifted the shadow further than the sprite's own radius, so the
+    // shadow read as a separate blob near the object instead of attached to
+    // it (part of what made trees look "floating" -- reported 2026-08-06).
+    constexpr float kShadowOffsetDistance = 4.f;           // world pixels a shadow shifts off-center
     constexpr float kHistorySampleInterval = 2.f; // seconds between net-worth sparkline samples
     constexpr size_t kMaxHistorySamples = 150;     // 2s * 150 = 5 minutes of visible history
     constexpr float kDayNightCycleSeconds = 180.f; // one full day/night cycle every 3 real minutes
@@ -792,6 +825,76 @@ void GameWorld::buildZones() {
     auto addBush = [](Zone& z, sf::Vector2f pos) {
         z.decorations.push_back(Decoration{ Decoration::Kind::Bush, pos, {} });
     };
+    // Freestanding street lamp -- see drawLamp. `pos` is the base (where its
+    // ground shadow lands), matching the addTree/addBush "position is the
+    // object's own anchor" convention. Declared up here (rather than by the
+    // other decoration-adders below) so scatterLamps can capture it.
+    auto addLamp = [](Zone& z, sf::Vector2f pos) {
+        z.decorations.push_back(Decoration{ Decoration::Kind::Lamp, pos, {} });
+    };
+    // Scatters `count` extra standalone trees across the open interior of a
+    // zone, on top of the hand-placed border wall + anchor trees each zone
+    // already has -- those alone were only 2 trees anyone actually walks
+    // past day to day, which read as too sparse (reported 2026-08-06).
+    // Rejection-sampled against buildings (with padding so a tree can't
+    // block a doorway or spawn on top of one), water/path tiles, and other
+    // trees (minimum spacing) -- unlike addBush's plain random scatter,
+    // trees collide with the player (see collidesWithTree) so a blind
+    // scatter risked sealing off a building or a walking lane.
+    auto scatterTrees = [&addTree](Zone& z, int count, float minX, float maxX, float minY, float maxY) {
+        constexpr float kBuildingPad = 44.f;
+        constexpr float kMinTreeSpacing = 64.f;
+        for (int i = 0; i < count; ++i) {
+            for (int attempt = 0; attempt < 24; ++attempt) {
+                sf::Vector2f candidate(randRange(minX, maxX), randRange(minY, maxY));
+                bool blocked = false;
+                for (const auto& b : z.buildings) {
+                    sf::FloatRect padded(b.position - sf::Vector2f(kBuildingPad, kBuildingPad),
+                        b.size + sf::Vector2f(kBuildingPad * 2.f, kBuildingPad * 2.f));
+                    if (padded.contains(candidate)) { blocked = true; break; }
+                }
+                if (!blocked) {
+                    for (const auto& d : z.decorations) {
+                        if (d.kind == Decoration::Kind::Water || d.kind == Decoration::Kind::Path
+                            || d.kind == Decoration::Kind::Sand) {
+                            sf::FloatRect padded(d.position - sf::Vector2f(20.f, 20.f), d.size + sf::Vector2f(40.f, 40.f));
+                            if (padded.contains(candidate)) { blocked = true; break; }
+                        } else if (d.kind == Decoration::Kind::Tree) {
+                            sf::Vector2f diff = candidate - d.position;
+                            if (diff.x * diff.x + diff.y * diff.y < kMinTreeSpacing * kMinTreeSpacing) { blocked = true; break; }
+                        }
+                    }
+                }
+                if (!blocked) { addTree(z, candidate); break; }
+            }
+        }
+    };
+    // A handful of street lamps per zone, same rejection-sampling idea as
+    // scatterTrees but against a smaller building pad (lamps don't block
+    // movement, they just shouldn't visually sit on top of a wall) and no
+    // tree-spacing requirement -- a lamp near a tree is fine.
+    auto scatterLamps = [&addLamp](Zone& z, int count, float minX, float maxX, float minY, float maxY) {
+        constexpr float kBuildingPad = 26.f;
+        for (int i = 0; i < count; ++i) {
+            for (int attempt = 0; attempt < 24; ++attempt) {
+                sf::Vector2f candidate(randRange(minX, maxX), randRange(minY, maxY));
+                bool blocked = false;
+                for (const auto& b : z.buildings) {
+                    sf::FloatRect padded(b.position - sf::Vector2f(kBuildingPad, kBuildingPad),
+                        b.size + sf::Vector2f(kBuildingPad * 2.f, kBuildingPad * 2.f));
+                    if (padded.contains(candidate)) { blocked = true; break; }
+                }
+                if (!blocked) {
+                    for (const auto& d : z.decorations) {
+                        if (d.kind != Decoration::Kind::Water && d.kind != Decoration::Kind::Sand) continue;
+                        sf::FloatRect padded(d.position - sf::Vector2f(16.f, 16.f), d.size + sf::Vector2f(32.f, 32.f));
+                        if (padded.contains(candidate)) { blocked = true; break; }
+                    }
+                }
+                if (!blocked) { addLamp(z, candidate); break; }
+            }
+        }
+    };
     auto addPatch = [](Zone& z, sf::Vector2f pos, sf::Vector2f size) {
         z.decorations.push_back(Decoration{ Decoration::Kind::GrassPatch, pos, size });
     };
@@ -843,7 +946,13 @@ void GameWorld::buildZones() {
         addBuilding(z, "bank",       { 220.f, 610.f }, kService, bSize);
         addBuilding(z, "warehouse",  { 950.f, 610.f }, kService, bSize);
 
-        addPath(z, { 600.f, 40.f }, { 40.f, 740.f }); // north-south spine (toward Mining District)
+        // North-south spine sits at x:700-740 rather than dead center
+        // (600-640) -- centered would run straight through market/eat/
+        // townhall's shared x-range (500-695), which is exactly the "houses
+        // built on top of the road" look reported 2026-08-06. This x clears
+        // every building in the zone while still landing inside the north/
+        // south tree-wall gap (540-780) below.
+        addPath(z, { 700.f, 40.f }, { 40.f, 740.f }); // north-south spine (toward Mining District)
         addPath(z, { 0.f, 390.f }, { 1280.f, 40.f }); // east-west spine (toward Farmlands / Valley District)
 
         for (float x = 20.f; x < 1260.f; x += 70.f) {
@@ -857,6 +966,8 @@ void GameWorld::buildZones() {
             if (!gapRange) addTree(z, { 1260.f, y }); // east wall, gap -> Farmlands
         }
         for (int i = 0; i < 10; ++i) addBush(z, { randRange(120.f, 1160.f), randRange(120.f, 760.f) });
+        scatterTrees(z, 9, 120.f, 1160.f, 120.f, 760.f);
+        scatterLamps(z, 4, 120.f, 1160.f, 120.f, 760.f);
         for (int i = 0; i < 14; ++i) addPatch(z, { randRange(0.f, 1260.f), randRange(0.f, 800.f) }, { 46.f, 30.f });
 
         addNpc(z, "npc_merchant", { 430.f, 360.f }, sf::Color(210, 80, 80),
@@ -914,7 +1025,10 @@ void GameWorld::buildZones() {
         addBuilding(z, "textile", { 850.f, 480.f }, kTier2, bSize);
 
         addPath(z, { 0.f, 390.f }, { 1280.f, 40.f });
-        addPath(z, { 590.f, 40.f }, { 40.f, 740.f });
+        // x:720-760 threads the gap between the farm/sheep column (610-720)
+        // and the bakery/textile column (850-960) instead of running
+        // straight through farm/sheep like the old dead-center spine did.
+        addPath(z, { 720.f, 40.f }, { 40.f, 740.f });
 
         for (float x = 20.f; x < 1260.f; x += 70.f) {
             addTree(z, { x, 15.f });
@@ -926,7 +1040,16 @@ void GameWorld::buildZones() {
             addTree(z, { 15.f, y });
             addTree(z, { 1260.f, y });
         }
+        // A couple of standalone trees in the open ground flanking the
+        // building rows -- unlike the border wall above (which is purely a
+        // map edge), these read as actual scenery near the buildings. Picked
+        // to clear the building footprints, the path spines, and every
+        // NPC's ~50px wander box around its home position.
+        addTree(z, { 75.f, 330.f });
+        addTree(z, { 1090.f, 330.f });
         for (int i = 0; i < 12; ++i) addBush(z, { randRange(120.f, 1160.f), randRange(120.f, 760.f) });
+        scatterTrees(z, 11, 120.f, 1160.f, 120.f, 760.f);
+        scatterLamps(z, 4, 120.f, 1160.f, 120.f, 760.f);
         for (int i = 0; i < 16; ++i) addPatch(z, { randRange(0.f, 1260.f), randRange(0.f, 800.f) }, { 50.f, 34.f });
 
         addNpc(z, "npc_farmer", { 570.f, 330.f }, sf::Color(120, 180, 90),
@@ -963,7 +1086,11 @@ void GameWorld::buildZones() {
         addBuilding(z, "carpenter",  { 600.f, 480.f }, kTier3, bSize);
         addBuilding(z, "tailor",     { 920.f, 480.f }, kTier3, bSize);
 
-        addPath(z, { 590.f, 0.f }, { 40.f, 780.f });
+        // x:720-760 threads the gap between the smelter/carpenter column
+        // (600-710) and the gemshop/tailor column (920-1030) instead of
+        // running straight through smelter/carpenter like the old
+        // dead-center spine did.
+        addPath(z, { 720.f, 0.f }, { 40.f, 780.f });
 
         for (float x = 20.f; x < 1260.f; x += 70.f) {
             if (x > 540.f && x < 780.f) continue; // north gap (-> Highlands District) and south gap (-> Town Square)
@@ -971,7 +1098,14 @@ void GameWorld::buildZones() {
             addTree(z, { x, 800.f });
         }
         for (float y = 90.f; y < 800.f; y += 70.f) { addTree(z, { 15.f, y }); addTree(z, { 1260.f, y }); }
+        // A couple of standalone trees flanking the building rows -- see the
+        // same addition in Zone 1 (Farmlands) above. Kept clear of the
+        // full-height path spine (x:720-760) here.
+        addTree(z, { 170.f, 370.f });
+        addTree(z, { 1145.f, 370.f });
         for (int i = 0; i < 10; ++i) addBush(z, { randRange(120.f, 1160.f), randRange(120.f, 760.f) });
+        scatterTrees(z, 9, 120.f, 1160.f, 120.f, 760.f);
+        scatterLamps(z, 4, 120.f, 1160.f, 120.f, 760.f);
         for (int i = 0; i < 14; ++i) addPatch(z, { randRange(0.f, 1260.f), randRange(0.f, 800.f) }, { 44.f, 28.f });
 
         addNpc(z, "npc_miner", { 600.f, 340.f }, sf::Color(150, 150, 160),
@@ -1013,7 +1147,15 @@ void GameWorld::buildZones() {
             if (y > 330.f && y < 490.f) continue; // east gap (back to Town Square)
             addTree(z, { 1260.f, y });
         }
+        // A couple of standalone trees near the buildings -- see the same
+        // addition in Zone 1 (Farmlands) above. Valley's 5-column layout
+        // leaves no safe flank on the east side, so both sit on the west
+        // half: one left of the first column, one in the column-1/column-2 gap.
+        addTree(z, { 75.f, 330.f });
+        addTree(z, { 305.f, 330.f });
         for (int i = 0; i < 12; ++i) addBush(z, { randRange(120.f, 1160.f), randRange(120.f, 760.f) });
+        scatterTrees(z, 11, 120.f, 1160.f, 120.f, 760.f);
+        scatterLamps(z, 4, 120.f, 1160.f, 120.f, 760.f);
         for (int i = 0; i < 16; ++i) addPatch(z, { randRange(0.f, 1260.f), randRange(0.f, 800.f) }, { 48.f, 32.f });
 
         addNpc(z, "npc_orchardist", { 400.f, 330.f }, sf::Color(200, 120, 90),
@@ -1055,15 +1197,30 @@ void GameWorld::buildZones() {
         addBuilding(z, "port",         { 570.f, 480.f }, kTier3, bSize);
         addBuilding(z, "pearlatelier", { 890.f, 480.f }, kTier2, bSize);
 
-        addPath(z, { 590.f, 0.f }, { 40.f, 260.f }); // spine leading down from the Town Square gap
+        // x:690-730 threads the gap between the fishing column (570-680) and
+        // the pearlfarm column (890-1000) instead of running straight
+        // through the Fishing Dock like the old dead-center spine did.
+        addPath(z, { 690.f, 0.f }, { 40.f, 260.f }); // spine leading down from the Town Square gap
 
+        // No south-edge tree row here, unlike every other zone's generic
+        // border loop -- the south edge is the water/shoreline (added
+        // below), not a forest wall, and the west/east columns stop short of
+        // y=700 for the same reason (a "tree standing in the harbor" reads
+        // as a bug, not scenery -- trees are a movement obstacle same as
+        // water, so they'd never actually overlap right, just look wrong).
         for (float x = 20.f; x < 1260.f; x += 70.f) {
             if (x > 540.f && x < 780.f) continue; // north gap (-> Town Square)
             addTree(z, { x, 15.f });
-            addTree(z, { x, 800.f });
         }
-        for (float y = 90.f; y < 800.f; y += 70.f) { addTree(z, { 15.f, y }); addTree(z, { 1260.f, y }); }
+        for (float y = 90.f; y < 700.f; y += 70.f) { addTree(z, { 15.f, y }); addTree(z, { 1260.f, y }); }
+        // A couple of standalone trees flanking the building rows -- see the
+        // same addition in Zone 1 (Farmlands) above. Well clear of the water
+        // band (y >= 700) below.
+        addTree(z, { 140.f, 370.f });
+        addTree(z, { 1130.f, 370.f });
         for (int i = 0; i < 10; ++i) addBush(z, { randRange(120.f, 1160.f), randRange(120.f, 760.f) });
+        scatterTrees(z, 9, 120.f, 1160.f, 120.f, 760.f);
+        scatterLamps(z, 4, 120.f, 1160.f, 120.f, 760.f);
         for (int i = 0; i < 14; ++i) addPatch(z, { randRange(0.f, 1260.f), randRange(0.f, 800.f) }, { 46.f, 30.f });
         // A band of animated water along the south edge, ties the dock
         // buildings to the shoreline (see Decoration::Kind::Water in drawZone).
@@ -1106,7 +1263,10 @@ void GameWorld::buildZones() {
         // spine below.
         addBuilding(z, "giftbasket", { 1090.f, 650.f }, kTier3, bSize);
 
-        addPath(z, { 590.f, 540.f }, { 40.f, 260.f }); // spine leading up to the Mining District gap
+        // x:720-760 threads the gap between the teahouse column (610-720)
+        // and the flaxfield column (850-960) instead of running straight
+        // through the Tea House like the old dead-center spine did.
+        addPath(z, { 720.f, 540.f }, { 40.f, 260.f }); // spine leading up to the Mining District gap
 
         for (float x = 20.f; x < 1260.f; x += 70.f) {
             addTree(z, { x, 15.f }); // north wall, no gap -- far edge of the map
@@ -1117,7 +1277,15 @@ void GameWorld::buildZones() {
             addTree(z, { 15.f, y }); // west wall, no gap -- far edge of the map
             addTree(z, { 1260.f, y }); // east wall, no gap -- far edge of the map
         }
+        // A couple of standalone trees near the buildings -- see the same
+        // addition in Zone 1 (Farmlands) above. Sits west of the path spine
+        // (which only spans the lower half here, y:540-800) and clear of
+        // both NPCs' wander boxes below.
+        addTree(z, { 75.f, 370.f });
+        addTree(z, { 500.f, 370.f });
         for (int i = 0; i < 12; ++i) addBush(z, { randRange(120.f, 1160.f), randRange(120.f, 760.f) });
+        scatterTrees(z, 11, 120.f, 1160.f, 120.f, 760.f);
+        scatterLamps(z, 4, 120.f, 1160.f, 120.f, 760.f);
         for (int i = 0; i < 16; ++i) addPatch(z, { randRange(0.f, 1260.f), randRange(0.f, 800.f) }, { 48.f, 32.f });
 
         addNpc(z, "npc_dairymaid", { 250.f, 330.f }, sf::Color(230, 210, 180),
@@ -1172,7 +1340,11 @@ void GameWorld::buildZones() {
         addBuilding(z, "cakeshop",       { 610.f, 620.f }, kTier3, bSize);
         addBuilding(z, "artisanbakery",  { 970.f, 620.f }, kTier3, bSize);
 
-        addPath(z, { 590.f, 0.f }, { 40.f, 260.f }); // spine leading down from the Farmlands gap
+        // x:720-760 threads the gap between the popcornstand column
+        // (610-720) and the juicebar column (970-1080) instead of running
+        // straight through the Popcorn Stand like the old dead-center spine
+        // did.
+        addPath(z, { 720.f, 0.f }, { 40.f, 260.f }); // spine leading down from the Farmlands gap
 
         for (float x = 20.f; x < 1260.f; x += 70.f) {
             if (x > 540.f && x < 780.f) continue; // north gap (-> Farmlands)
@@ -1180,7 +1352,14 @@ void GameWorld::buildZones() {
             addTree(z, { x, 800.f });
         }
         for (float y = 90.f; y < 800.f; y += 70.f) { addTree(z, { 15.f, y }); addTree(z, { 1260.f, y }); }
+        // A couple of standalone trees in the gap between the top and middle
+        // rows -- see the same addition in Zone 1 (Farmlands) above. Below
+        // the path spine (which only spans y:0-260 here).
+        addTree(z, { 140.f, 310.f });
+        addTree(z, { 1170.f, 310.f });
         for (int i = 0; i < 14; ++i) addBush(z, { randRange(120.f, 1160.f), randRange(120.f, 760.f) });
+        scatterTrees(z, 12, 120.f, 1160.f, 120.f, 760.f);
+        scatterLamps(z, 5, 120.f, 1160.f, 120.f, 760.f);
         for (int i = 0; i < 18; ++i) addPatch(z, { randRange(0.f, 1260.f), randRange(0.f, 800.f) }, { 46.f, 30.f }); // busier ground clutter than the open zones -- reads as a market square, not a field
 
         addNpc(z, "npc_market_vendor", { 610.f, 280.f }, sf::Color(220, 140, 60),
@@ -1232,6 +1411,8 @@ void GameWorld::buildZones() {
         addSand(z, { 60.f, 0.f }, { 26.f, 820.f });
         addSand(z, { 1194.f, 0.f }, { 26.f, 820.f });
         for (int i = 0; i < 10; ++i) addBush(z, { randRange(120.f, 1160.f), randRange(120.f, 700.f) });
+        scatterTrees(z, 9, 120.f, 1160.f, 120.f, 700.f);
+        scatterLamps(z, 4, 120.f, 1160.f, 120.f, 700.f);
         for (int i = 0; i < 14; ++i) addPatch(z, { randRange(80.f, 1200.f), randRange(80.f, 740.f) }, { 46.f, 30.f });
 
         addNpc(z, "npc_islander", { 610.f, 650.f }, sf::Color(70, 150, 160),
@@ -1273,7 +1454,14 @@ bool GameWorld::collidesWithTree(sf::Vector2f pos, float size) const {
         if (d.kind != Decoration::Kind::Tree) continue;
         sf::Vector2f diff = center - d.position;
         float distSq = diff.x * diff.x + diff.y * diff.y;
-        float minDist = kTreeRadius + size / 2.f - 6.f;
+        // Was "kTreeRadius + size/2 - 6" -- drawTree's canopy actually
+        // reaches ~23px north of d.position (it's a tall sprite anchored at
+        // the trunk, not a symmetric blob), so the old shrunken radius left
+        // an unguarded sliver at the top of the canopy a player approaching
+        // head-on could walk into before the collision triggered (reported
+        // as "can walk right through the trees" 2026-08-06). Dropping the
+        // -6 fudge instead of re-centering keeps this a one-line fix.
+        float minDist = kTreeRadius + size / 2.f;
         if (distSq < minDist * minDist) return true;
     }
     return false;
@@ -1529,7 +1717,7 @@ void GameWorld::updateForaging(float dt) {
     }
 }
 
-void GameWorld::drawForageable(sf::RenderWindow& window, const Forageable& f) {
+void GameWorld::drawForageable(sf::RenderWindow& window, const Forageable& f, const sf::RenderStates& states) {
     if (!f.active) return;
     // A small cluster of berries -- deliberately simple/bright so it reads
     // as "walk over and press E" at a glance against the Highlands' pasture
@@ -1541,7 +1729,7 @@ void GameWorld::drawForageable(sf::RenderWindow& window, const Forageable& f) {
         berry.setFillColor(sf::Color(210, 60, 90));
         berry.setOutlineThickness(1.f);
         berry.setOutlineColor(sf::Color(25, 20, 15));
-        window.draw(berry);
+        window.draw(berry, states);
     }
 }
 
@@ -1623,30 +1811,55 @@ void GameWorld::generateDealFor(Npc& npc) {
     npc.dealTotalPrice = g.price * npc.dealQty * 0.6;
 }
 
-void GameWorld::drawCottageShape(sf::RenderWindow& window, const WorldBuilding& b) {
+void GameWorld::drawCottageShape(sf::RenderWindow& window, const WorldBuilding& b, const sf::RenderStates& states) {
+    // 2026-08-07 detail pass: half-timbered upper wall over a stone
+    // foundation, a real coursed-shingle gable roof, two proper multi-pane
+    // windows (one with a flower box, echoing the player's reference image)
+    // and a paneled door -- replacing the old flat-panel body + 1 window.
     float roofH = b.size.y * 0.38f;
+    float wallH = b.size.y - roofH;
+    float foundationH = wallH * 0.16f;
     sf::Color roofColor = darken(b.labelColor, 0.55f);
-    sf::Color bodyColor = darken(b.labelColor, 0.85f);
+    // Wall material is deliberately NOT derived from b.labelColor (that
+    // ranges from green to blue across building types, which fought a
+    // consistent "half-timbered cottage" material -- a blue-tinted plaster
+    // read as a strange stucco, not the warm wood/plaster of the reference
+    // photo). Roof color is still what visually distinguishes buildings by
+    // type; every cottage now shares the same warm plaster + dark timber.
+    sf::Color plasterColor(228, 210, 176);
+    sf::Color beamColor(74, 50, 30);
 
-    drawPixelPanel(window, sf::Vector2f(b.position.x, b.position.y + roofH),
-        sf::Vector2f(b.size.x, b.size.y - roofH), bodyColor, sf::Color(25, 20, 15), b.position);
+    drawStoneTrim(window, sf::Vector2f(b.position.x, b.position.y + b.size.y - foundationH),
+        sf::Vector2f(b.size.x, foundationH), b.position, states);
+    drawTimberWall(window, sf::Vector2f(b.position.x, b.position.y + roofH),
+        sf::Vector2f(b.size.x, wallH - foundationH), plasterColor, beamColor, b.position, states);
 
-    drawPixelRoof(window, sf::FloatRect(sf::Vector2f(b.position.x - 8.f, b.position.y - 10.f),
-        sf::Vector2f(b.size.x + 16.f, roofH + 10.f)), roofColor);
+    drawGableRoof(window, sf::FloatRect(sf::Vector2f(b.position.x - 8.f, b.position.y - 10.f),
+        sf::Vector2f(b.size.x + 16.f, roofH + 10.f)), roofColor, b.position, states);
 
-    sf::Vector2f doorSize(b.size.x * 0.22f, (b.size.y - roofH) * 0.55f);
-    sf::RectangleShape door(doorSize);
-    door.setPosition(sf::Vector2f(b.position.x + b.size.x / 2.f - doorSize.x / 2.f, b.position.y + b.size.y - doorSize.y));
-    door.setFillColor(sf::Color(60, 42, 24));
-    window.draw(door);
+    sf::Vector2f doorSize(b.size.x * 0.2f, wallH * 0.5f);
+    drawPaneledDoor(window, sf::Vector2f(b.position.x + b.size.x / 2.f - doorSize.x / 2.f, b.position.y + b.size.y - foundationH - doorSize.y),
+        doorSize, sf::Color(96, 58, 30), states);
 
     sf::Vector2f winSize(b.size.x * 0.16f, b.size.x * 0.16f);
-    sf::RectangleShape win(winSize);
-    win.setPosition(sf::Vector2f(b.position.x + b.size.x * 0.7f, b.position.y + b.size.y - roofH - winSize.y - 8.f + roofH));
-    win.setFillColor(sf::Color(205, 228, 250));
-    win.setOutlineThickness(1.5f);
-    win.setOutlineColor(sf::Color(25, 20, 15));
-    window.draw(win);
+    float winY = b.position.y + roofH + wallH * 0.16f;
+    sf::Vector2f rightWinPos(b.position.x + b.size.x * 0.68f, winY);
+    // Warm lamplight instead of a flat pale-blue daylight reflection, with a
+    // soft glow behind it -- every cottage-shaped building (farm/sleep/eat/
+    // doctor at minimum) gets a "lit window" now instead of just one, since
+    // this is the single most common building shape in the game.
+    drawGlow(window, rightWinPos + winSize / 2.f, winSize.x * 0.55f, sf::Color(255, 200, 110, 200), states);
+    drawPaneWindow(window, rightWinPos, winSize, states);
+
+    // A second window on the left, well clear of the door, with a flower
+    // box under it -- only if the building is wide enough that it wouldn't
+    // crowd the door (the smallest cottage footprints stay single-window).
+    if (b.size.x > 90.f) {
+        sf::Vector2f leftWinPos(b.position.x + b.size.x * 0.12f, winY);
+        drawPaneWindow(window, leftWinPos, winSize, states);
+        drawFlowerBox(window, sf::Vector2f(leftWinPos.x - 2.f, leftWinPos.y + winSize.y + 1.f),
+            sf::Vector2f(winSize.x + 4.f, 5.f), b.position + sf::Vector2f(3.f, 0.f), states);
+    }
 
     if (smokesFrom(b.id)) {
         sf::RectangleShape chimney(sf::Vector2f(10.f, 20.f));
@@ -1654,54 +1867,54 @@ void GameWorld::drawCottageShape(sf::RenderWindow& window, const WorldBuilding& 
         chimney.setFillColor(sf::Color(96, 80, 70));
         chimney.setOutlineThickness(1.5f);
         chimney.setOutlineColor(sf::Color(25, 20, 15));
-        window.draw(chimney);
+        window.draw(chimney, states);
     }
 }
 
-void GameWorld::drawFarmShape(sf::RenderWindow& window, const WorldBuilding& b) {
-    drawPixelPanel(window, b.position, b.size, sf::Color(107, 84, 48), sf::Color(25, 20, 15), b.position, 8.f);
+void GameWorld::drawFarmShape(sf::RenderWindow& window, const WorldBuilding& b, const sf::RenderStates& states) {
+    drawPixelPanel(window, b.position, b.size, sf::Color(107, 84, 48), sf::Color(25, 20, 15), b.position, 5.f, states);
 
     constexpr int rows = 5;
     float gap = b.size.x / static_cast<float>(rows);
     for (int i = 0; i < rows; ++i) {
         sf::Vector2f rowPos(b.position.x + gap * static_cast<float>(i) + gap * 0.2f, b.position.y + 5.f);
         drawPixelPanel(window, rowPos, sf::Vector2f(gap * 0.55f, b.size.y - 10.f),
-            sf::Color(198, 182, 68), sf::Color(140, 120, 40), rowPos, 6.f);
+            sf::Color(198, 182, 68), sf::Color(140, 120, 40), rowPos, 4.f, states);
     }
 }
 
-void GameWorld::drawMineShape(sf::RenderWindow& window, const WorldBuilding& b) {
-    drawPixelMound(window, sf::FloatRect(b.position, b.size), sf::Color(114, 106, 100));
+void GameWorld::drawMineShape(sf::RenderWindow& window, const WorldBuilding& b, const sf::RenderStates& states) {
+    drawPixelMound(window, sf::FloatRect(b.position, b.size), sf::Color(114, 106, 100), states);
 
     float archW = b.size.x * 0.34f, archH = b.size.y * 0.6f;
     sf::Vector2f archPos(b.position.x + b.size.x / 2.f - archW / 2.f, b.position.y + b.size.y - archH);
 
     sf::Vector2f frameSize(7.f, archH + 4.f);
-    drawPixelPanel(window, sf::Vector2f(archPos.x - 7.f, archPos.y - 4.f), frameSize, sf::Color(94, 62, 32), sf::Color(50, 32, 16), b.position, 5.f);
-    drawPixelPanel(window, sf::Vector2f(archPos.x + archW, archPos.y - 4.f), frameSize, sf::Color(94, 62, 32), sf::Color(50, 32, 16), b.position + sf::Vector2f(1.f, 0.f), 5.f);
+    drawPixelPanel(window, sf::Vector2f(archPos.x - 7.f, archPos.y - 4.f), frameSize, sf::Color(94, 62, 32), sf::Color(50, 32, 16), b.position, 3.f, states);
+    drawPixelPanel(window, sf::Vector2f(archPos.x + archW, archPos.y - 4.f), frameSize, sf::Color(94, 62, 32), sf::Color(50, 32, 16), b.position + sf::Vector2f(1.f, 0.f), 3.f, states);
 
-    drawPixelPanel(window, archPos, sf::Vector2f(archW, archH), sf::Color(18, 18, 20), sf::Color(8, 8, 10), b.position, 6.f);
+    drawPixelPanel(window, archPos, sf::Vector2f(archW, archH), sf::Color(18, 18, 20), sf::Color(8, 8, 10), b.position, 4.f, states);
 }
 
-void GameWorld::drawLumberShape(sf::RenderWindow& window, const WorldBuilding& b) {
-    drawPixelPanel(window, b.position, b.size, sf::Color(96, 124, 60), sf::Color(25, 20, 15), b.position, 8.f);
+void GameWorld::drawLumberShape(sf::RenderWindow& window, const WorldBuilding& b, const sf::RenderStates& states) {
+    drawPixelPanel(window, b.position, b.size, sf::Color(96, 124, 60), sf::Color(25, 20, 15), b.position, 5.f, states);
 
     for (int i = 0; i < 3; ++i) {
         float y = b.position.y + b.size.y * 0.24f + static_cast<float>(i) * 15.f;
         sf::Vector2f logPos(b.position.x + b.size.x * 0.2f, y);
-        drawPixelPanel(window, logPos, sf::Vector2f(b.size.x * 0.62f, 11.f), sf::Color(124, 84, 44), sf::Color(70, 45, 20), logPos, 5.f);
+        drawPixelPanel(window, logPos, sf::Vector2f(b.size.x * 0.62f, 11.f), sf::Color(124, 84, 44), sf::Color(70, 45, 20), logPos, 3.f, states);
 
         sf::CircleShape ring(6.f);
         ring.setPosition(sf::Vector2f(b.position.x + b.size.x * 0.2f - 5.f, y - 1.f));
         ring.setFillColor(sf::Color(172, 134, 88));
         ring.setOutlineThickness(1.f);
         ring.setOutlineColor(sf::Color(70, 45, 20));
-        window.draw(ring);
+        window.draw(ring, states);
     }
 }
 
-void GameWorld::drawQuarryShape(sf::RenderWindow& window, const WorldBuilding& b) {
-    drawPixelPanel(window, b.position, b.size, sf::Color(98, 98, 102), sf::Color(25, 20, 15), b.position, 8.f);
+void GameWorld::drawQuarryShape(sf::RenderWindow& window, const WorldBuilding& b, const sf::RenderStates& states) {
+    drawPixelPanel(window, b.position, b.size, sf::Color(98, 98, 102), sf::Color(25, 20, 15), b.position, 5.f, states);
 
     const sf::Vector2f offsets[] = {
         { b.size.x * 0.18f, b.size.y * 0.28f },
@@ -1711,38 +1924,38 @@ void GameWorld::drawQuarryShape(sf::RenderWindow& window, const WorldBuilding& b
     };
     for (const auto& off : offsets) {
         sf::Vector2f chunkPos = b.position + off;
-        drawPixelPanel(window, chunkPos, sf::Vector2f(16.f, 12.f), sf::Color(152, 152, 156), sf::Color(70, 70, 74), chunkPos, 5.f);
+        drawPixelPanel(window, chunkPos, sf::Vector2f(16.f, 12.f), sf::Color(152, 152, 156), sf::Color(70, 70, 74), chunkPos, 3.f, states);
     }
 }
 
-void GameWorld::drawPastureShape(sf::RenderWindow& window, const WorldBuilding& b) {
-    drawPixelPanel(window, b.position, b.size, sf::Color(102, 140, 70), sf::Color(25, 20, 15), b.position, 8.f);
+void GameWorld::drawPastureShape(sf::RenderWindow& window, const WorldBuilding& b, const sf::RenderStates& states) {
+    drawPixelPanel(window, b.position, b.size, sf::Color(102, 140, 70), sf::Color(25, 20, 15), b.position, 5.f, states);
 
     for (float x = b.position.x + 4.f; x < b.position.x + b.size.x - 2.f; x += 16.f) {
         sf::RectangleShape post(sf::Vector2f(4.f, 16.f));
         post.setPosition(sf::Vector2f(x, b.position.y + b.size.y - 16.f));
         post.setFillColor(sf::Color(150, 118, 76));
-        window.draw(post);
+        window.draw(post, states);
     }
     sf::RectangleShape rail(sf::Vector2f(b.size.x - 8.f, 4.f));
     rail.setPosition(sf::Vector2f(b.position.x + 4.f, b.position.y + b.size.y - 22.f));
     rail.setFillColor(sf::Color(150, 118, 76));
-    window.draw(rail);
+    window.draw(rail, states);
 
     // A few grazing "sheep" -- a wool-white puff with a small dark head.
     const sf::Vector2f puffs[] = { { 0.30f, 0.35f }, { 0.55f, 0.50f }, { 0.72f, 0.30f } };
     for (const auto& pf : puffs) {
         sf::Vector2f p = b.position + sf::Vector2f(b.size.x * pf.x, b.size.y * pf.y);
-        drawPixelBlob(window, p, 9.f, sf::Color(240, 240, 235));
+        drawPixelBlob(window, p, 9.f, sf::Color(240, 240, 235), states);
         sf::CircleShape head(4.f);
         head.setPosition(sf::Vector2f(p.x - 13.f, p.y - 5.f));
         head.setFillColor(sf::Color(60, 50, 45));
-        window.draw(head);
+        window.draw(head, states);
     }
 }
 
-void GameWorld::drawOrchardShape(sf::RenderWindow& window, const WorldBuilding& b) {
-    drawPixelPanel(window, b.position, b.size, sf::Color(90, 130, 66), sf::Color(25, 20, 15), b.position, 8.f);
+void GameWorld::drawOrchardShape(sf::RenderWindow& window, const WorldBuilding& b, const sf::RenderStates& states) {
+    drawPixelPanel(window, b.position, b.size, sf::Color(90, 130, 66), sf::Color(25, 20, 15), b.position, 5.f, states);
 
     for (int row = 0; row < 2; ++row) {
         for (int col = 0; col < 3; ++col) {
@@ -1752,15 +1965,15 @@ void GameWorld::drawOrchardShape(sf::RenderWindow& window, const WorldBuilding& 
             sf::RectangleShape trunk(sf::Vector2f(4.f, 10.f));
             trunk.setPosition(sf::Vector2f(p.x - 2.f, p.y));
             trunk.setFillColor(sf::Color(96, 64, 32));
-            window.draw(trunk);
+            window.draw(trunk, states);
             // Fruit-red canopy -- distinct from the world's plain green trees.
-            drawPixelBlob(window, sf::Vector2f(p.x, p.y - 5.f), 9.f, sf::Color(200, 90, 70));
+            drawPixelBlob(window, sf::Vector2f(p.x, p.y - 5.f), 9.f, sf::Color(200, 90, 70), states);
         }
     }
 }
 
-void GameWorld::drawHerbGardenShape(sf::RenderWindow& window, const WorldBuilding& b) {
-    drawPixelPanel(window, b.position, b.size, sf::Color(74, 58, 40), sf::Color(25, 20, 15), b.position, 8.f);
+void GameWorld::drawHerbGardenShape(sf::RenderWindow& window, const WorldBuilding& b, const sf::RenderStates& states) {
+    drawPixelPanel(window, b.position, b.size, sf::Color(74, 58, 40), sf::Color(25, 20, 15), b.position, 5.f, states);
 
     const sf::Vector2f offsets[] = {
         { b.size.x * 0.15f, b.size.y * 0.25f }, { b.size.x * 0.35f, b.size.y * 0.55f },
@@ -1769,12 +1982,12 @@ void GameWorld::drawHerbGardenShape(sf::RenderWindow& window, const WorldBuildin
         { b.size.x * 0.85f, b.size.y * 0.40f }, { b.size.x * 0.45f, b.size.y * 0.80f },
     };
     for (const auto& off : offsets) {
-        drawPixelBlob(window, b.position + off + sf::Vector2f(5.f, 5.f), 5.f, sf::Color(110, 160, 80));
+        drawPixelBlob(window, b.position + off + sf::Vector2f(5.f, 5.f), 5.f, sf::Color(110, 160, 80), states);
     }
 }
 
-void GameWorld::drawVineyardShape(sf::RenderWindow& window, const WorldBuilding& b) {
-    drawPixelPanel(window, b.position, b.size, sf::Color(107, 84, 48), sf::Color(25, 20, 15), b.position, 8.f);
+void GameWorld::drawVineyardShape(sf::RenderWindow& window, const WorldBuilding& b, const sf::RenderStates& states) {
+    drawPixelPanel(window, b.position, b.size, sf::Color(107, 84, 48), sf::Color(25, 20, 15), b.position, 5.f, states);
 
     constexpr int rows = 4;
     float gap = b.size.x / static_cast<float>(rows);
@@ -1783,27 +1996,27 @@ void GameWorld::drawVineyardShape(sf::RenderWindow& window, const WorldBuilding&
         sf::RectangleShape post(sf::Vector2f(3.f, b.size.y - 10.f));
         post.setPosition(sf::Vector2f(x, b.position.y + 5.f));
         post.setFillColor(sf::Color(120, 90, 55));
-        window.draw(post);
+        window.draw(post, states);
 
         for (int j = 0; j < 3; ++j) {
             sf::Vector2f center(x, b.position.y + 15.5f + static_cast<float>(j) * 16.f);
-            drawPixelBlob(window, center, 3.5f, sf::Color(110, 60, 130));
+            drawPixelBlob(window, center, 3.5f, sf::Color(110, 60, 130), states);
         }
     }
 }
 
-void GameWorld::drawGoldMineShape(sf::RenderWindow& window, const WorldBuilding& b) {
+void GameWorld::drawGoldMineShape(sf::RenderWindow& window, const WorldBuilding& b, const sf::RenderStates& states) {
     // Gold-tinted rock -- distinct from the Ore Mine's grey mound.
-    drawPixelMound(window, sf::FloatRect(b.position, b.size), sf::Color(150, 130, 80));
+    drawPixelMound(window, sf::FloatRect(b.position, b.size), sf::Color(150, 130, 80), states);
 
     float archW = b.size.x * 0.34f, archH = b.size.y * 0.6f;
     sf::Vector2f archPos(b.position.x + b.size.x / 2.f - archW / 2.f, b.position.y + b.size.y - archH);
 
     sf::Vector2f frameSize(7.f, archH + 4.f);
-    drawPixelPanel(window, sf::Vector2f(archPos.x - 7.f, archPos.y - 4.f), frameSize, sf::Color(94, 62, 32), sf::Color(50, 32, 16), b.position, 5.f);
-    drawPixelPanel(window, sf::Vector2f(archPos.x + archW, archPos.y - 4.f), frameSize, sf::Color(94, 62, 32), sf::Color(50, 32, 16), b.position + sf::Vector2f(1.f, 0.f), 5.f);
+    drawPixelPanel(window, sf::Vector2f(archPos.x - 7.f, archPos.y - 4.f), frameSize, sf::Color(94, 62, 32), sf::Color(50, 32, 16), b.position, 3.f, states);
+    drawPixelPanel(window, sf::Vector2f(archPos.x + archW, archPos.y - 4.f), frameSize, sf::Color(94, 62, 32), sf::Color(50, 32, 16), b.position + sf::Vector2f(1.f, 0.f), 3.f, states);
 
-    drawPixelPanel(window, archPos, sf::Vector2f(archW, archH), sf::Color(18, 18, 20), sf::Color(8, 8, 10), b.position, 6.f);
+    drawPixelPanel(window, archPos, sf::Vector2f(archW, archH), sf::Color(18, 18, 20), sf::Color(8, 8, 10), b.position, 4.f, states);
 
     const sf::Vector2f sparkles[] = { { b.size.x * 0.28f, b.size.y * 0.55f }, { b.size.x * 0.68f, b.size.y * 0.45f } };
     for (const auto& s : sparkles) {
@@ -1814,7 +2027,7 @@ void GameWorld::drawGoldMineShape(sf::RenderWindow& window, const WorldBuilding&
         spark.setPoint(2, sf::Vector2f(p.x, p.y + 6.f));
         spark.setPoint(3, sf::Vector2f(p.x - 4.f, p.y));
         spark.setFillColor(sf::Color(255, 215, 90));
-        window.draw(spark);
+        window.draw(spark, states);
     }
 }
 
@@ -1822,7 +2035,7 @@ void GameWorld::drawGoldMineShape(sf::RenderWindow& window, const WorldBuilding&
 // shared by the Field/Workshop/Dock/ServiceHall archetypes so buildings that
 // share a base shape still read as visually distinct from one another. See
 // the kAccent* constants and accentFor() above for how each id picks one.
-void GameWorld::drawAccentGlyph(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color color) {
+void GameWorld::drawAccentGlyph(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color color, const sf::RenderStates& states) {
     const sf::Vector2f spots[] = {
         { b.size.x * 0.28f, b.size.y * 0.42f },
         { b.size.x * 0.55f, b.size.y * 0.62f },
@@ -1837,7 +2050,7 @@ void GameWorld::drawAccentGlyph(sf::RenderWindow& window, const WorldBuilding& b
             c.setFillColor(color);
             c.setOutlineThickness(1.f);
             c.setOutlineColor(sf::Color(25, 20, 15));
-            window.draw(c);
+            window.draw(c, states);
             break;
         }
         case kAccentDiamond: {
@@ -1849,7 +2062,7 @@ void GameWorld::drawAccentGlyph(sf::RenderWindow& window, const WorldBuilding& b
             d.setFillColor(color);
             d.setOutlineThickness(1.f);
             d.setOutlineColor(sf::Color(25, 20, 15));
-            window.draw(d);
+            window.draw(d, states);
             break;
         }
         case kAccentTriangle: {
@@ -1860,41 +2073,41 @@ void GameWorld::drawAccentGlyph(sf::RenderWindow& window, const WorldBuilding& b
             t.setFillColor(color);
             t.setOutlineThickness(1.f);
             t.setOutlineColor(sf::Color(25, 20, 15));
-            window.draw(t);
+            window.draw(t, states);
             break;
         }
         case kAccentCross: {
-            drawPixelPanel(window, sf::Vector2f(p.x - 6.f, p.y - 2.f), sf::Vector2f(12.f, 4.f), color, shade(color, -60), p, 4.f);
-            drawPixelPanel(window, sf::Vector2f(p.x - 2.f, p.y - 6.f), sf::Vector2f(4.f, 12.f), color, shade(color, -60), p, 4.f);
+            drawPixelPanel(window, sf::Vector2f(p.x - 6.f, p.y - 2.f), sf::Vector2f(12.f, 4.f), color, shade(color, -60), p, 3.f, states);
+            drawPixelPanel(window, sf::Vector2f(p.x - 2.f, p.y - 6.f), sf::Vector2f(4.f, 12.f), color, shade(color, -60), p, 3.f, states);
             break;
         }
         case kAccentDoubleDot: {
             sf::CircleShape c1(3.5f);
             c1.setPosition(sf::Vector2f(p.x - 6.f, p.y - 3.f));
             c1.setFillColor(color);
-            window.draw(c1);
+            window.draw(c1, states);
             sf::CircleShape c2(3.5f);
             c2.setPosition(sf::Vector2f(p.x + 2.f, p.y - 3.f));
             c2.setFillColor(color);
-            window.draw(c2);
+            window.draw(c2, states);
             break;
         }
         default: { // kAccentBar
-            drawPixelPanel(window, sf::Vector2f(p.x - 7.f, p.y - 2.5f), sf::Vector2f(14.f, 5.f), color, shade(color, -60), p, 5.f);
+            drawPixelPanel(window, sf::Vector2f(p.x - 7.f, p.y - 2.5f), sf::Vector2f(14.f, 5.f), color, shade(color, -60), p, 3.f, states);
             break;
         }
         }
     }
 }
 
-void GameWorld::drawFieldShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor) {
-    drawPixelPanel(window, b.position, b.size, sf::Color(92, 112, 58), sf::Color(25, 20, 15), b.position, 8.f);
+void GameWorld::drawFieldShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor, const sf::RenderStates& states) {
+    drawPixelPanel(window, b.position, b.size, sf::Color(92, 112, 58), sf::Color(25, 20, 15), b.position, 5.f, states);
 
     for (float x = b.position.x + 6.f; x < b.position.x + b.size.x - 4.f; x += 18.f) {
         sf::RectangleShape post(sf::Vector2f(4.f, 14.f));
         post.setPosition(sf::Vector2f(x, b.position.y + b.size.y - 14.f));
         post.setFillColor(sf::Color(140, 110, 70));
-        window.draw(post);
+        window.draw(post, states);
     }
 
     // The 7 Field buildings used to only tell apart by their generic accent
@@ -1948,24 +2161,40 @@ void GameWorld::drawFieldShape(sf::RenderWindow& window, const WorldBuilding& b,
     };
     sf::Vector2f iconSize(24.f, 24.f);
     sf::Vector2f iconPos(b.position.x + b.size.x / 2.f - iconSize.x / 2.f, b.position.y - iconSize.y - 6.f);
-    drawPixelSprite(window, *iconRows, sf::FloatRect(iconPos, iconSize), palette);
+    drawPixelSprite(window, *iconRows, sf::FloatRect(iconPos, iconSize), palette, false, states);
 
-    drawAccentGlyph(window, b, accentKind, accentColor);
+    drawAccentGlyph(window, b, accentKind, accentColor, states);
 }
 
 // A shared lean-to roof + optional chimney, factored out of drawWorkshopShape
 // so all 8 themed shapes below (and the plain Workshop fallback) build their
 // body out of the same boxy silhouette and only differ in what's added in
 // front of it -- keeps 9 shape functions from each re-deriving roof geometry.
-void GameWorld::drawWorkshopBody(sf::RenderWindow& window, const WorldBuilding& b, bool alwaysSmokes) {
+void GameWorld::drawWorkshopBody(sf::RenderWindow& window, const WorldBuilding& b, bool alwaysSmokes, const sf::RenderStates& states) {
+    // Same "building shell" kit the Cottage shape uses (2026-08-07 detail
+    // pass) -- timber-framed walls over a stone foundation and a real
+    // shingled roof, just a shallow lean-to slope instead of a full gable
+    // (these are working sheds, not houses). Deliberately not derived from
+    // b.labelColor either, for the same reason as the cottage: a slightly
+    // duskier plaster tone than the cottage's so a workshop still reads as
+    // "the working side of town" next to the residential cottages, but the
+    // material itself stays consistent building-to-building -- roofColor
+    // (still label-derived) and each theme's own accent (oven mouth, forge
+    // window, saw blade, ...) are what actually distinguish one shop from
+    // another.
     float roofH = b.size.y * 0.22f;
+    float wallH = b.size.y - roofH;
+    float foundationH = wallH * 0.14f;
     sf::Color roofColor = darken(b.labelColor, 0.5f);
-    sf::Color bodyColor = darken(b.labelColor, 0.8f);
+    sf::Color plasterColor(206, 192, 164);
+    sf::Color beamColor(64, 44, 26);
 
-    drawPixelPanel(window, sf::Vector2f(b.position.x, b.position.y + roofH),
-        sf::Vector2f(b.size.x, b.size.y - roofH), bodyColor, sf::Color(25, 20, 15), b.position);
-    drawPixelPanel(window, sf::Vector2f(b.position.x - 6.f, b.position.y),
-        sf::Vector2f(b.size.x + 12.f, roofH + 6.f), roofColor, sf::Color(25, 20, 15), b.position, 6.f);
+    drawStoneTrim(window, sf::Vector2f(b.position.x, b.position.y + b.size.y - foundationH),
+        sf::Vector2f(b.size.x, foundationH), b.position, states);
+    drawTimberWall(window, sf::Vector2f(b.position.x, b.position.y + roofH),
+        sf::Vector2f(b.size.x, wallH - foundationH), plasterColor, beamColor, b.position, states);
+    drawLeanToRoof(window, sf::Vector2f(b.position.x - 6.f, b.position.y),
+        sf::Vector2f(b.size.x + 12.f, roofH + 6.f), roofColor, b.position, states);
 
     if (alwaysSmokes || smokesFrom(b.id)) {
         sf::RectangleShape chimney(sf::Vector2f(10.f, 20.f));
@@ -1973,35 +2202,37 @@ void GameWorld::drawWorkshopBody(sf::RenderWindow& window, const WorldBuilding& 
         chimney.setFillColor(sf::Color(96, 80, 70));
         chimney.setOutlineThickness(1.5f);
         chimney.setOutlineColor(sf::Color(25, 20, 15));
-        window.draw(chimney);
+        window.draw(chimney, states);
     }
 }
 
 // Bakery/kitchen family (bread, cakes, pies, jams, honey syrup, ...) -- an
 // arched, glowing oven mouth out front is the one visual every one of these
 // businesses has in common, whatever the specific good.
-void GameWorld::drawOvenShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor) {
-    drawWorkshopBody(window, b, true);
+void GameWorld::drawOvenShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor, const sf::RenderStates& states) {
+    drawWorkshopBody(window, b, true, states);
 
     float mouthW = b.size.x * 0.36f, mouthH = b.size.y * 0.4f;
     sf::Vector2f mouthPos(b.position.x + b.size.x / 2.f - mouthW / 2.f, b.position.y + b.size.y - mouthH);
-    drawPixelPanel(window, mouthPos, sf::Vector2f(mouthW, mouthH), sf::Color(40, 18, 10), sf::Color(20, 10, 6), b.position, 5.f);
+    drawPixelPanel(window, mouthPos, sf::Vector2f(mouthW, mouthH), sf::Color(40, 18, 10), sf::Color(20, 10, 6), b.position, 3.f, states);
+    sf::Vector2f mouthCenter(mouthPos.x + mouthW / 2.f, mouthPos.y + mouthH * 0.5f);
+    drawGlow(window, mouthCenter, mouthW * 0.26f, sf::Color(255, 150, 60, 230), states);
     sf::CircleShape glow(mouthW * 0.26f);
-    glow.setPosition(sf::Vector2f(mouthPos.x + mouthW / 2.f - mouthW * 0.26f, mouthPos.y + mouthH * 0.5f - mouthW * 0.26f));
+    glow.setPosition(sf::Vector2f(mouthCenter.x - mouthW * 0.26f, mouthCenter.y - mouthW * 0.26f));
     glow.setFillColor(sf::Color(255, 150, 60, 210));
-    window.draw(glow);
+    window.draw(glow, states);
 
-    drawAccentGlyph(window, b, accentKind, accentColor);
+    drawAccentGlyph(window, b, accentKind, accentColor, states);
 }
 
 // Open-air market stall (popcorn, juice, tea, gift baskets, sushi) -- a
 // canvas awning over a counter instead of an enclosed shed, so it reads as
 // "buy here" rather than "goods are made here", matching how light these
 // businesses actually are compared to a full workshop.
-void GameWorld::drawStallShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor) {
+void GameWorld::drawStallShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor, const sf::RenderStates& states) {
     float counterH = b.size.y * 0.4f;
     drawPixelPanel(window, sf::Vector2f(b.position.x, b.position.y + b.size.y - counterH),
-        sf::Vector2f(b.size.x, counterH), sf::Color(150, 118, 76), sf::Color(90, 65, 35), b.position, 6.f);
+        sf::Vector2f(b.size.x, counterH), sf::Color(150, 118, 76), sf::Color(90, 65, 35), b.position, 4.f, states);
 
     // Striped canvas awning -- a wide shallow triangle in the accent color,
     // alternating with a darker shade for the "market stall" stripe look.
@@ -2018,26 +2249,27 @@ void GameWorld::drawStallShape(sf::RenderWindow& window, const WorldBuilding& b,
         stripe.setFillColor(i % 2 == 0 ? awningA : awningB);
         stripe.setOutlineThickness(1.f);
         stripe.setOutlineColor(sf::Color(25, 20, 15));
-        window.draw(stripe);
+        window.draw(stripe, states);
     }
 
-    drawAccentGlyph(window, b, accentKind, accentColor);
+    drawAccentGlyph(window, b, accentKind, accentColor, states);
 }
 
 // Metalworking (smelter, blacksmith, goldsmith) -- a stone furnace with a
 // glowing window and an anvil out front, always smoking regardless of the
 // old ad-hoc smokesFrom list (every forge runs hot).
-void GameWorld::drawForgeShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor) {
-    drawWorkshopBody(window, b, true);
+void GameWorld::drawForgeShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor, const sf::RenderStates& states) {
+    drawWorkshopBody(window, b, true, states);
 
     sf::Vector2f windowSize(b.size.x * 0.22f, b.size.x * 0.22f);
     sf::Vector2f windowPos(b.position.x + b.size.x * 0.6f, b.position.y + b.size.y - windowSize.y - 10.f);
+    drawGlow(window, windowPos + windowSize / 2.f, windowSize.x * 0.5f, sf::Color(255, 140, 40, 220), states);
     sf::RectangleShape furnaceWin(windowSize);
     furnaceWin.setPosition(windowPos);
     furnaceWin.setFillColor(sf::Color(255, 140, 40));
     furnaceWin.setOutlineThickness(2.f);
     furnaceWin.setOutlineColor(sf::Color(25, 20, 15));
-    window.draw(furnaceWin);
+    window.draw(furnaceWin, states);
 
     // Anvil -- a dark trapezoid on a short leg, sitting in front of the shed.
     sf::ConvexShape anvil(4);
@@ -2049,16 +2281,16 @@ void GameWorld::drawForgeShape(sf::RenderWindow& window, const WorldBuilding& b,
     anvil.setFillColor(sf::Color(60, 60, 66));
     anvil.setOutlineThickness(1.5f);
     anvil.setOutlineColor(sf::Color(25, 20, 15));
-    window.draw(anvil);
+    window.draw(anvil, states);
 
-    drawAccentGlyph(window, b, accentKind, accentColor);
+    drawAccentGlyph(window, b, accentKind, accentColor, states);
 }
 
 // Woodworking (sawmill, carpenter) -- a big circular saw blade mounted on
 // the wall plus a stack of planks, distinct from the Sawmill/Carpenter's own
 // output (planks/furniture) being shown as goods elsewhere in the UI.
-void GameWorld::drawSawmillShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor) {
-    drawWorkshopBody(window, b, false);
+void GameWorld::drawSawmillShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor, const sf::RenderStates& states) {
+    drawWorkshopBody(window, b, false, states);
 
     sf::Vector2f center(b.position.x + b.size.x * 0.68f, b.position.y + b.size.y * 0.52f);
     float r = b.size.x * 0.2f;
@@ -2067,11 +2299,11 @@ void GameWorld::drawSawmillShape(sf::RenderWindow& window, const WorldBuilding& 
     blade.setFillColor(sf::Color(180, 180, 186));
     blade.setOutlineThickness(2.f);
     blade.setOutlineColor(sf::Color(25, 20, 15));
-    window.draw(blade);
+    window.draw(blade, states);
     sf::CircleShape hub(r * 0.25f);
     hub.setPosition(sf::Vector2f(center.x - r * 0.25f, center.y - r * 0.25f));
     hub.setFillColor(sf::Color(90, 90, 96));
-    window.draw(hub);
+    window.draw(hub, states);
     // Saw teeth -- short radial spokes around the rim.
     constexpr int kTeeth = 8;
     for (int i = 0; i < kTeeth; ++i) {
@@ -2080,53 +2312,53 @@ void GameWorld::drawSawmillShape(sf::RenderWindow& window, const WorldBuilding& 
             sf::Vertex{ sf::Vector2f(center.x + std::cos(ang) * r * 0.6f, center.y + std::sin(ang) * r * 0.6f), sf::Color(60, 60, 64) },
             sf::Vertex{ sf::Vector2f(center.x + std::cos(ang) * r * 1.15f, center.y + std::sin(ang) * r * 1.15f), sf::Color(60, 60, 64) },
         };
-        window.draw(tooth, 2, sf::PrimitiveType::Lines);
+        window.draw(tooth, 2, sf::PrimitiveType::Lines, states);
     }
 
     for (int i = 0; i < 3; ++i) {
         sf::Vector2f plankPos(b.position.x + b.size.x * 0.1f, b.position.y + b.size.y - 10.f - static_cast<float>(i) * 6.f);
-        drawPixelPanel(window, plankPos, sf::Vector2f(b.size.x * 0.32f, 5.f), sf::Color(190, 140, 80), sf::Color(120, 85, 45), plankPos, 5.f);
+        drawPixelPanel(window, plankPos, sf::Vector2f(b.size.x * 0.32f, 5.f), sf::Color(190, 140, 80), sf::Color(120, 85, 45), plankPos, 3.f, states);
     }
 
-    drawAccentGlyph(window, b, accentKind, accentColor);
+    drawAccentGlyph(window, b, accentKind, accentColor, states);
 }
 
 // Fiber/hide processing (textile, tailor, linen, tannery) -- a loom frame
 // with vertical warp threads and a hanging bolt of material in the accent
 // color, standing in for cloth or hides depending on which business it is.
-void GameWorld::drawFiberShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor) {
-    drawWorkshopBody(window, b, false);
+void GameWorld::drawFiberShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor, const sf::RenderStates& states) {
+    drawWorkshopBody(window, b, false, states);
 
     float frameW = b.size.x * 0.4f, frameH = b.size.y * 0.55f;
     sf::Vector2f framePos(b.position.x + b.size.x * 0.08f, b.position.y + b.size.y - frameH - 6.f);
     sf::RectangleShape postL(sf::Vector2f(3.f, frameH));
     postL.setPosition(framePos);
     postL.setFillColor(sf::Color(110, 80, 50));
-    window.draw(postL);
+    window.draw(postL, states);
     sf::RectangleShape postR(postL);
     postR.setPosition(sf::Vector2f(framePos.x + frameW, framePos.y));
-    window.draw(postR);
+    window.draw(postR, states);
     for (int i = 0; i < 4; ++i) {
         float x = framePos.x + frameW * (0.2f + 0.22f * static_cast<float>(i));
         sf::RectangleShape thread(sf::Vector2f(2.f, frameH));
         thread.setPosition(sf::Vector2f(x, framePos.y));
         thread.setFillColor(sf::Color(220, 215, 200));
-        window.draw(thread);
+        window.draw(thread, states);
     }
     drawPixelPanel(window, sf::Vector2f(framePos.x, framePos.y - 10.f), sf::Vector2f(frameW, 10.f),
-        accentColor, shade(accentColor, -50), b.position, 5.f);
+        accentColor, shade(accentColor, -50), b.position, 3.f, states);
 
-    drawAccentGlyph(window, b, accentKind, accentColor);
+    drawAccentGlyph(window, b, accentKind, accentColor, states);
 }
 
 // Stonecutting/gem workshop (mason, gemshop, jeweler, pearl atelier) -- a
 // workbench out front with a large faceted gem in the accent color, the
 // closest thing to a "shopfront display" any Workshop-family building gets.
-void GameWorld::drawMasonGemShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor) {
-    drawWorkshopBody(window, b, false);
+void GameWorld::drawMasonGemShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor, const sf::RenderStates& states) {
+    drawWorkshopBody(window, b, false, states);
 
     sf::Vector2f benchPos(b.position.x + b.size.x * 0.18f, b.position.y + b.size.y - 14.f);
-    drawPixelPanel(window, benchPos, sf::Vector2f(b.size.x * 0.5f, 8.f), sf::Color(120, 90, 60), sf::Color(70, 50, 30), b.position, 5.f);
+    drawPixelPanel(window, benchPos, sf::Vector2f(b.size.x * 0.5f, 8.f), sf::Color(120, 90, 60), sf::Color(70, 50, 30), b.position, 3.f, states);
 
     sf::Vector2f gemCenter(benchPos.x + b.size.x * 0.25f, benchPos.y - 10.f);
     sf::ConvexShape gem(6);
@@ -2138,44 +2370,44 @@ void GameWorld::drawMasonGemShape(sf::RenderWindow& window, const WorldBuilding&
     gem.setFillColor(accentColor);
     gem.setOutlineThickness(1.5f);
     gem.setOutlineColor(sf::Color(25, 20, 15));
-    window.draw(gem);
+    window.draw(gem, states);
     sf::CircleShape sparkle(2.5f);
     sparkle.setPosition(sf::Vector2f(gemCenter.x - 4.f, gemCenter.y - 6.f));
     sparkle.setFillColor(sf::Color(255, 255, 255, 200));
-    window.draw(sparkle);
+    window.draw(sparkle, states);
 
-    drawAccentGlyph(window, b, accentKind, accentColor);
+    drawAccentGlyph(window, b, accentKind, accentColor, states);
 }
 
 // Brewing/alchemy (winery, meadery, alchemist, creamery, apothecary) --
 // stacked barrels plus a bubbling still, the one visual all five share
 // despite making very different final goods.
-void GameWorld::drawBreweryShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor) {
-    drawWorkshopBody(window, b, false);
+void GameWorld::drawBreweryShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor, const sf::RenderStates& states) {
+    drawWorkshopBody(window, b, false, states);
 
     for (int i = 0; i < 2; ++i) {
         sf::Vector2f barrelPos(b.position.x + b.size.x * 0.12f + static_cast<float>(i) * 20.f, b.position.y + b.size.y - 22.f);
-        drawPixelPanel(window, barrelPos, sf::Vector2f(16.f, 20.f), sf::Color(150, 108, 60), sf::Color(90, 60, 30), barrelPos, 4.f);
+        drawPixelPanel(window, barrelPos, sf::Vector2f(16.f, 20.f), sf::Color(150, 108, 60), sf::Color(90, 60, 30), barrelPos, 3.f, states);
     }
 
     sf::Vector2f vatPos(b.position.x + b.size.x * 0.58f, b.position.y + b.size.y - 26.f);
-    drawPixelPanel(window, vatPos, sf::Vector2f(24.f, 22.f), sf::Color(120, 122, 128), sf::Color(60, 60, 66), b.position, 5.f);
+    drawPixelPanel(window, vatPos, sf::Vector2f(24.f, 22.f), sf::Color(120, 122, 128), sf::Color(60, 60, 66), b.position, 3.f, states);
     for (int i = 0; i < 3; ++i) {
         float bx = vatPos.x + 6.f + static_cast<float>(i) * 6.f;
         sf::CircleShape bubble(2.2f);
         bubble.setPosition(sf::Vector2f(bx, vatPos.y - 4.f - static_cast<float>(i) * 3.f));
         bubble.setFillColor(accentColor);
-        window.draw(bubble);
+        window.draw(bubble, states);
     }
 
-    drawAccentGlyph(window, b, accentKind, accentColor);
+    drawAccentGlyph(window, b, accentKind, accentColor, states);
 }
 
 // Smokehouse -- a few hanging smoked fish under the eave, plus a chimney
 // that's always lit (this is a one-business "theme" but distinct enough
 // from every other shed to be worth its own shape rather than reusing Oven).
-void GameWorld::drawSmokehouseShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor) {
-    drawWorkshopBody(window, b, true);
+void GameWorld::drawSmokehouseShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor, const sf::RenderStates& states) {
+    drawWorkshopBody(window, b, true, states);
 
     sf::Color fishColor(150, 130, 90);
     for (int i = 0; i < 3; ++i) {
@@ -2183,7 +2415,7 @@ void GameWorld::drawSmokehouseShape(sf::RenderWindow& window, const WorldBuildin
         float hookY = b.position.y + b.size.y * 0.22f;
         sf::Vertex hook[] = { sf::Vertex{ sf::Vector2f(x, hookY - 6.f), sf::Color(60, 60, 64) },
                                sf::Vertex{ sf::Vector2f(x, hookY), sf::Color(60, 60, 64) } };
-        window.draw(hook, 2, sf::PrimitiveType::Lines);
+        window.draw(hook, 2, sf::PrimitiveType::Lines, states);
         sf::ConvexShape fish(4);
         fish.setPoint(0, sf::Vector2f(x - 7.f, hookY + 4.f));
         fish.setPoint(1, sf::Vector2f(x, hookY + 1.f));
@@ -2192,33 +2424,33 @@ void GameWorld::drawSmokehouseShape(sf::RenderWindow& window, const WorldBuildin
         fish.setFillColor(fishColor);
         fish.setOutlineThickness(1.f);
         fish.setOutlineColor(sf::Color(25, 20, 15));
-        window.draw(fish);
+        window.draw(fish, states);
     }
 
-    drawAccentGlyph(window, b, accentKind, accentColor);
+    drawAccentGlyph(window, b, accentKind, accentColor, states);
 }
 
-void GameWorld::drawWorkshopShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor) {
+void GameWorld::drawWorkshopShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor, const sf::RenderStates& states) {
     // Fallback shape only -- every id that used to land here now has one of
     // the 8 themed shapes above instead (see isOvenId etc. and drawBuilding's
     // dispatch chain). Kept as a safety net for any future business that
     // doesn't fit one of those 8 groups.
-    drawWorkshopBody(window, b, smokesFrom(b.id));
-    drawAccentGlyph(window, b, accentKind, accentColor);
+    drawWorkshopBody(window, b, smokesFrom(b.id), states);
+    drawAccentGlyph(window, b, accentKind, accentColor, states);
 }
 
-void GameWorld::drawDockShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor) {
-    drawPixelPanel(window, b.position, sf::Vector2f(b.size.x, b.size.y * 0.72f), sf::Color(126, 92, 56), sf::Color(25, 20, 15), b.position, 6.f);
+void GameWorld::drawDockShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor, const sf::RenderStates& states) {
+    drawPixelPanel(window, b.position, sf::Vector2f(b.size.x, b.size.y * 0.72f), sf::Color(126, 92, 56), sf::Color(25, 20, 15), b.position, 4.f, states);
 
     for (float x = b.position.x + 8.f; x < b.position.x + b.size.x - 4.f; x += 14.f) {
         sf::RectangleShape plank(sf::Vector2f(2.f, b.size.y * 0.72f - 6.f));
         plank.setPosition(sf::Vector2f(x, b.position.y + 3.f));
         plank.setFillColor(sf::Color(100, 72, 42));
-        window.draw(plank);
+        window.draw(plank, states);
     }
 
     drawPixelPanel(window, sf::Vector2f(b.position.x, b.position.y + b.size.y * 0.72f),
-        sf::Vector2f(b.size.x, b.size.y * 0.28f), sf::Color(60, 110, 150), sf::Color(25, 20, 15), b.position, 6.f);
+        sf::Vector2f(b.size.x, b.size.y * 0.28f), sf::Color(60, 110, 150), sf::Color(25, 20, 15), b.position, 4.f, states);
 
     // The 7 Dock buildings shared the same deck+water look, distinguished
     // only by their accent glyph -- last of the archetype groups to get its
@@ -2256,22 +2488,50 @@ void GameWorld::drawDockShape(sf::RenderWindow& window, const WorldBuilding& b, 
     };
     sf::Vector2f iconSize(24.f, 24.f);
     sf::Vector2f iconPos(b.position.x + b.size.x / 2.f - iconSize.x / 2.f, b.position.y - iconSize.y - 6.f);
-    drawPixelSprite(window, *iconRows, sf::FloatRect(iconPos, iconSize), palette);
+    drawPixelSprite(window, *iconRows, sf::FloatRect(iconPos, iconSize), palette, false, states);
 
-    drawAccentGlyph(window, b, accentKind, accentColor);
+    drawAccentGlyph(window, b, accentKind, accentColor, states);
 }
 
-void GameWorld::drawServiceHallShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor) {
-    sf::Color bodyColor = darken(b.labelColor, 0.82f);
-    drawPixelPanel(window, b.position, b.size, bodyColor, sf::Color(25, 20, 15), b.position);
+void GameWorld::drawServiceHallShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor, const sf::RenderStates& states) {
+    // 2026-08-07 detail pass: these were a flat label-color box with 4
+    // pillars and no roof at all -- read as unfinished once the cottage/
+    // workshop archetypes got real shingled roofs. A civic-hall look now: a
+    // stone facade + pedimented roof, with the pillars getting simple
+    // capital/base caps for a classical-column read instead of plain bars.
+    float roofH = b.size.y * 0.24f;
+    float wallH = b.size.y - roofH;
+    float foundationH = wallH * 0.14f;
+    sf::Color roofColor = darken(b.labelColor, 0.55f);
+    sf::Color stoneWall(196, 192, 182);
+
+    drawStoneTrim(window, sf::Vector2f(b.position.x, b.position.y + b.size.y - foundationH),
+        sf::Vector2f(b.size.x, foundationH), b.position, states);
+    drawPixelPanel(window, sf::Vector2f(b.position.x, b.position.y + roofH),
+        sf::Vector2f(b.size.x, wallH - foundationH), stoneWall, sf::Color(120, 116, 108), b.position, 5.f, states);
+    drawGableRoof(window, sf::FloatRect(sf::Vector2f(b.position.x - 8.f, b.position.y - 6.f),
+        sf::Vector2f(b.size.x + 16.f, roofH + 6.f)), roofColor, b.position, states);
 
     // A row of pillars along the front, civic-hall style.
+    sf::Color columnColor(224, 220, 208), columnShade(150, 146, 136);
     for (int i = 0; i < 4; ++i) {
         float x = b.position.x + b.size.x * (0.15f + 0.23f * static_cast<float>(i));
-        sf::RectangleShape pillar(sf::Vector2f(8.f, b.size.y - 10.f));
-        pillar.setPosition(sf::Vector2f(x, b.position.y + 6.f));
-        pillar.setFillColor(b.labelColor);
-        window.draw(pillar);
+        float pillarTop = b.position.y + roofH + 3.f;
+        float pillarBottom = b.position.y + b.size.y - foundationH - 3.f;
+        sf::RectangleShape pillar(sf::Vector2f(8.f, pillarBottom - pillarTop));
+        pillar.setPosition(sf::Vector2f(x, pillarTop));
+        pillar.setFillColor(columnColor);
+        pillar.setOutlineThickness(1.f);
+        pillar.setOutlineColor(columnShade);
+        window.draw(pillar, states);
+        sf::RectangleShape cap(sf::Vector2f(11.f, 3.f));
+        cap.setPosition(sf::Vector2f(x - 1.5f, pillarTop - 1.f));
+        cap.setFillColor(columnColor);
+        window.draw(cap, states);
+        sf::RectangleShape baseCap(sf::Vector2f(11.f, 3.f));
+        baseCap.setPosition(sf::Vector2f(x - 1.5f, pillarBottom - 2.f));
+        baseCap.setFillColor(columnColor);
+        window.draw(baseCap, states);
     }
 
     if (b.id == "townhall") {
@@ -2280,14 +2540,14 @@ void GameWorld::drawServiceHallShape(sf::RenderWindow& window, const WorldBuildi
         sf::RectangleShape pole(sf::Vector2f(3.f, 22.f));
         pole.setPosition(sf::Vector2f(b.position.x + b.size.x * 0.5f, b.position.y - 20.f));
         pole.setFillColor(sf::Color(80, 70, 60));
-        window.draw(pole);
+        window.draw(pole, states);
         sf::ConvexShape flag(3);
         sf::Vector2f fp(b.position.x + b.size.x * 0.5f + 3.f, b.position.y - 20.f);
         flag.setPoint(0, fp);
         flag.setPoint(1, sf::Vector2f(fp.x + 14.f, fp.y + 4.f));
         flag.setPoint(2, sf::Vector2f(fp.x, fp.y + 8.f));
         flag.setFillColor(accentColor);
-        window.draw(flag);
+        window.draw(flag, states);
         return;
     }
 
@@ -2333,14 +2593,14 @@ void GameWorld::drawServiceHallShape(sf::RenderWindow& window, const WorldBuildi
     };
     sf::Vector2f iconSize(26.f, 22.f);
     sf::Vector2f iconPos(b.position.x + b.size.x / 2.f - iconSize.x / 2.f, b.position.y - iconSize.y - 6.f);
-    drawPixelSprite(window, *iconRows, sf::FloatRect(iconPos, iconSize), palette);
+    drawPixelSprite(window, *iconRows, sf::FloatRect(iconPos, iconSize), palette, false, states);
 }
 
-void GameWorld::drawLockOverlay(sf::RenderWindow& window, const WorldBuilding& b) {
+void GameWorld::drawLockOverlay(sf::RenderWindow& window, const WorldBuilding& b, const sf::RenderStates& states) {
     sf::RectangleShape dim(b.size);
     dim.setPosition(b.position);
     dim.setFillColor(sf::Color(10, 10, 15, 150));
-    window.draw(dim);
+    window.draw(dim, states);
 
     sf::Vector2f center = b.position + b.size / 2.f;
     sf::RectangleShape lockBody(sf::Vector2f(20.f, 16.f));
@@ -2348,17 +2608,17 @@ void GameWorld::drawLockOverlay(sf::RenderWindow& window, const WorldBuilding& b
     lockBody.setFillColor(sf::Color(225, 205, 110));
     lockBody.setOutlineThickness(1.5f);
     lockBody.setOutlineColor(sf::Color(40, 30, 10));
-    window.draw(lockBody);
+    window.draw(lockBody, states);
 
     sf::CircleShape shackle(8.f);
     shackle.setFillColor(sf::Color::Transparent);
     shackle.setOutlineThickness(3.f);
     shackle.setOutlineColor(sf::Color(225, 205, 110));
     shackle.setPosition(sf::Vector2f(center.x - 8.f, center.y - 18.f));
-    window.draw(shackle);
+    window.draw(shackle, states);
 }
 
-void GameWorld::drawEmptyPlotShape(sf::RenderWindow& window, const WorldBuilding& b, const ConstructionInfo& ci) {
+void GameWorld::drawEmptyPlotShape(sf::RenderWindow& window, const WorldBuilding& b, const ConstructionInfo& ci, const sf::RenderStates& states) {
     // Bare, muted ground -- deliberately duller/flatter than any built shape
     // (or the construction site below) so an unstarted plot reads as
     // "nothing here yet" at a glance rather than looking broken.
@@ -2367,7 +2627,7 @@ void GameWorld::drawEmptyPlotShape(sf::RenderWindow& window, const WorldBuilding
     ground.setFillColor(sf::Color(70, 78, 62));
     ground.setOutlineThickness(1.5f);
     ground.setOutlineColor(sf::Color(45, 50, 40));
-    window.draw(ground);
+    window.draw(ground, states);
 
     // A small signboard in the corner of the plot naming what's meant to go
     // here (plus the material shortlist, so a walk-by tells you what to
@@ -2380,20 +2640,23 @@ void GameWorld::drawEmptyPlotShape(sf::RenderWindow& window, const WorldBuilding
     sf::RectangleShape post(sf::Vector2f(5.f, boardH + 6.f));
     post.setPosition(postPos);
     post.setFillColor(sf::Color(94, 62, 32));
-    window.draw(post);
+    window.draw(post, states);
 
     sf::RectangleShape board(sf::Vector2f(88.f, boardH));
     board.setPosition(sf::Vector2f(postPos.x - 6.f, postPos.y));
     board.setFillColor(sf::Color(196, 168, 118));
     board.setOutlineThickness(1.5f);
     board.setOutlineColor(sf::Color(94, 62, 32));
-    window.draw(board);
+    window.draw(board, states);
 
     if (fontLoaded_) {
+        // Anchor points only, not the full shear -- see drawBuilding's label
+        // (states' shear would slant these glyphs).
+        sf::Transform tf = worldObliqueTransform();
         std::string text = Localization::t("construction_plot_sign_prefix") + Localization::t(b.labelKey);
         sf::Text label(font_, toSfString(text), 10);
         label.setFillColor(sf::Color(40, 30, 15));
-        label.setPosition(sf::Vector2f(board.getPosition().x + 4.f, board.getPosition().y + 4.f));
+        label.setPosition(tf.transformPoint(sf::Vector2f(board.getPosition().x + 4.f, board.getPosition().y + 4.f)));
         window.draw(label);
 
         float lineY = board.getPosition().y + 20.f;
@@ -2402,17 +2665,17 @@ void GameWorld::drawEmptyPlotShape(sf::RenderWindow& window, const WorldBuilding
             line << Localization::t(m.goodId) << " " << formatNumber(m.have) << "/" << formatNumber(m.required);
             sf::Text matLine(font_, toSfString(line.str()), 9);
             matLine.setFillColor(m.have >= m.required ? sf::Color(30, 90, 30) : sf::Color(110, 30, 30));
-            matLine.setPosition(sf::Vector2f(board.getPosition().x + 4.f, lineY));
+            matLine.setPosition(tf.transformPoint(sf::Vector2f(board.getPosition().x + 4.f, lineY)));
             window.draw(matLine);
             lineY += 13.f;
         }
     }
 }
 
-void GameWorld::drawConstructionSiteShape(sf::RenderWindow& window, const WorldBuilding& b, const ConstructionInfo& ci) {
+void GameWorld::drawConstructionSiteShape(sf::RenderWindow& window, const WorldBuilding& b, const ConstructionInfo& ci, const sf::RenderStates& states) {
     // Excavated, earthy ground -- distinct from both the empty plot's dull
     // grey-green above and any finished building's own colors.
-    drawPixelPanel(window, b.position, b.size, sf::Color(120, 96, 62), sf::Color(70, 55, 30), b.position, 7.f);
+    drawPixelPanel(window, b.position, b.size, sf::Color(120, 96, 62), sf::Color(70, 55, 30), b.position, 4.5f, states);
 
     // A crossed scaffold -- flat lines, no gradients, matching every other
     // building shape's look.
@@ -2423,7 +2686,7 @@ void GameWorld::drawConstructionSiteShape(sf::RenderWindow& window, const WorldB
         sf::Vertex{ sf::Vector2f(b.position.x + 6.f, b.position.y + 6.f), beam },
         sf::Vertex{ sf::Vector2f(b.position.x + b.size.x - 6.f, b.position.y + b.size.y - 6.f), beam },
     };
-    window.draw(scaffold, 4, sf::PrimitiveType::Lines);
+    window.draw(scaffold, 4, sf::PrimitiveType::Lines, states);
 
     // A small pile of material blocks in the corner.
     const sf::Color materialColors[3] = { sf::Color(196, 168, 118), sf::Color(150, 150, 156), sf::Color(120, 80, 50) };
@@ -2431,7 +2694,7 @@ void GameWorld::drawConstructionSiteShape(sf::RenderWindow& window, const WorldB
         sf::RectangleShape chunk(sf::Vector2f(12.f, 10.f));
         chunk.setPosition(sf::Vector2f(b.position.x + 8.f + static_cast<float>(i) * 14.f, b.position.y + b.size.y - 18.f));
         chunk.setFillColor(materialColors[i]);
-        window.draw(chunk);
+        window.draw(chunk, states);
     }
 
     // Progress bar along the bottom edge of the site itself (not above the
@@ -2442,21 +2705,23 @@ void GameWorld::drawConstructionSiteShape(sf::RenderWindow& window, const WorldB
     sf::RectangleShape barBg(sf::Vector2f(barW, barH));
     barBg.setPosition(barPos);
     barBg.setFillColor(sf::Color(30, 30, 34));
-    window.draw(barBg);
+    window.draw(barBg, states);
 
     double totalDays = std::max(1, ci.totalDays);
     float progress = static_cast<float>(std::clamp(1.0 - (ci.daysRemaining / totalDays), 0.0, 1.0));
     sf::RectangleShape barFill(sf::Vector2f(barW * progress, barH));
     barFill.setPosition(barPos);
     barFill.setFillColor(sf::Color(232, 212, 120));
-    window.draw(barFill);
+    window.draw(barFill, states);
 
     if (fontLoaded_) {
         int daysLeft = static_cast<int>(std::ceil(ci.daysRemaining));
         std::string text = Localization::t("construction_site_days_left_prefix") + std::to_string(daysLeft) + Localization::t("construction_site_days_left_suffix");
         sf::Text label(font_, toSfString(text), 12);
         sf::FloatRect bounds = label.getLocalBounds();
-        label.setPosition(sf::Vector2f(b.position.x + b.size.x / 2.f - bounds.size.x / 2.f - bounds.position.x, b.position.y + b.size.y / 2.f - 8.f));
+        sf::Vector2f anchor(b.position.x + b.size.x / 2.f - bounds.size.x / 2.f - bounds.position.x, b.position.y + b.size.y / 2.f - 8.f);
+        // Anchor point only, not the full shear -- see drawBuilding's label.
+        label.setPosition(worldObliqueTransform().transformPoint(anchor));
         label.setFillColor(sf::Color(255, 240, 210));
         label.setOutlineColor(sf::Color::Black);
         label.setOutlineThickness(2.f);
@@ -2464,7 +2729,7 @@ void GameWorld::drawConstructionSiteShape(sf::RenderWindow& window, const WorldB
     }
 }
 
-void GameWorld::drawBuilding(sf::RenderWindow& window, const WorldBuilding& b) {
+void GameWorld::drawBuilding(sf::RenderWindow& window, const WorldBuilding& b, const sf::RenderStates& states) {
     // Prerequisite lock (see BusinessManager::isLocked) takes priority over
     // everything below and is unchanged from before this feature: a
     // tier-2/3 building whose tier-1 source isn't built yet still just gets
@@ -2479,36 +2744,36 @@ void GameWorld::drawBuilding(sf::RenderWindow& window, const WorldBuilding& b) {
     // straight to the shared name label below.
     ConstructionInfo ci = locked ? ConstructionInfo{} : game_.businessConstructionInfo(b.id);
     if (ci.requiresConstruction) {
-        if (ci.inProgress) drawConstructionSiteShape(window, b, ci);
-        else drawEmptyPlotShape(window, b, ci);
+        if (ci.inProgress) drawConstructionSiteShape(window, b, ci, states);
+        else drawEmptyPlotShape(window, b, ci, states);
     } else {
-        if (b.id == "farm") drawFarmShape(window, b);
-        else if (b.id == "mine") drawMineShape(window, b);
-        else if (b.id == "lumber") drawLumberShape(window, b);
-        else if (b.id == "quarry") drawQuarryShape(window, b);
-        else if (b.id == "sheep") drawPastureShape(window, b);
-        else if (b.id == "orchard") drawOrchardShape(window, b);
-        else if (b.id == "herbgarden") drawHerbGardenShape(window, b);
-        else if (b.id == "vineyard") drawVineyardShape(window, b);
-        else if (b.id == "goldmine") drawGoldMineShape(window, b);
-        else if (isDockId(b.id)) { BuildingAccent a = accentFor(b.id); drawDockShape(window, b, a.kind, a.color); }
-        else if (isFieldId(b.id)) { BuildingAccent a = accentFor(b.id); drawFieldShape(window, b, a.kind, a.color); }
-        else if (isServiceHallId(b.id)) { BuildingAccent a = accentFor(b.id); drawServiceHallShape(window, b, a.kind, a.color); }
-        else if (b.id == "sleep" || b.id == "eat" || b.id == "doctor") drawCottageShape(window, b);
+        if (b.id == "farm") drawFarmShape(window, b, states);
+        else if (b.id == "mine") drawMineShape(window, b, states);
+        else if (b.id == "lumber") drawLumberShape(window, b, states);
+        else if (b.id == "quarry") drawQuarryShape(window, b, states);
+        else if (b.id == "sheep") drawPastureShape(window, b, states);
+        else if (b.id == "orchard") drawOrchardShape(window, b, states);
+        else if (b.id == "herbgarden") drawHerbGardenShape(window, b, states);
+        else if (b.id == "vineyard") drawVineyardShape(window, b, states);
+        else if (b.id == "goldmine") drawGoldMineShape(window, b, states);
+        else if (isDockId(b.id)) { BuildingAccent a = accentFor(b.id); drawDockShape(window, b, a.kind, a.color, states); }
+        else if (isFieldId(b.id)) { BuildingAccent a = accentFor(b.id); drawFieldShape(window, b, a.kind, a.color, states); }
+        else if (isServiceHallId(b.id)) { BuildingAccent a = accentFor(b.id); drawServiceHallShape(window, b, a.kind, a.color, states); }
+        else if (b.id == "sleep" || b.id == "eat" || b.id == "doctor") drawCottageShape(window, b, states);
         // The 33 remaining processors used to all land on the one generic
         // Workshop shape below -- now split into 8 themed sub-archetypes by
         // what they actually make (see isOvenId etc. above).
-        else if (isOvenId(b.id)) { BuildingAccent a = accentFor(b.id); drawOvenShape(window, b, a.kind, a.color); }
-        else if (isStallId(b.id)) { BuildingAccent a = accentFor(b.id); drawStallShape(window, b, a.kind, a.color); }
-        else if (isForgeId(b.id)) { BuildingAccent a = accentFor(b.id); drawForgeShape(window, b, a.kind, a.color); }
-        else if (isSawmillId(b.id)) { BuildingAccent a = accentFor(b.id); drawSawmillShape(window, b, a.kind, a.color); }
-        else if (isFiberId(b.id)) { BuildingAccent a = accentFor(b.id); drawFiberShape(window, b, a.kind, a.color); }
-        else if (isMasonGemId(b.id)) { BuildingAccent a = accentFor(b.id); drawMasonGemShape(window, b, a.kind, a.color); }
-        else if (isBreweryId(b.id)) { BuildingAccent a = accentFor(b.id); drawBreweryShape(window, b, a.kind, a.color); }
-        else if (isSmokehouseId(b.id)) { BuildingAccent a = accentFor(b.id); drawSmokehouseShape(window, b, a.kind, a.color); }
-        else { BuildingAccent a = accentFor(b.id); drawWorkshopShape(window, b, a.kind, a.color); } // safety net -- shouldn't be reachable
+        else if (isOvenId(b.id)) { BuildingAccent a = accentFor(b.id); drawOvenShape(window, b, a.kind, a.color, states); }
+        else if (isStallId(b.id)) { BuildingAccent a = accentFor(b.id); drawStallShape(window, b, a.kind, a.color, states); }
+        else if (isForgeId(b.id)) { BuildingAccent a = accentFor(b.id); drawForgeShape(window, b, a.kind, a.color, states); }
+        else if (isSawmillId(b.id)) { BuildingAccent a = accentFor(b.id); drawSawmillShape(window, b, a.kind, a.color, states); }
+        else if (isFiberId(b.id)) { BuildingAccent a = accentFor(b.id); drawFiberShape(window, b, a.kind, a.color, states); }
+        else if (isMasonGemId(b.id)) { BuildingAccent a = accentFor(b.id); drawMasonGemShape(window, b, a.kind, a.color, states); }
+        else if (isBreweryId(b.id)) { BuildingAccent a = accentFor(b.id); drawBreweryShape(window, b, a.kind, a.color, states); }
+        else if (isSmokehouseId(b.id)) { BuildingAccent a = accentFor(b.id); drawSmokehouseShape(window, b, a.kind, a.color, states); }
+        else { BuildingAccent a = accentFor(b.id); drawWorkshopShape(window, b, a.kind, a.color, states); } // safety net -- shouldn't be reachable
 
-        if (locked) drawLockOverlay(window, b);
+        if (locked) drawLockOverlay(window, b, states);
     }
 
     if (fontLoaded_) {
@@ -2533,7 +2798,10 @@ void GameWorld::drawBuilding(sf::RenderWindow& window, const WorldBuilding& b) {
         float labelOffsetY = hasIconSign ? 48.f : 26.f;
         sf::Text text(font_, toSfString(label), 13);
         sf::FloatRect bounds = text.getLocalBounds();
-        text.setPosition(sf::Vector2f(b.position.x + b.size.x / 2.f - bounds.size.x / 2.f, b.position.y - labelOffsetY));
+        sf::Vector2f anchor(b.position.x + b.size.x / 2.f - bounds.size.x / 2.f, b.position.y - labelOffsetY);
+        // Anchor point only, not the full shear -- states' shear would slant
+        // the glyphs themselves (see worldObliqueTransform's doc comment).
+        text.setPosition(worldObliqueTransform().transformPoint(anchor));
         text.setFillColor(b.labelColor);
         text.setOutlineColor(sf::Color::Black);
         text.setOutlineThickness(2.f);
@@ -2542,7 +2810,7 @@ void GameWorld::drawBuilding(sf::RenderWindow& window, const WorldBuilding& b) {
     }
 }
 
-void GameWorld::drawTree(sf::RenderWindow& window, sf::Vector2f pos) {
+void GameWorld::drawTree(sf::RenderWindow& window, sf::Vector2f pos, const sf::RenderStates& states) {
     // Canopy color follows the season -- fresh light green in Spring, the
     // original deep green as Summer's full-bloom baseline, warm orange/red
     // in Autumn, pale/bare in Winter -- now shaded into highlight/base/shadow
@@ -2592,11 +2860,11 @@ void GameWorld::drawTree(sf::RenderWindow& window, sf::Vector2f pos) {
     // A shadow under the trunk grounds the sprite -- without it a flat pixel
     // cutout on top of the grass reads as pasted-on/floating rather than an
     // actual tree standing in the world.
-    drawGroundShadow(window, sf::Vector2f(pos.x, pos.y + 14.f), kTreeRadius * 0.9f);
-    drawPixelSprite(window, rows, sf::FloatRect(topLeft, spriteSize), palette);
+    drawGroundShadow(window, sf::Vector2f(pos.x, pos.y + 14.f), kTreeRadius * 0.9f, states);
+    drawPixelSprite(window, rows, sf::FloatRect(topLeft, spriteSize), palette, false, states);
 }
 
-void GameWorld::drawBush(sf::RenderWindow& window, sf::Vector2f pos) {
+void GameWorld::drawBush(sf::RenderWindow& window, sf::Vector2f pos, const sf::RenderStates& states) {
     sf::Color fill;
     switch (game_.currentSeason()) {
     case Season::Spring: fill = sf::Color(122, 192, 112); break;
@@ -2604,26 +2872,66 @@ void GameWorld::drawBush(sf::RenderWindow& window, sf::Vector2f pos) {
     case Season::Winter: fill = sf::Color(202, 206, 212); break;
     default:             fill = sf::Color(54, 132, 62);   break; // Summer
     }
+    // Was a near-circular 8x7 blob -- at a glance across a whole zone it
+    // read as a plain "green dot" rather than a bush (reported 2026-08-06).
+    // Widened into a lumpy twin-mound silhouette (the OO dip in row 1 splits
+    // it into two overlapping clumps) and given the same 'L' leaf-cluster
+    // texture role drawTree's canopy uses, so it reads as foliage instead of
+    // a flat disc.
     static const std::vector<std::string> rows = {
-        "..OOOO..",
-        ".OHHHHO.",
-        "OHBBBBHO",
-        "OBBBBBBO",
-        "OBBSBBBO",
-        ".OSSSSO.",
-        "..OOOO..",
+        "...OOO..OOO..",
+        "..OHHHOOHHHO.",
+        ".OHBBBLBBBHO.",
+        "OHBBBBBBBBBHO",
+        "OBBBLBBBLBBBO",
+        "OBBSBBBBSBBBO",
+        ".OSSSSSSSSSO.",
+        "..OOOOOOOOO..",
     };
     std::unordered_map<char, sf::Color> palette = {
         { 'O', shade(fill, -60) },
         { 'H', shade(fill, 35) },
         { 'B', fill },
+        { 'L', shade(fill, 14) },
         { 'S', shade(fill, -35) },
     };
-    drawGroundShadow(window, sf::Vector2f(pos.x + 9.f, pos.y + 16.f), 7.f);
-    drawPixelSprite(window, rows, sf::FloatRect(pos, sf::Vector2f(18.f, 18.f)), palette);
+    drawGroundShadow(window, sf::Vector2f(pos.x + 13.f, pos.y + 15.f), 9.f, states);
+    drawPixelSprite(window, rows, sf::FloatRect(pos, sf::Vector2f(26.f, 16.f)), palette, false, states);
 }
 
-void GameWorld::drawNpc(sf::RenderWindow& window, const Npc& npc) {
+void GameWorld::drawLamp(sf::RenderWindow& window, sf::Vector2f pos, const sf::RenderStates& states) {
+    float night = nightFactor();
+    drawGroundShadow(window, sf::Vector2f(pos.x, pos.y + 34.f), 8.f, states);
+
+    // Iron pole -- no seasonal/day-night variation, it's just metal.
+    drawPixelPanel(window, sf::Vector2f(pos.x - 2.f, pos.y - 4.f), sf::Vector2f(4.f, 38.f),
+        sf::Color(58, 56, 60), sf::Color(28, 26, 30), pos, 4.f, states);
+
+    // Lantern glass tints from a dull unlit grey to a warm amber as
+    // nightFactor() rises, so the lamp visibly "switches on" at dusk instead
+    // of always looking lit -- see the guard NPC's complaint this answers:
+    // 2026-08-06, "the lamp effect could be more obvious at night".
+    auto lerp8 = [](std::uint8_t a, std::uint8_t b, float t) {
+        return static_cast<std::uint8_t>(static_cast<float>(a) + (static_cast<float>(b) - static_cast<float>(a)) * t);
+    };
+    sf::Color glass(lerp8(70, 255, night), lerp8(74, 214, night), lerp8(82, 140, night));
+
+    sf::Vector2f headSize(14.f, 16.f);
+    sf::Vector2f headPos(pos.x - headSize.x / 2.f, pos.y - 4.f - headSize.y);
+    // Alpha swings from barely-there by day to a full warm halo at night --
+    // a much wider range than drawGlow's own built-in day/night scaling
+    // alone, since an unlit lamp shouldn't glow at all at noon.
+    drawGlow(window, headPos + headSize / 2.f, headSize.x * 0.65f,
+        sf::Color(255, 190, 110, static_cast<std::uint8_t>(30.f + 190.f * night)), states);
+    drawPixelPanel(window, headPos, headSize, glass, sf::Color(28, 26, 30), pos, 4.f, states);
+
+    sf::RectangleShape cap(sf::Vector2f(headSize.x + 6.f, 4.f));
+    cap.setPosition(sf::Vector2f(headPos.x - 3.f, headPos.y - 4.f));
+    cap.setFillColor(sf::Color(40, 38, 42));
+    window.draw(cap, states);
+}
+
+void GameWorld::drawNpc(sf::RenderWindow& window, const Npc& npc, const sf::RenderStates& states) {
     // npc.pos is this NPC's collision-box center (see updateNpcs/collidesWith*),
     // same spot the old flat circle used to be centered on -- drawPixelPerson
     // wants a feet-center point, i.e. kPlayerSize/2 further down.
@@ -2631,12 +2939,14 @@ void GameWorld::drawNpc(sf::RenderWindow& window, const Npc& npc) {
     // (see updateNpcs); `npc.home` seeds a per-NPC offset off the shared
     // waterWaveTimer_ clock so a whole zone's NPCs don't all bob in lockstep.
     float walkPhase = npc.isWalking ? waterWaveTimer_ * 6.f + npc.home.x * 0.3f : 0.f;
-    drawPixelPerson(window, sf::Vector2f(npc.pos.x, npc.pos.y + kPlayerSize / 2.f), npc.color, false, walkPhase);
+    drawPixelPerson(window, sf::Vector2f(npc.pos.x, npc.pos.y + kPlayerSize / 2.f), npc.color, false, walkPhase, states);
 
     if (fontLoaded_) {
         sf::Text text(font_, toSfString(Localization::t(npc.nameKey)), 12);
         sf::FloatRect bounds = text.getLocalBounds();
-        text.setPosition(sf::Vector2f(npc.pos.x - bounds.size.x / 2.f, npc.pos.y - kPlayerSize));
+        sf::Vector2f anchor(npc.pos.x - bounds.size.x / 2.f, npc.pos.y - kPlayerSize);
+        // Anchor point only, not the full shear -- see drawBuilding's label.
+        text.setPosition(worldObliqueTransform().transformPoint(anchor));
         text.setFillColor(sf::Color::White);
         text.setOutlineColor(sf::Color::Black);
         text.setOutlineThickness(2.f);
@@ -2645,6 +2955,7 @@ void GameWorld::drawNpc(sf::RenderWindow& window, const Npc& npc) {
 }
 
 void GameWorld::drawZone(sf::RenderWindow& window) {
+    sf::RenderStates states{ worldObliqueTransform() };
     const Zone& z = zones_[currentZone_];
 
     for (const auto& d : z.decorations) {
@@ -2652,13 +2963,13 @@ void GameWorld::drawZone(sf::RenderWindow& window) {
             sf::RectangleShape patch(d.size);
             patch.setPosition(d.position);
             patch.setFillColor(sf::Color(40, 122, 50, 120));
-            window.draw(patch);
+            window.draw(patch, states);
         } else if (d.kind == Decoration::Kind::Path) {
-            drawPixelPanel(window, d.position, d.size, sf::Color(176, 152, 104), sf::Color(140, 118, 78), d.position, 9.f);
+            drawPixelPanel(window, d.position, d.size, sf::Color(176, 152, 104), sf::Color(140, 118, 78), d.position, 5.5f, states);
         } else if (d.kind == Decoration::Kind::Sand) {
-            drawPixelPanel(window, d.position, d.size, sf::Color(222, 198, 150), sf::Color(190, 165, 115), d.position, 9.f);
+            drawPixelPanel(window, d.position, d.size, sf::Color(222, 198, 150), sf::Color(190, 165, 115), d.position, 5.5f, states);
         } else if (d.kind == Decoration::Kind::Water) {
-            drawPixelPanel(window, d.position, d.size, sf::Color(48, 92, 130), sf::Color(28, 60, 90), d.position, 9.f);
+            drawPixelPanel(window, d.position, d.size, sf::Color(48, 92, 130), sf::Color(28, 60, 90), d.position, 5.5f, states);
 
             // A few slow, phase-offset sine "ripples" -- purely cosmetic,
             // driven by waterWaveTimer_ (see run()'s per-frame update).
@@ -2671,15 +2982,48 @@ void GameWorld::drawZone(sf::RenderWindow& window) {
                     float wobble = std::sin(phase + x * 0.02f) * 3.f;
                     verts.push_back(sf::Vertex{ sf::Vector2f(x, rowY + wobble), sf::Color(120, 170, 200, 160) });
                 }
-                if (verts.size() >= 2) window.draw(verts.data(), verts.size(), sf::PrimitiveType::LineStrip);
+                if (verts.size() >= 2) window.draw(verts.data(), verts.size(), sf::PrimitiveType::LineStrip, states);
             }
         }
     }
-    for (const auto& d : z.decorations) if (d.kind == Decoration::Kind::Bush) drawBush(window, d.position);
-    for (const auto& f : z.forageables) drawForageable(window, f);
-    for (const auto& b : z.buildings) drawBuilding(window, b);
-    for (const auto& npc : z.npcs) drawNpc(window, npc);
-    for (const auto& d : z.decorations) if (d.kind == Decoration::Kind::Tree) drawTree(window, d.position);
+    for (const auto& f : z.forageables) drawForageable(window, f, states);
+
+    // Y-sorted (painter's algorithm) pass for everything that can occlude or
+    // be occluded by something else standing on the ground -- buildings,
+    // NPCs, trees, bushes, and the player all interleaved by depth instead of
+    // the old fixed category order (which always drew trees last/on top and
+    // the player after everything, regardless of position). Sort key is each
+    // sprite's own "feet"/bottom-edge Y, matching the anchor convention each
+    // draw function already uses. Ground-plane content above (grass/path/
+    // sand/water, forageables) stays an unsorted first pass -- it's the
+    // floor, nothing occludes it.
+    struct DepthEntry { float sortY; int kind; int index; }; // kind: 0 building, 1 npc, 2 tree, 3 bush, 4 player, 5 lamp
+    std::vector<DepthEntry> entries;
+    entries.reserve(z.buildings.size() + z.npcs.size() + z.decorations.size() + 1);
+    for (size_t i = 0; i < z.buildings.size(); ++i)
+        entries.push_back({ z.buildings[i].position.y + z.buildings[i].size.y, 0, static_cast<int>(i) });
+    for (size_t i = 0; i < z.npcs.size(); ++i)
+        entries.push_back({ z.npcs[i].pos.y + kPlayerSize / 2.f, 1, static_cast<int>(i) });
+    for (size_t i = 0; i < z.decorations.size(); ++i) {
+        if (z.decorations[i].kind == Decoration::Kind::Tree)
+            entries.push_back({ z.decorations[i].position.y + 14.f, 2, static_cast<int>(i) });
+        else if (z.decorations[i].kind == Decoration::Kind::Bush)
+            entries.push_back({ z.decorations[i].position.y + 16.f, 3, static_cast<int>(i) });
+        else if (z.decorations[i].kind == Decoration::Kind::Lamp)
+            entries.push_back({ z.decorations[i].position.y + 34.f, 5, static_cast<int>(i) });
+    }
+    entries.push_back({ playerPos_.y + kPlayerSize, 4, -1 });
+    std::sort(entries.begin(), entries.end(), [](const DepthEntry& a, const DepthEntry& b) { return a.sortY < b.sortY; });
+    for (const auto& e : entries) {
+        switch (e.kind) {
+        case 0: drawBuilding(window, z.buildings[static_cast<size_t>(e.index)], states); break;
+        case 1: drawNpc(window, z.npcs[static_cast<size_t>(e.index)], states); break;
+        case 2: drawTree(window, z.decorations[static_cast<size_t>(e.index)].position, states); break;
+        case 3: drawBush(window, z.decorations[static_cast<size_t>(e.index)].position, states); break;
+        case 5: drawLamp(window, z.decorations[static_cast<size_t>(e.index)].position, states); break;
+        default: drawPlayer(window, playerPos_, playerFacingLeft_, playerWalkTimer_); break;
+        }
+    }
 }
 
 void GameWorld::drawLegend(sf::RenderWindow& window) {
@@ -2998,20 +3342,32 @@ void GameWorld::updateDayNightAndWeather(float dt) {
 }
 
 sf::Color GameWorld::dayNightTint() const {
-    // Four flat-color keyframes cycled through smoothly: dawn -> day (no
-    // tint) -> dusk -> night -> back to dawn. Deliberately just a linear
-    // blend between two RGBA keyframes, no gradients/glow, to match the
-    // rest of the world's plain-shape look.
+    // Flat-color keyframes cycled through smoothly: dawn -> day (no tint) ->
+    // dusk -> night -> a held night plateau -> dawn again. Deliberately just
+    // a linear blend between two RGBA keyframes, no gradients/glow, to match
+    // the rest of the world's plain-shape look.
+    //
+    // The original table had a single instantaneous "night" keyframe with
+    // dusk fading in on one side and dawn fading out on the other -- true
+    // full darkness only ever lasted one instant, the rest of "night" was
+    // actually still mid-transition, which read as "dim" rather than
+    // "dark" (reported 2026-08-06: the lamp effect wasn't obvious enough at
+    // night). Repeating the night color across two keyframes (0.58/0.88)
+    // holds it at full strength for a real stretch of the cycle instead of
+    // just touching it. Also darker/more opaque than before (was 25,35,80,
+    // 130) so lit windows/lamps actually have something dark to stand out
+    // against.
     struct Key { float t; std::uint8_t r, g, b, a; };
     static const Key keys[] = {
-        { 0.00f, 255, 200, 150, 55 },  // dawn
-        { 0.25f, 255, 255, 255, 0 },   // day
-        { 0.50f, 255, 150, 90, 60 },   // dusk
-        { 0.75f, 25, 35, 80, 130 },    // night
-        { 1.00f, 255, 200, 150, 55 },  // wraps back to dawn
+        { 0.00f, 255, 200, 150, 60 },  // dawn
+        { 0.18f, 255, 255, 255, 0 },   // day
+        { 0.42f, 255, 140, 90, 70 },   // dusk
+        { 0.58f, 18, 22, 55, 190 },    // night reached
+        { 0.88f, 18, 22, 55, 190 },    // night held
+        { 1.00f, 255, 200, 150, 60 },  // wraps back to dawn
     };
     float t = dayNightTimer_ / kDayNightCycleSeconds;
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 5; ++i) {
         if (t < keys[i].t || t > keys[i + 1].t) continue;
         float span = keys[i + 1].t - keys[i].t;
         float local = span > 0.f ? (t - keys[i].t) / span : 0.f;
@@ -3021,6 +3377,32 @@ sf::Color GameWorld::dayNightTint() const {
         return sf::Color(lerp(keys[i].r, keys[i + 1].r), lerp(keys[i].g, keys[i + 1].g), lerp(keys[i].b, keys[i + 1].b), lerp(keys[i].a, keys[i + 1].a));
     }
     return sf::Color(255, 255, 255, 0);
+}
+
+float GameWorld::nightFactor() const {
+    // Same keyframe/lerp shape as dayNightTint() above (including its held
+    // night plateau at 0.58-0.88, so lamps/glows are at full brightness for
+    // the same stretch the sky is actually at its darkest), just
+    // interpolating a 0..1 brightness scalar instead of an RGBA tint: 0 at
+    // midday, ramping up through dusk, 1 through night, back down through
+    // dawn.
+    struct Key { float t; float n; };
+    static const Key keys[] = {
+        { 0.00f, 0.35f }, // dawn
+        { 0.18f, 0.00f }, // day
+        { 0.42f, 0.45f }, // dusk
+        { 0.58f, 1.00f }, // night reached
+        { 0.88f, 1.00f }, // night held
+        { 1.00f, 0.35f }, // wraps back to dawn
+    };
+    float t = dayNightTimer_ / kDayNightCycleSeconds;
+    for (int i = 0; i < 5; ++i) {
+        if (t < keys[i].t || t > keys[i + 1].t) continue;
+        float span = keys[i + 1].t - keys[i].t;
+        float local = span > 0.f ? (t - keys[i].t) / span : 0.f;
+        return keys[i].n + (keys[i + 1].n - keys[i].n) * local;
+    }
+    return 0.f;
 }
 
 sf::Color GameWorld::seasonTint() const {
@@ -3042,6 +3424,16 @@ void GameWorld::drawDayNightOverlay(sf::RenderWindow& window) {
     sf::RectangleShape season(sf::Vector2f(static_cast<float>(windowSize_.x), static_cast<float>(windowSize_.y)));
     season.setFillColor(seasonTint());
     window.draw(season);
+
+    // A constant, always-on warm grade -- distinct from dayNightTint's dawn/
+    // dusk keyframes above (which fade in and out over the day/night cycle):
+    // this one never goes away, a permanent color-grading pass toward warmer
+    // tones (the "HD-2D" look leans warm generally, not just at golden hour).
+    // Bumped up from an initial too-subtle-to-notice pass -- meant to
+    // actually read at a glance now, not just show up in a screenshot diff.
+    sf::RectangleShape warmGrade(sf::Vector2f(static_cast<float>(windowSize_.x), static_cast<float>(windowSize_.y)));
+    warmGrade.setFillColor(sf::Color(255, 165, 80, 34));
+    window.draw(warmGrade);
 }
 
 void GameWorld::drawWeather(sf::RenderWindow& window) {
@@ -3156,6 +3548,56 @@ void GameWorld::drawSeasonalAmbient(sf::RenderWindow& window) {
         break;
     }
     }
+}
+
+void GameWorld::drawLightMotes(sf::RenderWindow& window) {
+    // Same deterministic index+timer trick as drawSeasonalAmbient's Summer
+    // motes (rises, fades in/out over its climb) -- but always the same warm
+    // color and always on, independent of season, as a standing bit of
+    // atmosphere rather than seasonal flavor. Deliberately sparser/fainter
+    // than the seasonal effects so it reads as ambient dust in the light
+    // rather than competing with whatever the current season is already doing.
+    float w = static_cast<float>(windowSize_.x);
+    float h = static_cast<float>(windowSize_.y);
+    constexpr int kCount = 22;
+    constexpr float kCycle = 780.f;
+    for (int i = 0; i < kCount; ++i) {
+        float laneX = std::fmod(static_cast<float>(i) * 211.f, w);
+        float progress = std::fmod(seasonalAmbientTimer_ * 11.f + static_cast<float>(i) * 67.f, kCycle);
+        float y = h - progress + 20.f;
+        float drift = std::sin(seasonalAmbientTimer_ * 0.35f + static_cast<float>(i) * 1.1f) * 14.f;
+        float tNorm = progress / kCycle;
+        std::uint8_t alpha = static_cast<std::uint8_t>(150.f * (1.f - std::fabs(2.f * tNorm - 1.f)));
+        sf::CircleShape mote(2.5f);
+        mote.setPosition(sf::Vector2f(laneX + drift, y));
+        mote.setFillColor(sf::Color(255, 210, 140, alpha));
+        window.draw(mote);
+    }
+}
+
+void GameWorld::drawVignette(sf::RenderWindow& window) {
+    // Soft gradient bands (not flat rects -- a flat semi-transparent bar
+    // reads as letterboxing, not atmosphere) top and bottom of the screen,
+    // darkest at the very edge fading to nothing a short way in. Cheap
+    // stand-in for a tilt-shift/tilt-blur "miniature diorama" edge treatment.
+    float w = static_cast<float>(windowSize_.x);
+    constexpr float kBandH = 140.f;
+    constexpr std::uint8_t kEdgeAlpha = 115;
+
+    sf::VertexArray top(sf::PrimitiveType::TriangleStrip, 4);
+    top[0] = sf::Vertex{ sf::Vector2f(0.f, 0.f), sf::Color(10, 8, 16, kEdgeAlpha) };
+    top[1] = sf::Vertex{ sf::Vector2f(w, 0.f), sf::Color(10, 8, 16, kEdgeAlpha) };
+    top[2] = sf::Vertex{ sf::Vector2f(0.f, kBandH), sf::Color(10, 8, 16, 0) };
+    top[3] = sf::Vertex{ sf::Vector2f(w, kBandH), sf::Color(10, 8, 16, 0) };
+    window.draw(top);
+
+    float h = static_cast<float>(windowSize_.y);
+    sf::VertexArray bottom(sf::PrimitiveType::TriangleStrip, 4);
+    bottom[0] = sf::Vertex{ sf::Vector2f(0.f, h - kBandH), sf::Color(10, 8, 16, 0) };
+    bottom[1] = sf::Vertex{ sf::Vector2f(w, h - kBandH), sf::Color(10, 8, 16, 0) };
+    bottom[2] = sf::Vertex{ sf::Vector2f(0.f, h), sf::Color(10, 8, 16, kEdgeAlpha) };
+    bottom[3] = sf::Vertex{ sf::Vector2f(w, h), sf::Color(10, 8, 16, kEdgeAlpha) };
+    window.draw(bottom);
 }
 
 void GameWorld::updateSeasonTransition(float dt) {
@@ -3461,6 +3903,23 @@ void GameWorld::endClip(sf::RenderWindow& window) {
     window.setView(gameView_);
 }
 
+sf::Transform GameWorld::worldObliqueTransform() const {
+    // Raw 9-float affine matrix (row-major: x' = a0*x + a1*y + a2, y' =
+    // a3*x + a4*y + a5) -- sf::Transform has no setShear() convenience, so
+    // the shear term (kObliqueShearX) is written directly. Pivoted around
+    // the logical canvas's own center so windowSize_ (always 1280x820 today)
+    // stays centered under the tilt instead of drifting toward one corner.
+    sf::Vector2f pivot(static_cast<float>(windowSize_.x) / 2.f, static_cast<float>(windowSize_.y) / 2.f);
+    sf::Transform t;
+    t.translate(pivot);
+    t.combine(sf::Transform(
+        1.f, kObliqueShearX, 0.f,
+        0.f, kObliqueVerticalScale, 0.f,
+        0.f, 0.f, 1.f));
+    t.translate(-pivot);
+    return t;
+}
+
 // ---- Pixel-art world rendering ----
 // Same "small role-char grid recolored through a palette" idea as the Recipe
 // Book icons (drawGoodIcon below), but batched into one sf::VertexArray draw
@@ -3469,7 +3928,7 @@ void GameWorld::endClip(sf::RenderWindow& window) {
 // where per-pixel draw calls would actually add up (a good icon only ever
 // draws a handful at a time, in the Recipe Book overlay).
 void GameWorld::drawPixelSprite(sf::RenderWindow& window, const std::vector<std::string>& rows, sf::FloatRect area,
-    const std::unordered_map<char, sf::Color>& palette, bool flipX) {
+    const std::unordered_map<char, sf::Color>& palette, bool flipX, const sf::RenderStates& states) {
     if (rows.empty()) return;
     int rowCount = static_cast<int>(rows.size());
     int colCount = 0;
@@ -3494,11 +3953,11 @@ void GameWorld::drawPixelSprite(sf::RenderWindow& window, const std::vector<std:
             va.append(v0); va.append(v2); va.append(v3);
         }
     }
-    window.draw(va);
+    window.draw(va, states);
 }
 
 void GameWorld::drawPixelPanel(sf::RenderWindow& window, sf::Vector2f pos, sf::Vector2f size, sf::Color baseColor,
-    sf::Color outlineColor, sf::Vector2f seedPos, float pixelSize) {
+    sf::Color outlineColor, sf::Vector2f seedPos, float pixelSize, const sf::RenderStates& states) {
     sf::Color hi = shade(baseColor, 32), sh = shade(baseColor, -32), speck = shade(baseColor, -55);
     int cols = std::max(1, static_cast<int>(size.x / pixelSize));
     int rows = std::max(1, static_cast<int>(size.y / pixelSize));
@@ -3522,17 +3981,17 @@ void GameWorld::drawPixelPanel(sf::RenderWindow& window, sf::Vector2f pos, sf::V
             va.append(v0); va.append(v2); va.append(v3);
         }
     }
-    window.draw(va);
+    window.draw(va, states);
 
     sf::RectangleShape outline(size);
     outline.setPosition(pos);
     outline.setFillColor(sf::Color::Transparent);
     outline.setOutlineThickness(2.f);
     outline.setOutlineColor(outlineColor);
-    window.draw(outline);
+    window.draw(outline, states);
 }
 
-void GameWorld::drawPixelRoof(sf::RenderWindow& window, sf::FloatRect area, sf::Color roofColor) {
+void GameWorld::drawPixelRoof(sf::RenderWindow& window, sf::FloatRect area, sf::Color roofColor, const sf::RenderStates& states) {
     static const std::vector<std::string> rows = {
         "......OO......",
         ".....OHHO.....",
@@ -3549,10 +4008,234 @@ void GameWorld::drawPixelRoof(sf::RenderWindow& window, sf::FloatRect area, sf::
         { 'B', roofColor },
         { 'S', shade(roofColor, -35) },
     };
-    drawPixelSprite(window, rows, area, palette);
+    drawPixelSprite(window, rows, area, palette, false, states);
 }
 
-void GameWorld::drawPixelMound(sf::RenderWindow& window, sf::FloatRect area, sf::Color rockColor) {
+void GameWorld::drawTimberWall(sf::RenderWindow& window, sf::Vector2f pos, sf::Vector2f size, sf::Color plasterColor,
+    sf::Color beamColor, sf::Vector2f seedPos, const sf::RenderStates& states) {
+    // Plaster base -- same textured-rectangle technique drawPixelPanel
+    // already uses (highlight/base/shadow banding + seeded speckle).
+    drawPixelPanel(window, pos, size, plasterColor, shade(beamColor, -20), seedPos, 4.5f, states);
+
+    sf::Color beamLight = shade(beamColor, 32), beamDark = shade(beamColor, -28);
+    constexpr float kBeamW = 5.f;
+    constexpr float kSpacing = 30.f;
+
+    auto beam = [&](float x, float y, float w, float h) {
+        sf::RectangleShape r(sf::Vector2f(w, h));
+        r.setPosition(sf::Vector2f(x, y));
+        r.setFillColor(beamColor);
+        window.draw(r, states);
+        // A thin lit edge along the beam's own top/left side -- just enough
+        // to keep it from reading as a flat silhouette against the plaster.
+        sf::RectangleShape hi(sf::Vector2f(std::min(w, 1.6f), h));
+        hi.setPosition(sf::Vector2f(x, y));
+        hi.setFillColor(beamLight);
+        window.draw(hi, states);
+    };
+
+    // Vertical studs, evenly spaced with half a gap of margin on each side.
+    float usableW = size.x - kSpacing * 0.5f;
+    int studCount = std::max(1, static_cast<int>(usableW / kSpacing));
+    for (int i = 0; i <= studCount; ++i) {
+        float x = pos.x + kSpacing * 0.5f + static_cast<float>(i) * (size.x - kSpacing) / static_cast<float>(std::max(1, studCount));
+        beam(x, pos.y, kBeamW, size.y);
+    }
+    // Top and bottom rails.
+    beam(pos.x, pos.y + 2.f, size.x, kBeamW);
+    beam(pos.x, pos.y + size.y - kBeamW - 2.f, size.x, kBeamW);
+
+    sf::RectangleShape outline(size);
+    outline.setPosition(pos);
+    outline.setFillColor(sf::Color::Transparent);
+    outline.setOutlineThickness(2.f);
+    outline.setOutlineColor(beamDark);
+    window.draw(outline, states);
+}
+
+namespace {
+    // Shared by drawGableRoof/drawLeanToRoof -- a shingle course's tone at
+    // (r,c): row banding (lighter near the top, darker toward the eave) plus
+    // a per-course darker seam every 3 rows and a column checker within a
+    // course, so a roof reads as overlapping individual shingles instead of
+    // one flat gradient.
+    sf::Color shingleTone(int r, int c, float rowT, sf::Color hi, sf::Color base, sf::Color sh) {
+        sf::Color rowBase = rowT < 0.32f ? hi : (rowT > 0.78f ? sh : base);
+        bool courseSeam = (r % 3 == 2);
+        bool checker = ((c + r / 3) % 2 == 0);
+        if (courseSeam) return shade(rowBase, -22);
+        return checker ? rowBase : shade(rowBase, -10);
+    }
+}
+
+void GameWorld::drawGableRoof(sf::RenderWindow& window, sf::FloatRect area, sf::Color roofColor, sf::Vector2f seedPos,
+    const sf::RenderStates& states) {
+    (void)seedPos; // shingle coursing is purely (row,col)-derived, no per-instance seed needed
+    sf::Color hi = shade(roofColor, 38), sh = shade(roofColor, -30);
+    sf::Color outline(25, 20, 15);
+    constexpr float kShingleW = 9.f, kShingleH = 6.f;
+    int cols = std::max(6, static_cast<int>(area.size.x / kShingleW));
+    int rows = std::max(4, static_cast<int>(area.size.y / kShingleH));
+    float cw = area.size.x / static_cast<float>(cols), ch = area.size.y / static_cast<float>(rows);
+
+    sf::VertexArray va(sf::PrimitiveType::Triangles);
+    auto putCell = [&](int r, int c, sf::Color color) {
+        float x0 = area.position.x + static_cast<float>(c) * cw, y0 = area.position.y + static_cast<float>(r) * ch;
+        float x1 = x0 + cw + 0.6f, y1 = y0 + ch + 0.6f;
+        sf::Vertex v0{ sf::Vector2f(x0, y0), color }, v1{ sf::Vector2f(x1, y0), color };
+        sf::Vertex v2{ sf::Vector2f(x1, y1), color }, v3{ sf::Vector2f(x0, y1), color };
+        va.append(v0); va.append(v1); va.append(v2);
+        va.append(v0); va.append(v2); va.append(v3);
+    };
+
+    int midCol = cols / 2;
+    for (int r = 0; r < rows; ++r) {
+        float rowT = static_cast<float>(r) / static_cast<float>(std::max(1, rows - 1));
+        // Triangle taper: a point at the ridge (row 0), full width at the
+        // eave (last row) -- a gable's front-on silhouette.
+        float halfWidthFrac = 0.05f + 0.95f * rowT;
+        int halfCols = static_cast<int>(halfWidthFrac * static_cast<float>(cols) / 2.f);
+        for (int c = midCol - halfCols; c <= midCol + halfCols; ++c) {
+            if (c < 0 || c >= cols) continue;
+            bool edge = (c == midCol - halfCols || c == midCol + halfCols);
+            putCell(r, c, edge ? outline : shingleTone(r, c, rowT, hi, roofColor, sh));
+        }
+    }
+    window.draw(va, states);
+}
+
+void GameWorld::drawLeanToRoof(sf::RenderWindow& window, sf::Vector2f pos, sf::Vector2f size, sf::Color roofColor,
+    sf::Vector2f seedPos, const sf::RenderStates& states) {
+    (void)seedPos;
+    sf::Color hi = shade(roofColor, 35), sh = shade(roofColor, -30);
+    constexpr float kShingleW = 9.f, kShingleH = 6.f;
+    int cols = std::max(2, static_cast<int>(size.x / kShingleW));
+    int rows = std::max(2, static_cast<int>(size.y / kShingleH));
+    float cw = size.x / static_cast<float>(cols), ch = size.y / static_cast<float>(rows);
+
+    sf::VertexArray va(sf::PrimitiveType::Triangles);
+    for (int r = 0; r < rows; ++r) {
+        float rowT = static_cast<float>(r) / static_cast<float>(std::max(1, rows - 1));
+        for (int c = 0; c < cols; ++c) {
+            sf::Color cell = shingleTone(r, c, rowT, hi, roofColor, sh);
+            float x0 = pos.x + static_cast<float>(c) * cw, y0 = pos.y + static_cast<float>(r) * ch;
+            float x1 = x0 + cw + 0.6f, y1 = y0 + ch + 0.6f;
+            sf::Vertex v0{ sf::Vector2f(x0, y0), cell }, v1{ sf::Vector2f(x1, y0), cell };
+            sf::Vertex v2{ sf::Vector2f(x1, y1), cell }, v3{ sf::Vector2f(x0, y1), cell };
+            va.append(v0); va.append(v1); va.append(v2);
+            va.append(v0); va.append(v2); va.append(v3);
+        }
+    }
+    window.draw(va, states);
+
+    sf::RectangleShape outline(size);
+    outline.setPosition(pos);
+    outline.setFillColor(sf::Color::Transparent);
+    outline.setOutlineThickness(2.f);
+    outline.setOutlineColor(sf::Color(25, 20, 15));
+    window.draw(outline, states);
+}
+
+void GameWorld::drawPaneWindow(sf::RenderWindow& window, sf::Vector2f pos, sf::Vector2f size, const sf::RenderStates& states) {
+    sf::RectangleShape frame(size);
+    frame.setPosition(pos);
+    frame.setFillColor(sf::Color(58, 40, 24));
+    window.draw(frame, states);
+
+    sf::Vector2f inset(2.2f, 2.2f);
+    sf::Vector2f glassSize(std::max(1.f, size.x - inset.x * 2.f), std::max(1.f, size.y - inset.y * 2.f));
+    sf::RectangleShape glass(glassSize);
+    glass.setPosition(pos + inset);
+    glass.setFillColor(sf::Color(150, 197, 212, 235));
+    window.draw(glass, states);
+
+    // Cross mullion dividing the glass into 4 panes.
+    sf::RectangleShape vBar(sf::Vector2f(1.6f, glassSize.y));
+    vBar.setPosition(sf::Vector2f(pos.x + size.x / 2.f - 0.8f, pos.y + inset.y));
+    vBar.setFillColor(sf::Color(58, 40, 24));
+    window.draw(vBar, states);
+    sf::RectangleShape hBar(sf::Vector2f(glassSize.x, 1.6f));
+    hBar.setPosition(sf::Vector2f(pos.x + inset.x, pos.y + size.y / 2.f - 0.8f));
+    hBar.setFillColor(sf::Color(58, 40, 24));
+    window.draw(hBar, states);
+
+    // A glint in the top-left pane sells "glass" over "flat blue square".
+    sf::RectangleShape glint(sf::Vector2f(glassSize.x * 0.3f, glassSize.y * 0.3f));
+    glint.setPosition(pos + inset + sf::Vector2f(1.2f, 1.2f));
+    glint.setFillColor(sf::Color(255, 255, 255, 95));
+    window.draw(glint, states);
+}
+
+void GameWorld::drawStoneTrim(sf::RenderWindow& window, sf::Vector2f pos, sf::Vector2f size, sf::Vector2f seedPos,
+    const sf::RenderStates& states) {
+    int seed = static_cast<int>(seedPos.x) * 928371 + static_cast<int>(seedPos.y) * 137;
+    constexpr float kStoneW = 12.f;
+    int cols = std::max(1, static_cast<int>(size.x / kStoneW));
+    float w = size.x / static_cast<float>(cols);
+    static const sf::Color kTones[3] = { sf::Color(168, 166, 158), sf::Color(140, 138, 130), sf::Color(180, 178, 170) };
+    for (int c = 0; c < cols; ++c) {
+        float x = pos.x + static_cast<float>(c) * w;
+        int tone = (c * 928371 + seed) % 3;
+        if (tone < 0) tone += 3;
+        sf::RectangleShape stone(sf::Vector2f(w - 1.5f, size.y - 2.f));
+        stone.setPosition(sf::Vector2f(x + 0.75f, pos.y + 1.f));
+        stone.setFillColor(kTones[tone]);
+        stone.setOutlineThickness(1.f);
+        stone.setOutlineColor(sf::Color(90, 88, 82));
+        window.draw(stone, states);
+    }
+}
+
+void GameWorld::drawPaneledDoor(sf::RenderWindow& window, sf::Vector2f pos, sf::Vector2f size, sf::Color doorColor,
+    const sf::RenderStates& states) {
+    sf::RectangleShape frame(size);
+    frame.setPosition(pos);
+    frame.setFillColor(shade(doorColor, -32));
+    window.draw(frame, states);
+
+    sf::Vector2f inset(2.f, 2.f);
+    sf::RectangleShape face(sf::Vector2f(size.x - inset.x * 2.f, size.y - inset.y * 2.f));
+    face.setPosition(pos + inset);
+    face.setFillColor(doorColor);
+    window.draw(face, states);
+
+    sf::Vector2f panelSize(size.x - inset.x * 2.f - 4.f, (size.y - inset.y * 2.f - 9.f) / 2.f);
+    for (int i = 0; i < 2; ++i) {
+        sf::RectangleShape panel(panelSize);
+        panel.setPosition(sf::Vector2f(pos.x + inset.x + 2.f, pos.y + inset.y + 3.f + static_cast<float>(i) * (panelSize.y + 3.f)));
+        panel.setFillColor(shade(doorColor, -16));
+        panel.setOutlineThickness(1.f);
+        panel.setOutlineColor(shade(doorColor, -40));
+        window.draw(panel, states);
+    }
+
+    sf::CircleShape handle(1.6f);
+    handle.setPosition(sf::Vector2f(pos.x + size.x * 0.76f, pos.y + size.y * 0.55f));
+    handle.setFillColor(sf::Color(228, 198, 90));
+    window.draw(handle, states);
+}
+
+void GameWorld::drawFlowerBox(sf::RenderWindow& window, sf::Vector2f pos, sf::Vector2f size, sf::Vector2f seedPos,
+    const sf::RenderStates& states) {
+    sf::RectangleShape box(size);
+    box.setPosition(pos);
+    box.setFillColor(sf::Color(120, 82, 50));
+    box.setOutlineThickness(1.f);
+    box.setOutlineColor(sf::Color(70, 46, 26));
+    window.draw(box, states);
+
+    static const sf::Color kPetals[3] = { sf::Color(232, 112, 142), sf::Color(240, 162, 82), sf::Color(222, 92, 92) };
+    int seed = static_cast<int>(seedPos.x) * 7 + static_cast<int>(seedPos.y) * 13;
+    int count = std::max(2, static_cast<int>(size.x / 6.f));
+    for (int i = 0; i < count; ++i) {
+        float x = pos.x + (static_cast<float>(i) + 0.5f) * size.x / static_cast<float>(count);
+        int jitter = ((i * 928371 + seed) % 3) - 1;
+        float y = pos.y - 1.5f + static_cast<float>(jitter) * 1.4f;
+        drawPixelBlob(window, sf::Vector2f(x, y), 2.6f, kPetals[static_cast<unsigned>(i + seed) % 3], states);
+    }
+}
+
+void GameWorld::drawPixelMound(sf::RenderWindow& window, sf::FloatRect area, sf::Color rockColor, const sf::RenderStates& states) {
     // 'D' scatters a couple of darker ore-vein/pebble flecks through the
     // rock face -- fixed positions (not per-instance random), same reasoning
     // as the tree canopy's 'L' leaf clusters.
@@ -3574,10 +4257,10 @@ void GameWorld::drawPixelMound(sf::RenderWindow& window, sf::FloatRect area, sf:
         { 'D', shade(rockColor, -55) },
         { 'S', shade(rockColor, -32) },
     };
-    drawPixelSprite(window, rows, area, palette);
+    drawPixelSprite(window, rows, area, palette, false, states);
 }
 
-void GameWorld::drawPixelBlob(sf::RenderWindow& window, sf::Vector2f center, float radius, sf::Color baseColor) {
+void GameWorld::drawPixelBlob(sf::RenderWindow& window, sf::Vector2f center, float radius, sf::Color baseColor, const sf::RenderStates& states) {
     static const std::vector<std::string> rows = {
         "..OOOO..",
         ".OHHHHO.",
@@ -3595,13 +4278,13 @@ void GameWorld::drawPixelBlob(sf::RenderWindow& window, sf::Vector2f center, flo
         { 'S', shade(baseColor, -35) },
     };
     sf::Vector2f size(radius * 2.f, radius * 2.f);
-    drawPixelSprite(window, rows, sf::FloatRect(sf::Vector2f(center.x - radius, center.y - radius), size), palette);
+    drawPixelSprite(window, rows, sf::FloatRect(sf::Vector2f(center.x - radius, center.y - radius), size), palette, false, states);
 }
 
 // Shared 12-wide pixel villager -- roles: 'O' outline, 'H' hair, 'K' skin,
 // 'E' eye, 'C' shirt (the one role callers recolor -- player's signature
 // yellow, or an Npc's own `color`), 'P' trousers, 'B' boots.
-void GameWorld::drawPixelPerson(sf::RenderWindow& window, sf::Vector2f pos, sf::Color shirtColor, bool flipX, float walkPhase) {
+void GameWorld::drawPixelPerson(sf::RenderWindow& window, sf::Vector2f pos, sf::Color shirtColor, bool flipX, float walkPhase, const sf::RenderStates& states) {
     // Two leg frames -- legs together (the standing pose, also used whenever
     // walkPhase is 0) and legs apart -- swapped by sin(walkPhase) instead of
     // authoring a full mid-stride frame. Everything above the waist (torso
@@ -3656,24 +4339,68 @@ void GameWorld::drawPixelPerson(sf::RenderWindow& window, sf::Vector2f pos, sf::
     float bob = std::abs(std::sin(walkPhase)) * 2.2f;
     sf::Vector2f spriteSize(30.f, 38.f);
     sf::Vector2f topLeft(pos.x - spriteSize.x / 2.f, pos.y - spriteSize.y + kPlayerSize / 2.f - bob);
-    drawGroundShadow(window, pos, 11.f);
-    drawPixelSprite(window, rows, sf::FloatRect(topLeft, spriteSize), palette, flipX);
+    drawGroundShadow(window, pos, 11.f, states);
+    drawPixelSprite(window, rows, sf::FloatRect(topLeft, spriteSize), palette, flipX, states);
 }
 
-void GameWorld::drawGroundShadow(sf::RenderWindow& window, sf::Vector2f feetCenter, float radiusX) {
+void GameWorld::drawGroundShadow(sf::RenderWindow& window, sf::Vector2f feetCenter, float radiusX, const sf::RenderStates& states) {
+    // Squashed into an ellipse -- reads as resting on the ground. This own
+    // squash used to be the only depth cue (0.4 flat); the oblique camera's
+    // kObliqueVerticalScale (currently back at 1.0 -- see its own comment)
+    // would compress everything drawn through `states` too, so dividing it
+    // out here keeps the shadow's own flatness constant regardless of
+    // whatever that constant is set to.
+    constexpr float kShadowBaseSquashY = 0.4f;
+    float squashY = kShadowBaseSquashY / kObliqueVerticalScale;
+
+    // Offset toward kLightDirection (warm-light atmosphere pass, see the
+    // constants block) instead of sitting perfectly centered under the feet
+    // -- a directional shadow reads as "there's a light source somewhere"
+    // instead of the flat, shadowless look a purely top-down camera implies.
+    sf::Vector2f center = feetCenter + kLightDirection * kShadowOffsetDistance;
+
     sf::CircleShape shadow(radiusX);
-    shadow.setScale(sf::Vector2f(1.f, 0.4f)); // squashed into an ellipse -- reads as resting on the ground from this top-down angle
-    shadow.setPosition(sf::Vector2f(feetCenter.x - radiusX, feetCenter.y - radiusX * 0.4f));
+    shadow.setScale(sf::Vector2f(1.f, squashY));
+    shadow.setPosition(sf::Vector2f(center.x - radiusX, center.y - radiusX * squashY));
     shadow.setFillColor(sf::Color(10, 10, 10, 90));
-    window.draw(shadow);
+    window.draw(shadow, states);
+}
+
+void GameWorld::drawGlow(sf::RenderWindow& window, sf::Vector2f center, float radius, sf::Color color, const sf::RenderStates& states) {
+    // 3 concentric rings, biggest/faintest first (painter's order) so the
+    // brightest, smallest ring ends up on top -- a soft halo around an
+    // already-drawn emissive shape (oven mouth, forge window, ...) standing
+    // in for a real bloom pass this codebase has no shader pipeline for.
+    //
+    // Brighter and a little bigger after dark than at midday -- every glow
+    // in the game (cottage windows, oven mouths, forge windows, lamp posts)
+    // used to shine at the same flat intensity around the clock, which read
+    // as "fine, but not obviously a night effect" (reported 2026-08-06).
+    // Individual callers that want an even wider day/night swing (drawLamp,
+    // an unlit lantern) bake extra range into the alpha they pass in on top
+    // of this.
+    float night = nightFactor();
+    float intensity = 0.55f + 0.45f * night; // 0.55x by day, full strength at night
+    float sizeScale = 0.85f + 0.35f * night;  // slightly bigger halo at night
+    struct Ring { float scale; float alphaFrac; };
+    static constexpr Ring kRings[] = { { 3.4f, 0.22f }, { 2.2f, 0.42f }, { 1.3f, 0.70f } };
+    for (const auto& ring : kRings) {
+        float r = radius * ring.scale * sizeScale;
+        sf::CircleShape c(r);
+        c.setPosition(sf::Vector2f(center.x - r, center.y - r));
+        std::uint8_t a = static_cast<std::uint8_t>(std::clamp(static_cast<float>(color.a) * ring.alphaFrac * intensity, 0.f, 255.f));
+        c.setFillColor(sf::Color(color.r, color.g, color.b, a));
+        window.draw(c, states);
+    }
 }
 
 void GameWorld::drawPlayer(sf::RenderWindow& window, sf::Vector2f pos, bool facingLeft, float walkPhase) {
+    sf::RenderStates states{ worldObliqueTransform() };
     // Player position is stored as the top-left of its kPlayerSize collision
     // box (see playerPos_ throughout run()) -- drawPixelPerson takes a feet
     // center point, so convert once here.
     sf::Vector2f feetCenter(pos.x + kPlayerSize / 2.f, pos.y + kPlayerSize);
-    drawPixelPerson(window, feetCenter, sf::Color(250, 220, 60), facingLeft, walkPhase);
+    drawPixelPerson(window, feetCenter, sf::Color(250, 220, 60), facingLeft, walkPhase, states);
 }
 
 void GameWorld::drawGoodIcon(sf::RenderWindow& window, const std::string& goodId, sf::Vector2f pos, float size, sf::Color accent) {
@@ -6100,14 +6827,23 @@ void GameWorld::run() {
                     } else if (recipeBookButtonBounds().contains(click)) {
                         openOverlay(OverlayKind::RecipeBook);
                     } else {
+                        // World content (buildings/NPCs) is drawn through the
+                        // oblique diorama transform (see worldObliqueTransform/
+                        // drawZone) but its stored positions/rects stay flat --
+                        // inverse-transform the click once here so it lands
+                        // back in that same flat space before testing against
+                        // the raw rects below, instead of drifting stale as
+                        // the tilt moved buildings' actual screen silhouettes
+                        // away from their untransformed rects.
+                        sf::Vector2f worldClick = worldObliqueTransform().getInverse().transformPoint(click);
                         bool handled = false;
                         for (auto& npc : zones_[currentZone_].npcs) {
                             sf::FloatRect npcRect(npc.pos - sf::Vector2f(kPlayerSize / 2.f, kPlayerSize / 2.f), sf::Vector2f(kPlayerSize, kPlayerSize));
-                            if (npcRect.contains(click)) { handleNpcTalk(npc); handled = true; break; }
+                            if (npcRect.contains(worldClick)) { handleNpcTalk(npc); handled = true; break; }
                         }
                         if (!handled) {
                             for (const auto& b : zones_[currentZone_].buildings) {
-                                if (sf::FloatRect(b.position, b.size).contains(click)) { handleInteraction(b); break; }
+                                if (sf::FloatRect(b.position, b.size).contains(worldClick)) { handleInteraction(b); break; }
                             }
                         }
                     }
@@ -6287,16 +7023,21 @@ void GameWorld::run() {
 
         if (currentOverlay_ == OverlayKind::None) {
             if (const WorldBuilding* near = findNearbyBuilding(kInteractRadius)) {
+                // World content (see drawZone) -- needs the same oblique
+                // transform, or this ring would float over the building's
+                // untilted flat position instead of tracking its drawn one.
                 sf::RectangleShape highlight(near->size);
                 highlight.setPosition(near->position);
                 highlight.setFillColor(sf::Color::Transparent);
                 highlight.setOutlineThickness(3.f);
                 highlight.setOutlineColor(sf::Color::Yellow);
-                window.draw(highlight);
+                window.draw(highlight, sf::RenderStates{ worldObliqueTransform() });
             }
         }
 
-        drawPlayer(window, playerPos_, playerFacingLeft_, playerWalkTimer_);
+        // Player is now drawn as part of drawZone's Y-sorted pass (see
+        // DepthEntry kind 4) so it can appear in front of/behind a tree or
+        // building depending on relative depth, instead of always on top.
 
         // Tints/rains on the world (and the player standing in it), but not
         // the legend/minimap/HUD/overlays drawn after this -- those stay
@@ -6304,6 +7045,8 @@ void GameWorld::run() {
         drawDayNightOverlay(window);
         drawWeather(window);
         drawSeasonalAmbient(window);
+        drawLightMotes(window);
+        drawVignette(window);
 
         drawLegend(window);
         if (showMinimap_) drawMinimap(window);
