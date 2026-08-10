@@ -82,7 +82,6 @@ namespace {
     constexpr float kShadowOffsetDistance = 4.f;           // world pixels a shadow shifts off-center
     constexpr float kHistorySampleInterval = 2.f; // seconds between net-worth sparkline samples
     constexpr size_t kMaxHistorySamples = 150;     // 2s * 150 = 5 minutes of visible history
-    constexpr float kDayNightCycleSeconds = 180.f; // one full day/night cycle every 3 real minutes
     constexpr int kRainDropCount = 60;
 
     // Windowed size presets for the Settings overlay (see Settings::
@@ -936,15 +935,59 @@ void GameWorld::buildZones() {
         z.west = 3;  // -> Valley District
         z.south = 4; // -> Harbor District
 
-        addBuilding(z, "market",     { 585.f, 130.f }, kService, bSize);
-        addBuilding(z, "townhall",   { 585.f, 610.f }, kService, bSize);
-        addBuilding(z, "staff",      { 220.f, 300.f }, kService, bSize);
-        addBuilding(z, "doctor",     { 950.f, 300.f }, kService, bSize);
-        addBuilding(z, "sleep",      { 330.f, 470.f }, kService, bSize);
-        addBuilding(z, "eat",        { 500.f, 470.f }, kService, bSize);
-        addBuilding(z, "storefront", { 750.f, 470.f }, kService, bSize);
-        addBuilding(z, "bank",       { 220.f, 610.f }, kService, bSize);
-        addBuilding(z, "warehouse",  { 950.f, 610.f }, kService, bSize);
+        // Re-laid-out 2026-08-07 ("帮我将我的城市进行排版" -- once all 9
+        // ServiceHall businesses had real hand-designed hero shapes instead
+        // of plain boxes, the OLD positions below -- tuned back when every
+        // building was an identical 110x80 box -- left the west half
+        // visibly overcrowded (staff/sleep/eat/bank/townhall all within
+        // ~330 units of each other) while the east half had room to spare.
+        // Hero shapes also aren't flush with their own `WorldBuilding`
+        // rect anymore -- wings/jetties/porches/prop clutter poke past it
+        // (Staff's east wing +18 south, Inn's west wing +14 south, Kitchen's
+        // west porch, Warehouse's east-side crate/log clutter, etc) -- so
+        // this layout gives every building generous clearance from its
+        // neighbors, not just from its own bare rect.
+        //
+        // New layout: 2 clean columns per side of the north-south road
+        // spine (x:700-740, untouched), 2 rows per column, all sitting well
+        // clear of the east-west spine too (z:390-430) instead of hugging
+        // it. Town Hall keeps its own already-tuned position/footprint
+        // unchanged (see its own comment below) -- everything else is new.
+        //
+        // West side, back row (z=140): Staff alone, Town Hall alongside it
+        // -- Town Hall's own footprint is much wider (and a bit deeper)
+        // than every other building's shared `bSize`: its 3D hero shape
+        // (see addTownHallBuilding in GameWorld3D.cpp) is 4 volumes wide --
+        // 2 side wings + a main block + a clock tower -- and every one of
+        // that shape's internal proportions is a fraction of this rect's
+        // own width. At the plain 110-wide `bSize` there was only ever
+        // ~110 units total to split between all 4 volumes no matter how
+        // those fractions got rebalanced (the "no matter how much I widen
+        // it, it still feels like the same area" report was exactly this).
+        // 690 (this rect's own right edge) leaves a safe margin before the
+        // north-south road spine at x:700-740.
+        addBuilding(z, "staff",    { 150.f, 140.f }, kService, bSize);
+        addBuilding(z, "townhall", { 430.f, 140.f }, kService, sf::Vector2f(260.f, 100.f));
+        // West side, front row (z=470): Bank, Inn, Market side by side in
+        // one row (2026-08-07, "把旅馆,钱庄,市场排列在同一行" -- regrouped
+        // out of the earlier stacked-column arrangement into this single
+        // row instead). Evenly spaced (150/320/490, each a 110-wide `bSize`
+        // rect with a 60-unit gap between neighbors) rather than reusing
+        // the old column x-values, and re-checked against the 4 fixed NPC
+        // home spots below (trader `{620,550}` in particular sits just
+        // 20 units clear of Market's own right edge at this spacing --
+        // any less gap here and it would've landed right on Market's
+        // corner). 600 (Market's own right edge) leaves 100 units clear of
+        // the road spine at x:700-740.
+        addBuilding(z, "bank",   { 150.f, 470.f }, kService, bSize);
+        addBuilding(z, "sleep",  { 320.f, 470.f }, kService, bSize);
+        addBuilding(z, "market", { 490.f, 470.f }, kService, bSize);
+        // East side, left column (x:830-940):
+        addBuilding(z, "doctor", { 830.f, 140.f }, kService, bSize);
+        addBuilding(z, "eat",    { 830.f, 470.f }, kService, bSize);
+        // East side, right column (x:1030-1140):
+        addBuilding(z, "storefront", { 1030.f, 140.f }, kService, bSize);
+        addBuilding(z, "warehouse",  { 1030.f, 470.f }, kService, bSize);
 
         // North-south spine sits at x:700-740 rather than dead center
         // (600-640) -- centered would run straight through market/eat/
@@ -2810,7 +2853,7 @@ void GameWorld::drawBuilding(sf::RenderWindow& window, const WorldBuilding& b, c
     }
 }
 
-void GameWorld::drawTree(sf::RenderWindow& window, sf::Vector2f pos, const sf::RenderStates& states) {
+void GameWorld::drawTree(sf::RenderTarget& window, sf::Vector2f pos, const sf::RenderStates& states) {
     // Canopy color follows the season -- fresh light green in Spring, the
     // original deep green as Summer's full-bloom baseline, warm orange/red
     // in Autumn, pale/bare in Winter -- now shaded into highlight/base/shadow
@@ -2864,7 +2907,7 @@ void GameWorld::drawTree(sf::RenderWindow& window, sf::Vector2f pos, const sf::R
     drawPixelSprite(window, rows, sf::FloatRect(topLeft, spriteSize), palette, false, states);
 }
 
-void GameWorld::drawBush(sf::RenderWindow& window, sf::Vector2f pos, const sf::RenderStates& states) {
+void GameWorld::drawBush(sf::RenderTarget& window, sf::Vector2f pos, const sf::RenderStates& states) {
     sf::Color fill;
     switch (game_.currentSeason()) {
     case Season::Spring: fill = sf::Color(122, 192, 112); break;
@@ -2899,7 +2942,7 @@ void GameWorld::drawBush(sf::RenderWindow& window, sf::Vector2f pos, const sf::R
     drawPixelSprite(window, rows, sf::FloatRect(pos, sf::Vector2f(26.f, 16.f)), palette, false, states);
 }
 
-void GameWorld::drawLamp(sf::RenderWindow& window, sf::Vector2f pos, const sf::RenderStates& states) {
+void GameWorld::drawLamp(sf::RenderTarget& window, sf::Vector2f pos, const sf::RenderStates& states) {
     float night = nightFactor();
     drawGroundShadow(window, sf::Vector2f(pos.x, pos.y + 34.f), 8.f, states);
 
@@ -2955,6 +2998,13 @@ void GameWorld::drawNpc(sf::RenderWindow& window, const Npc& npc, const sf::Rend
 }
 
 void GameWorld::drawZone(sf::RenderWindow& window) {
+    // HD-2D renderer (see GameWorld3D.cpp and the plan doc) -- now used for
+    // every zone, not just Town Square (2026-08-07). The flat 2D path below
+    // is kept but unreachable, as an easy revert if the 3D renderer ever
+    // needs rolling back for a specific zone or entirely.
+    draw3DZone(window);
+    return;
+
     sf::RenderStates states{ worldObliqueTransform() };
     const Zone& z = zones_[currentZone_];
 
@@ -3180,6 +3230,14 @@ void GameWorld::drawHud(sf::RenderWindow& window) {
 
     if (!fontLoaded_) return;
 
+    // In-game clock (2026-08-07, added alongside trySleep()'s next-day-8am
+    // fix -- "点击睡觉了...我也不确定时间有没有过了一天" -- so sleeping's
+    // effect on time is actually visible somewhere, not just inferred from
+    // the sky). game_.timeOfDayHours() is 0..24; HH:MM, zero-padded.
+    double timeHours = game_.timeOfDayHours();
+    int timeHH = static_cast<int>(timeHours);
+    int timeMM = static_cast<int>((timeHours - static_cast<double>(timeHH)) * 60.0);
+
     std::ostringstream oss;
     oss << Localization::t("hud_generation") << " " << game_.generation()
         << "   " << Localization::t("hud_cash") << ": $" << std::fixed << std::setprecision(2) << game_.money()
@@ -3189,6 +3247,8 @@ void GameWorld::drawHud(sf::RenderWindow& window) {
         // visible instead of only showing up after enough days accumulate
         // to move the 1-decimal age figure.
         << "   " << Localization::t("hud_day_prefix") << game_.totalDaysElapsed() << Localization::t("hud_day_suffix")
+        << "   " << Localization::t("hud_time_prefix") << std::setw(2) << std::setfill('0') << timeHH << ":" << std::setw(2) << std::setfill('0') << timeMM
+        << std::setfill(' ') // reset -- setfill sticks on the stream otherwise, and every setw above this point already only used the default space fill
         << "   " << Localization::t("hud_season_prefix") << Localization::t(seasonKey(game_.currentSeason()))
         << " " << Localization::t(seasonEffectKey(game_.currentSeason()))
         << Localization::t("hud_days_until_season_prefix") << game_.daysUntilNextSeason() << Localization::t("hud_days_until_season_suffix")
@@ -3319,9 +3379,11 @@ void GameWorld::drawLifeStatusPanel(sf::RenderWindow& window) {
 }
 
 void GameWorld::updateDayNightAndWeather(float dt) {
-    dayNightTimer_ += dt;
-    if (dayNightTimer_ >= kDayNightCycleSeconds) dayNightTimer_ -= kDayNightCycleSeconds;
-
+    // Day/night itself no longer has anything to update here -- it reads
+    // straight off game_.timeOfDayHours() every frame in dayNightTint()/
+    // nightFactor() (2026-08-07, see GameWorld.h's own comment on the
+    // removed dayNightTimer_). Weather is untouched, still its own real-
+    // time accumulators.
     if (raining_) rainTime_ += dt;
     seasonalAmbientTimer_ += dt; // drives drawSeasonalAmbient -- its own accumulator, independent of rainTime_
 
@@ -3347,30 +3409,37 @@ sf::Color GameWorld::dayNightTint() const {
     // a linear blend between two RGBA keyframes, no gradients/glow, to match
     // the rest of the world's plain-shape look.
     //
-    // The original table had a single instantaneous "night" keyframe with
-    // dusk fading in on one side and dawn fading out on the other -- true
-    // full darkness only ever lasted one instant, the rest of "night" was
-    // actually still mid-transition, which read as "dim" rather than
-    // "dark" (reported 2026-08-06: the lamp effect wasn't obvious enough at
-    // night). Repeating the night color across two keyframes (0.58/0.88)
-    // holds it at full strength for a real stretch of the cycle instead of
-    // just touching it. Also darker/more opaque than before (was 25,35,80,
-    // 130) so lit windows/lamps actually have something dark to stand out
-    // against.
-    struct Key { float t; std::uint8_t r, g, b, a; };
+    // Keyed directly by the real in-game clock (game_.timeOfDayHours(),
+    // 0..24) instead of an independent real-time timer (2026-08-07, "我看
+    // 时间15.39就已经晚上了...就跟着游戏时间跑吧" -- the old dayNightTimer_
+    // ran on real wall-clock dt completely decoupled from the actual
+    // simulated hour, so the sky could show full night in the middle of a
+    // 3:39pm in-game afternoon with no way to fix it without tying the two
+    // together). Anchored exactly on the 4 phase boundaries the user
+    // specified (00:00 midnight / 06:00 dawn / 12:00 noon / 18:00 dusk,
+    // wrapping back to 24:00==00:00), each transitioning smoothly into the
+    // next. 2 extra keyframes (02:00/22:00) hold full night at its darkest
+    // for a real stretch either side of midnight instead of just touching
+    // it for one instant -- the same "an instantaneous night reads as
+    // merely dim, not dark" lesson this function already learned once
+    // before (the old table's 0.58/0.88 double-keyframe, same idea just in
+    // real hours now). Dusk is more yellow-gold than the old system's
+    // straight orange, per the user's own "黄昏天空可能会有一点黄黄的" ask.
+    struct Key { float hour; std::uint8_t r, g, b, a; };
     static const Key keys[] = {
-        { 0.00f, 255, 200, 150, 60 },  // dawn
-        { 0.18f, 255, 255, 255, 0 },   // day
-        { 0.42f, 255, 140, 90, 70 },   // dusk
-        { 0.58f, 18, 22, 55, 190 },    // night reached
-        { 0.88f, 18, 22, 55, 190 },    // night held
-        { 1.00f, 255, 200, 150, 60 },  // wraps back to dawn
+        { 0.f,  18,  22,  55,  190 }, // midnight -- deep night
+        { 2.f,  18,  22,  55,  190 }, // held deep night
+        { 6.f,  255, 210, 150, 90 },  // dawn -- 00:00-06:00 "天色由黑转亮", warm pink-orange
+        { 12.f, 255, 255, 255, 0 },   // noon -- 06:00-12:00 "太阳升起", full day by the midpoint
+        { 18.f, 255, 205, 110, 70 },  // dusk -- 12:00-18:00 "光照由强变弱", yellow-gold
+        { 22.f, 18,  22,  55,  190 }, // night reached again -- 18:00-24:00 "夜幕降临", held
+        { 24.f, 18,  22,  55,  190 }, // == 0h, closes the loop
     };
-    float t = dayNightTimer_ / kDayNightCycleSeconds;
-    for (int i = 0; i < 5; ++i) {
-        if (t < keys[i].t || t > keys[i + 1].t) continue;
-        float span = keys[i + 1].t - keys[i].t;
-        float local = span > 0.f ? (t - keys[i].t) / span : 0.f;
+    float hour = static_cast<float>(game_.timeOfDayHours());
+    for (int i = 0; i < 6; ++i) {
+        if (hour < keys[i].hour || hour > keys[i + 1].hour) continue;
+        float span = keys[i + 1].hour - keys[i].hour;
+        float local = span > 0.f ? (hour - keys[i].hour) / span : 0.f;
         auto lerp = [&](std::uint8_t a, std::uint8_t b) {
             return static_cast<std::uint8_t>(static_cast<float>(a) + (static_cast<float>(b) - static_cast<float>(a)) * local);
         };
@@ -3380,26 +3449,26 @@ sf::Color GameWorld::dayNightTint() const {
 }
 
 float GameWorld::nightFactor() const {
-    // Same keyframe/lerp shape as dayNightTint() above (including its held
-    // night plateau at 0.58-0.88, so lamps/glows are at full brightness for
-    // the same stretch the sky is actually at its darkest), just
+    // Same keyframe/lerp shape as dayNightTint() above (same real-hour
+    // anchors, same held-night stretch either side of midnight), just
     // interpolating a 0..1 brightness scalar instead of an RGBA tint: 0 at
     // midday, ramping up through dusk, 1 through night, back down through
     // dawn.
-    struct Key { float t; float n; };
+    struct Key { float hour; float n; };
     static const Key keys[] = {
-        { 0.00f, 0.35f }, // dawn
-        { 0.18f, 0.00f }, // day
-        { 0.42f, 0.45f }, // dusk
-        { 0.58f, 1.00f }, // night reached
-        { 0.88f, 1.00f }, // night held
-        { 1.00f, 0.35f }, // wraps back to dawn
+        { 0.f,  1.00f },
+        { 2.f,  1.00f },
+        { 6.f,  0.45f },
+        { 12.f, 0.00f },
+        { 18.f, 0.45f },
+        { 22.f, 1.00f },
+        { 24.f, 1.00f },
     };
-    float t = dayNightTimer_ / kDayNightCycleSeconds;
-    for (int i = 0; i < 5; ++i) {
-        if (t < keys[i].t || t > keys[i + 1].t) continue;
-        float span = keys[i + 1].t - keys[i].t;
-        float local = span > 0.f ? (t - keys[i].t) / span : 0.f;
+    float hour = static_cast<float>(game_.timeOfDayHours());
+    for (int i = 0; i < 6; ++i) {
+        if (hour < keys[i].hour || hour > keys[i + 1].hour) continue;
+        float span = keys[i + 1].hour - keys[i].hour;
+        float local = span > 0.f ? (hour - keys[i].hour) / span : 0.f;
         return keys[i].n + (keys[i + 1].n - keys[i].n) * local;
     }
     return 0.f;
@@ -3927,7 +3996,7 @@ sf::Transform GameWorld::worldObliqueTransform() const {
 // every frame for however many buildings/trees/NPCs are on screen at once,
 // where per-pixel draw calls would actually add up (a good icon only ever
 // draws a handful at a time, in the Recipe Book overlay).
-void GameWorld::drawPixelSprite(sf::RenderWindow& window, const std::vector<std::string>& rows, sf::FloatRect area,
+void GameWorld::drawPixelSprite(sf::RenderTarget& window, const std::vector<std::string>& rows, sf::FloatRect area,
     const std::unordered_map<char, sf::Color>& palette, bool flipX, const sf::RenderStates& states) {
     if (rows.empty()) return;
     int rowCount = static_cast<int>(rows.size());
@@ -3956,7 +4025,7 @@ void GameWorld::drawPixelSprite(sf::RenderWindow& window, const std::vector<std:
     window.draw(va, states);
 }
 
-void GameWorld::drawPixelPanel(sf::RenderWindow& window, sf::Vector2f pos, sf::Vector2f size, sf::Color baseColor,
+void GameWorld::drawPixelPanel(sf::RenderTarget& window, sf::Vector2f pos, sf::Vector2f size, sf::Color baseColor,
     sf::Color outlineColor, sf::Vector2f seedPos, float pixelSize, const sf::RenderStates& states) {
     sf::Color hi = shade(baseColor, 32), sh = shade(baseColor, -32), speck = shade(baseColor, -55);
     int cols = std::max(1, static_cast<int>(size.x / pixelSize));
@@ -4284,7 +4353,7 @@ void GameWorld::drawPixelBlob(sf::RenderWindow& window, sf::Vector2f center, flo
 // Shared 12-wide pixel villager -- roles: 'O' outline, 'H' hair, 'K' skin,
 // 'E' eye, 'C' shirt (the one role callers recolor -- player's signature
 // yellow, or an Npc's own `color`), 'P' trousers, 'B' boots.
-void GameWorld::drawPixelPerson(sf::RenderWindow& window, sf::Vector2f pos, sf::Color shirtColor, bool flipX, float walkPhase, const sf::RenderStates& states) {
+void GameWorld::drawPixelPerson(sf::RenderTarget& window, sf::Vector2f pos, sf::Color shirtColor, bool flipX, float walkPhase, const sf::RenderStates& states) {
     // Two leg frames -- legs together (the standing pose, also used whenever
     // walkPhase is 0) and legs apart -- swapped by sin(walkPhase) instead of
     // authoring a full mid-stride frame. Everything above the waist (torso
@@ -4343,7 +4412,7 @@ void GameWorld::drawPixelPerson(sf::RenderWindow& window, sf::Vector2f pos, sf::
     drawPixelSprite(window, rows, sf::FloatRect(topLeft, spriteSize), palette, flipX, states);
 }
 
-void GameWorld::drawGroundShadow(sf::RenderWindow& window, sf::Vector2f feetCenter, float radiusX, const sf::RenderStates& states) {
+void GameWorld::drawGroundShadow(sf::RenderTarget& window, sf::Vector2f feetCenter, float radiusX, const sf::RenderStates& states) {
     // Squashed into an ellipse -- reads as resting on the ground. This own
     // squash used to be the only depth cue (0.4 flat); the oblique camera's
     // kObliqueVerticalScale (currently back at 1.0 -- see its own comment)
@@ -4366,7 +4435,7 @@ void GameWorld::drawGroundShadow(sf::RenderWindow& window, sf::Vector2f feetCent
     window.draw(shadow, states);
 }
 
-void GameWorld::drawGlow(sf::RenderWindow& window, sf::Vector2f center, float radius, sf::Color color, const sf::RenderStates& states) {
+void GameWorld::drawGlow(sf::RenderTarget& window, sf::Vector2f center, float radius, sf::Color color, const sf::RenderStates& states) {
     // 3 concentric rings, biggest/faintest first (painter's order) so the
     // brightest, smallest ring ends up on top -- a soft halo around an
     // already-drawn emissive shape (oven mouth, forge window, ...) standing
@@ -5229,39 +5298,82 @@ void GameWorld::drawStaffOverlay(sf::RenderWindow& window) {
 }
 
 void GameWorld::drawSleepOverlay(sf::RenderWindow& window) {
-    // Taller than before -- the Bedroom upgrade section (see Game::bedroomLevel/
-    // tryUpgradeBedroom) lives at the bottom, under a divider, so sleeping
-    // itself stays the first thing the player sees and does.
-    sf::Vector2f pos(360.f, 190.f), size(560.f, 430.f);
+    // Taller than before -- a 5-row Inn tier picker (2026-08-07: sleeping
+    // now costs a room for the night instead of being free, see
+    // Game::innTiers/trySleep) sits between the description and the
+    // Bedroom upgrade section (see Game::bedroomLevel/tryUpgradeBedroom),
+    // which still lives at the bottom under its own divider.
+    sf::Vector2f pos(320.f, 96.f), size(640.f, 664.f);
     uiPanelBg(window, pos, size);
     uiText(window, { pos.x + 24.f, pos.y + 16.f }, Localization::t("menu_sleep_header"), 20, sf::Color(232, 212, 120), true);
     uiButton(window, { pos.x + size.x - 120.f, pos.y + 14.f }, { 100.f, 34.f }, Localization::t("close_button"), [this]() { closeOverlay(); });
 
-    uiText(window, { pos.x + 24.f, pos.y + 70.f }, Localization::t("sleep_desc_prefix"), 14);
-    uiText(window, { pos.x + 24.f, pos.y + 100.f }, Localization::t("sleep_desc_suffix"), 14);
+    uiText(window, { pos.x + 24.f, pos.y + 62.f }, Localization::t("sleep_desc_prefix"), 13);
+    uiText(window, { pos.x + 24.f, pos.y + 84.f }, Localization::t("sleep_desc_suffix"), 13);
 
     // Forecast warning (see Game::predictedHungerAfterSleep/predictedStarvingDaysAfterSleep)
     // -- only shown when sleeping a full day would actually run hunger out or
     // push starvingDays to a fatal streak, so a well-fed sleep looks exactly
     // like it always did.
     double predictedStarving = game_.predictedStarvingDaysAfterSleep();
+    bool showWarning = predictedStarving >= game_.starvationDeathDays() || game_.predictedHungerAfterSleep() <= 0.0;
     if (predictedStarving >= game_.starvationDeathDays()) {
-        uiText(window, { pos.x + 24.f, pos.y + 128.f }, Localization::t("sleep_warning_fatal"), 13, sf::Color(230, 110, 110), true);
-    } else if (game_.predictedHungerAfterSleep() <= 0.0) {
-        uiText(window, { pos.x + 24.f, pos.y + 128.f }, Localization::t("sleep_warning_hunger"), 13, sf::Color(230, 170, 100), true);
+        uiText(window, { pos.x + 24.f, pos.y + 108.f }, Localization::t("sleep_warning_fatal"), 13, sf::Color(230, 110, 110), true);
+    } else if (showWarning) {
+        uiText(window, { pos.x + 24.f, pos.y + 108.f }, Localization::t("sleep_warning_hunger"), 13, sf::Color(230, 170, 100), true);
     }
 
-    uiButton(window, { pos.x + 24.f, pos.y + 160.f }, { 200.f, 44.f }, Localization::t("sleep_button"), [this]() {
-        TickOutcome outcome = game_.trySleep();
-        if (outcome.died) { handleTickOutcome(outcome); return; }
-        setFeedback(Localization::t("sleep_woke") + Localization::t("sleep_well_rested"), true);
-    });
+    // ---- Room tiers -- a compact 5-row picker, cheapest first, each
+    // showing its cost and the well-rested bonus it grants ON TOP OF the
+    // player's own permanent Bedroom upgrade below (see InnTierInfo's own
+    // comment on why the two stack instead of replacing each other). ----
+    float listTop = pos.y + (showWarning ? 132.f : 112.f);
+    constexpr float rowH = 40.f;
+    std::vector<InnTierInfo> tiers = game_.innTiers();
+    for (size_t i = 0; i < tiers.size(); ++i) {
+        const InnTierInfo& t = tiers[i];
+        float rowY = listTop + static_cast<float>(i) * rowH;
+        bool selected = static_cast<int>(i) == sleepSelectedTier_;
+        sf::RectangleShape rowBg(sf::Vector2f(size.x - 48.f, rowH - 4.f));
+        rowBg.setPosition(sf::Vector2f(pos.x + 24.f, rowY));
+        rowBg.setFillColor(selected ? sf::Color(90, 76, 130) : sf::Color(50, 52, 62));
+        window.draw(rowBg);
+
+        int tierIndex = static_cast<int>(i);
+        overlayClickRegions_.push_back(ClickRegion{
+            sf::FloatRect(sf::Vector2f(pos.x + 24.f, rowY), sf::Vector2f(size.x - 48.f, rowH - 4.f)),
+            [this, tierIndex]() { sleepSelectedTier_ = tierIndex; } });
+
+        uiText(window, { pos.x + 34.f, rowY + 9.f }, Localization::t(t.nameKey), 14, sf::Color::White);
+        uiText(window, { pos.x + 300.f, rowY + 9.f }, "$" + formatNumber(t.cost), 13, sf::Color(232, 212, 120));
+        std::string effect = "+" + formatNumber(game_.bedroomWellRestedHours() + t.extraWellRestedHours) + Localization::t("sleep_tier_hours_suffix") +
+            ", +" + formatNumber((game_.bedroomWellRestedBonus() + t.extraWellRestedBonus) * 100.0) + Localization::t("sleep_tier_bonus_suffix");
+        uiText(window, { pos.x + 420.f, rowY + 9.f }, effect, 13, sf::Color(160, 220, 160));
+    }
+
+    float afterListY = listTop + static_cast<float>(tiers.size()) * rowH + 16.f;
+    int clampedTier = std::clamp(sleepSelectedTier_, 0, static_cast<int>(tiers.size()) - 1);
+    double chosenCost = tiers[static_cast<size_t>(clampedTier)].cost;
+    uiButton(window, { pos.x + 24.f, afterListY }, { 260.f, 44.f },
+        Localization::t("sleep_button") + " ($" + formatNumber(chosenCost) + ")", [this, clampedTier, chosenCost]() {
+            TickOutcome outcome = game_.trySleep(clampedTier);
+            if (!outcome.success) { setFeedback(Localization::t("not_enough_cash_prefix") + formatNumber(chosenCost), false); return; }
+            if (outcome.died) { handleTickOutcome(outcome); return; }
+            // No manual sky sync needed here anymore (2026-08-07) -- now
+            // that dayNightTint()/nightFactor() read straight off
+            // game_.timeOfDayHours() every frame, trySleep() landing on
+            // 8am already makes the very next frame's sky reflect that
+            // automatically. (Used to need a dayNightTimer_ snap here, back
+            // when the sky ran on its own independent real-time cycle --
+            // see GameWorld.h's own comment on why that was removed.)
+            setFeedback(Localization::t("sleep_woke") + Localization::t("sleep_well_rested"), true);
+        });
 
     // ---- Bedroom upgrade (see Game.h's kBedroomMaxLevel and up): longer and
     // stronger well-rested buff plus a standing cut to sickness chance, each
     // level. Lives here rather than as its own world building since it only
     // ever matters in the context of sleeping. ----
-    float bedY = pos.y + 226.f;
+    float bedY = afterListY + 66.f;
     sf::RectangleShape divider(sf::Vector2f(size.x - 48.f, 1.f));
     divider.setPosition(sf::Vector2f(pos.x + 24.f, bedY));
     divider.setFillColor(sf::Color(90, 90, 100));
@@ -6827,15 +6939,15 @@ void GameWorld::run() {
                     } else if (recipeBookButtonBounds().contains(click)) {
                         openOverlay(OverlayKind::RecipeBook);
                     } else {
-                        // World content (buildings/NPCs) is drawn through the
-                        // oblique diorama transform (see worldObliqueTransform/
-                        // drawZone) but its stored positions/rects stay flat --
-                        // inverse-transform the click once here so it lands
-                        // back in that same flat space before testing against
-                        // the raw rects below, instead of drifting stale as
-                        // the tilt moved buildings' actual screen silhouettes
-                        // away from their untransformed rects.
-                        sf::Vector2f worldClick = worldObliqueTransform().getInverse().transformPoint(click);
+                        // Every zone now renders through the HD-2D 3D camera
+                        // (see draw3DZone) -- a building's screen position
+                        // has no fixed relationship to its flat world rect
+                        // under that camera, so the click needs a ground-
+                        // plane raycast (raycastZoneGround3D) rather than
+                        // the old oblique-transform inverse the flat 2D
+                        // drawZone path used (still there, unreachable, as
+                        // the revert path -- see its own comment).
+                        sf::Vector2f worldClick = raycastZoneGround3D(click);
                         bool handled = false;
                         for (auto& npc : zones_[currentZone_].npcs) {
                             sf::FloatRect npcRect(npc.pos - sf::Vector2f(kPlayerSize / 2.f, kPlayerSize / 2.f), sf::Vector2f(kPlayerSize, kPlayerSize));
@@ -6857,6 +6969,17 @@ void GameWorld::run() {
                 if (currentOverlay_ != OverlayKind::None) {
                     overlayScrollOffset_ -= wheel->delta * 3.f * 24.f;
                     if (overlayScrollOffset_ < 0.f) overlayScrollOffset_ = 0.f;
+                } else {
+                    // 3D camera zoom (2026-08-07, "允许滚轮放大...可以靠近
+                    //角色的视角") -- only live while no overlay has claimed
+                    // the wheel for scrolling above. Scrolling up (positive
+                    // delta) shrinks the multiplier -> closer to the player;
+                    // clamped to keep the camera from ever crossing the
+                    // ground plane (too close) or panning distance getting
+                    // silly (too far). See cameraZoom3D_'s own comment and
+                    // getZoneCamera3D for how this actually moves the eye.
+                    cameraZoom3D_ -= wheel->delta * 0.08f;
+                    cameraZoom3D_ = std::clamp(cameraZoom3D_, 0.35f, 1.6f);
                 }
             }
         }
@@ -7023,15 +7146,10 @@ void GameWorld::run() {
 
         if (currentOverlay_ == OverlayKind::None) {
             if (const WorldBuilding* near = findNearbyBuilding(kInteractRadius)) {
-                // World content (see drawZone) -- needs the same oblique
-                // transform, or this ring would float over the building's
-                // untilted flat position instead of tracking its drawn one.
-                sf::RectangleShape highlight(near->size);
-                highlight.setPosition(near->position);
-                highlight.setFillColor(sf::Color::Transparent);
-                highlight.setOutlineThickness(3.f);
-                highlight.setOutlineColor(sf::Color::Yellow);
-                window.draw(highlight, sf::RenderStates{ worldObliqueTransform() });
+                // Every zone renders through the HD-2D 3D camera (see
+                // draw3DZone) -- project the ring through that same camera
+                // instead of drawing an untilted flat rect.
+                draw3DBuildingHighlight(window, *near);
             }
         }
 

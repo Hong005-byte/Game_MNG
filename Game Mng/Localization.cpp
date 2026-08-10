@@ -45,6 +45,7 @@ namespace {
         { "hud_age",        { "Age", "年龄" } },
         { "hud_day_prefix", { "Day ", "第" } },
         { "hud_day_suffix", { "", "天" } },
+        { "hud_time_prefix", { "Time: ", "时间: " } }, // in-game clock (2026-08-07, alongside trySleep()'s next-day-8am fix) -- game_.timeOfDayHours(), formatted HH:MM, distinct from hud_day_prefix's whole-day count
         { "hud_years",      { "yrs", "岁" } },
         { "hud_season_prefix", { "Season: ", "季节: " } },
         { "season_spring",  { "Spring", "春季" } },
@@ -230,7 +231,7 @@ namespace {
         { "jeweler",     { "Jeweler", "珠宝坊" } },
         { "market",      { "Market", "市场" } },
         { "staff",       { "Staff Office", "职介所" } },
-        { "sleep",       { "Bedroom", "卧室" } },
+        { "sleep",       { "Inn", "旅馆" } },
         { "eat",         { "Kitchen", "厨房" } },
         { "doctor",      { "Clinic", "诊所" } },
         { "townhall",    { "Town Hall", "市政厅" } },
@@ -622,10 +623,13 @@ namespace {
         { "staff_focus_clarify",     { "Stacks with that business's own hired workers -- a separate bonus, not a duplicate.",
                                         "这是独立于该产业自己雇佣的员工的额外加成,两者可以同时生效,并非重复功能。" } },
 
-        // Sleep menu
-        { "menu_sleep_header",   { "\n-- Sleep --\n", "\n-- 睡觉 --\n" } },
-        { "sleep_desc_prefix",   { "Sleeping skips ahead one full in-game day (", "睡觉会跳过完整的一个游戏日(现实中约 " } },
-        { "sleep_desc_suffix",   { " of real time) and fully restores your energy. Hunger keeps ticking down as normal.\n", "),并完全恢复体力。饥饿度仍会照常下降。\n" } },
+        // Sleep menu (the "sleep" building is the Inn -- see innTiers/trySleep,
+        // 2026-08-07: a night now costs whichever room tier is picked below,
+        // instead of being free)
+        { "menu_sleep_header",   { "\n-- Inn --\n", "\n-- 旅馆 --\n" } },
+        { "sleep_desc_prefix",   { "A night here skips ahead one full in-game day (", "在这里住一晚会跳过完整的一个游戏日(现实中约 " } },
+        { "sleep_desc_suffix",   { " of real time), fully restores your energy, and grants a well-rested bonus. Hunger keeps ticking down as normal. Pick a room below.\n",
+                                    "),并完全恢复体力,还会获得「精神饱满」加成。饥饿度仍会照常下降。请在下方选择房间。\n" } },
         { "sleep_warning_fatal", { "WARNING: at this rate, sleeping now will starve you badly enough to be fatal. Eat something first!\n", "警告: 按目前的速度,现在睡觉会饿到足以致命。先吃点东西吧!\n" } },
         { "sleep_warning_hunger", { "Note: your hunger will hit 0 partway through the night. You'll wake up starving.\n", "注意: 睡到一半你的饥饿度就会降到 0,醒来时会处于饥饿状态。\n" } },
         { "sleep_prompt",        { "Go to sleep? (1 = yes, 0 = back): ", "要睡觉吗?(1 = 是, 0 = 返回): " } },
@@ -633,6 +637,15 @@ namespace {
         { "sleep_died",          { "You fall asleep... and don't wake up.\n", "你睡着了……却再也没有醒来。\n" } },
         { "sleep_woke",          { "You wake up refreshed. Energy restored to 100.\n", "你醒来时精神饱满,体力恢复到 100。\n" } },
         { "sleep_well_rested",   { "You feel well-rested! Production is up for the next few hours.\n", "你感觉精神饱满!接下来几小时产出会提升。\n" } },
+        // Room tiers (see Game::innTiers) -- name + the two units used in
+        // drawSleepOverlay's per-row effect summary ("+Xh, +Y%").
+        { "inn_tier_bunk",       { "Shared Bunk", "大通铺" } },
+        { "inn_tier_standard",   { "Standard Room", "标准间" } },
+        { "inn_tier_comfort",    { "Comfort Room", "舒适间" } },
+        { "inn_tier_deluxe",     { "Deluxe Suite", "豪华套房" } },
+        { "inn_tier_royal",      { "Royal Suite", "至尊套房" } },
+        { "sleep_tier_hours_suffix", { "h", "小时" } },
+        { "sleep_tier_bonus_suffix", { "%", "%" } },
 
         // Bedroom upgrade (reached from the Sleep menu -- see Game::bedroomLevel/tryUpgradeBedroom)
         { "bedroom_level_prefix",        { "Bedroom: Lv ", "卧室: 等级 " } },

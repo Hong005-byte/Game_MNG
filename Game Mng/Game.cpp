@@ -83,6 +83,23 @@ namespace {
         return 0.0; // not a recognized food good
     }
 
+    // The Inn's 5 room tiers (see Game.h's InnTierInfo/innTiers/trySleep) --
+    // cheapest is a token fee (never blocks the core sleep loop), priciest
+    // still undercuts a single Doctor visit (kDoctorCost above). `const
+    // char*` not std::string, same reason as FoodDef above -- keeps this a
+    // trivially constexpr-friendly table; Game::innTiers() below converts
+    // each row into the std::string-holding InnTierInfo the rest of the
+    // game actually uses.
+    struct InnTierDef { const char* nameKey; double cost; double extraHours; double extraBonus; };
+    constexpr InnTierDef kInnTierDefs[] = {
+        { "inn_tier_bunk",     3.0,  0.0,  0.00 },
+        { "inn_tier_standard", 10.0, 2.0,  0.03 },
+        { "inn_tier_comfort",  22.0, 4.0,  0.06 },
+        { "inn_tier_deluxe",   40.0, 6.5,  0.10 },
+        { "inn_tier_royal",    68.0, 10.0, 0.16 },
+    };
+    static_assert(sizeof(kInnTierDefs) / sizeof(kInnTierDefs[0]) == 5, "keep in sync with Game::kInnTierCount");
+
     // No cap on offline catch-up: aging/energy/hunger and the economy all
     // continue advancing however long the game was closed, so a character
     // genuinely keeps aging while you're away. Market and event simulation
@@ -135,7 +152,7 @@ Game::Game() {
     lastTickEpoch_ = nowEpoch();
 }
 
-bool Game::simulateElapsed(long long seconds, std::vector<std::string>& eventLog, double weatherMult, bool allowDeath) {
+bool Game::simulateElapsed(long long seconds, std::vector<std::string>& eventLog, double weatherMult, bool allowDeath, bool grantProduction) {
     if (seconds <= 0) return false;
 
     double legacyMult = 1.0 + static_cast<double>(legacyProdLevel_) * kLegacyProdBonusPerLevel;
@@ -165,7 +182,7 @@ bool Game::simulateElapsed(long long seconds, std::vector<std::string>& eventLog
     // life_.advanceReal is applied last so this interval's production used
     // last interval's energy/hunger) -- then drains by however many in-game
     // hours this interval actually covered.
-    double wellRestedMult = (wellRestedHoursRemaining_ > 0.0) ? (1.0 + bedroomWellRestedBonus()) : 1.0;
+    double wellRestedMult = (wellRestedHoursRemaining_ > 0.0) ? (1.0 + activeWellRestedBonus_) : 1.0;
     wellRestedHoursRemaining_ = std::max(0.0, wellRestedHoursRemaining_ - daysElapsed * 24.0);
 
     double mult = staff_.multiplier() * life_.productionMultiplier() * life_.ageEfficiency() * legacyMult * dailyYieldVariance_ * kEconomyPaceMultiplier * wellRestedMult;
@@ -219,6 +236,12 @@ bool Game::simulateElapsed(long long seconds, std::vector<std::string>& eventLog
     // replacing it, same as every other multiplier in this function.
     seasonSicknessMult *= std::max(0.0, 1.0 - static_cast<double>(bedroomLevel_) * kBedroomSicknessReductionPerLevel);
 
+    // Pass 1 and Pass 2 (all production, raw and processed alike) are
+    // skipped entirely when `grantProduction` is false -- see the header
+    // comment on simulateElapsed's own declaration. Everything below this
+    // (construction already ran in Pass 0 above; market noise, events,
+    // upkeep, and the life clock all still run further down) is untouched.
+    if (grantProduction) {
     for (auto& b : businessManager_.businesses()) {
         if (b.level <= 0) continue;
         const BusinessType* type = businessManager_.findType(b.typeId);
@@ -297,6 +320,7 @@ bool Game::simulateElapsed(long long seconds, std::vector<std::string>& eventLog
             money_ += actualOutput;
         }
     }
+    } // grantProduction
 
     // Pass 3: Storefront auto-sell (see Business::autoSellGoodId/
     // autoSellThreshold and GameWorld::drawAutoSellOverlay) -- runs after
@@ -335,7 +359,25 @@ bool Game::simulateElapsed(long long seconds, std::vector<std::string>& eventLog
     // applying to money that hasn't been earned yet.
     money_ = std::max(0.0, money_ - upkeepPerSecond() * static_cast<double>(seconds));
 
-    long long steps = seconds / kMarketStepSeconds;
+    // 2026-08-10 bugfix ("价钱会一直跳动...为什么我这个版本好像没有了" --
+    // price jitter seemed to have stopped happening during live play): used
+    // to be `steps = seconds / kMarketStepSeconds` computed fresh from THIS
+    // call's own `seconds` alone. That's fine for one big sleep/offline
+    // catch-up, but Game::tickBackground (called every render frame) passes
+    // real elapsed seconds since the last call -- almost always exactly 1
+    // (nowEpoch() only has whole-second resolution, and it's checked far
+    // more than once a second), so `1 / 5 == 0` in integer division: live
+    // play never accumulated enough in a single call to take a single
+    // price-noise step, and the leftover second was thrown away every tick
+    // instead of carrying toward the next one -- market_.advance() was
+    // structurally unreachable during normal foreground gameplay. Fixed by
+    // accumulating into a persistent remainder (see marketStepRemainderSeconds_'s
+    // own comment) across calls instead of deriving steps from one call in
+    // isolation -- a real ~1 step every 5 real seconds during live play now,
+    // same total step count as before for one big catch-up/sleep call.
+    marketStepRemainderSeconds_ += seconds;
+    long long steps = marketStepRemainderSeconds_ / kMarketStepSeconds;
+    marketStepRemainderSeconds_ -= steps * kMarketStepSeconds;
     if (steps > 0) market_.advance(static_cast<int>(std::min<long long>(steps, 100000)));
 
     // Rolls flavor events and progresses illness onset/duration (see Life::sick).
@@ -449,6 +491,7 @@ void Game::handleDeath() {
     warehouseLevel_ = 0;
     bedroomLevel_ = 0;
     wellRestedHoursRemaining_ = 0.0;
+    activeWellRestedBonus_ = 0.0;
     lastFoodEatenId_.clear();
     contracts_.clear();
     market_ = Market();
@@ -1078,7 +1121,10 @@ void Game::menuSleep() {
     if (choice != 1) return;
 
     std::vector<std::string> log;
-    bool died = simulateElapsed(kOneGameDaySeconds, log);
+    // grantProduction=false -- same fix as GameWorld's trySleep(), see its
+    // own call site comment: sleeping shouldn't silently run every business
+    // at full output for the whole night, just advance the clock.
+    bool died = simulateElapsed(kOneGameDaySeconds, log, 1.0, true, /*grantProduction=*/false);
     lastTickEpoch_ += kOneGameDaySeconds;
     printEventLog(log);
 
@@ -1312,6 +1358,15 @@ std::vector<FoodOption> Game::foodOptions() const {
             if (g.id == f.goodId) { stock = g.stock; break; }
         }
         result.push_back(FoodOption{ f.goodId, f.hungerRestorePerUnit, stock });
+    }
+    return result;
+}
+
+std::vector<InnTierInfo> Game::innTiers() const {
+    std::vector<InnTierInfo> result;
+    result.reserve(sizeof(kInnTierDefs) / sizeof(kInnTierDefs[0]));
+    for (const auto& t : kInnTierDefs) {
+        result.push_back(InnTierInfo{ t.nameKey, t.cost, t.extraHours, t.extraBonus });
     }
     return result;
 }
@@ -2003,14 +2058,40 @@ ActionResult Game::tryVisitDoctor() {
     return result;
 }
 
-TickOutcome Game::trySleep() {
-    static const long long kOneGameDaySeconds =
-        static_cast<long long>(Life::kGameSecondsPerDay / Life::kTimeCompression);
-
+TickOutcome Game::trySleep(int tier) {
     TickOutcome outcome;
+    int clampedTier = std::clamp(tier, 0, static_cast<int>(sizeof(kInnTierDefs) / sizeof(kInnTierDefs[0])) - 1);
+    const InnTierDef& room = kInnTierDefs[static_cast<size_t>(clampedTier)];
+    if (money_ < room.cost) {
+        outcome.success = false;
+        return outcome;
+    }
+    // Charged up front, before the night's events -- you paid for the room
+    // regardless of what happens to you overnight (see trySleep's own
+    // declaration comment).
+    money_ -= room.cost;
+
+    // Wake up at next-day 8am (2026-08-07 fix, "点击睡觉了,但是时间不会变
+    // 白天" -- this used to just add a flat one game day, which leaves the
+    // fractional part of life_.ageDays (i.e. the actual time of day)
+    // completely unchanged: falling asleep at, say, 11pm woke you up at
+    // 11pm the *next* day too, so the clock never visibly passed through
+    // morning at all. Computing the delta to the next day's 8am instead
+    // means sleeping always actually lands on morning, regardless of what
+    // time you fell asleep at.
+    double dayStart = static_cast<double>(static_cast<long long>(life_.ageDays)); // start (midnight) of the current in-game day
+    constexpr double kWakeHourFraction = 8.0 / 24.0; // 8am
+    double targetAgeDays = dayStart + 1.0 + kWakeHourFraction; // tomorrow's 8am -- always forward of life_.ageDays regardless of what hour sleep started at (fraction is always < 1)
+    double deltaDays = targetAgeDays - life_.ageDays;
+    long long sleepSeconds = static_cast<long long>(deltaDays * Life::kGameSecondsPerDay / Life::kTimeCompression);
+
     std::vector<std::string> log;
-    bool died = simulateElapsed(kOneGameDaySeconds, log);
-    lastTickEpoch_ += kOneGameDaySeconds;
+    // grantProduction=false (2026-08-10, "睡觉了,用户可以直接领取满的仓库...
+    // 睡觉只会影响时间和事件发生就ok了,不要帮忙加货" -- sleeping shouldn't
+    // hand the player a full warehouse; it should just advance the clock and
+    // let events happen) -- see simulateElapsed's own declaration comment.
+    bool died = simulateElapsed(sleepSeconds, log, 1.0, true, /*grantProduction=*/false);
+    lastTickEpoch_ += sleepSeconds;
     printEventLog(log);
     if (died) {
         outcome.died = true;
@@ -2019,7 +2100,8 @@ TickOutcome Game::trySleep() {
         outcome.generation = generation_;
     } else {
         life_.energy = 100.0;
-        wellRestedHoursRemaining_ = bedroomWellRestedHours();
+        wellRestedHoursRemaining_ = bedroomWellRestedHours() + room.extraHours;
+        activeWellRestedBonus_ = bedroomWellRestedBonus() + room.extraBonus;
     }
     checkAchievements();
     return outcome;

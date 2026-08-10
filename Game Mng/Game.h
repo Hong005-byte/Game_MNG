@@ -67,6 +67,20 @@ struct FoodOption {
     double stock = 0.0;
 };
 
+// One selectable room tier at the Inn (see Game::innTiers/trySleep) --
+// `nameKey` is the room's own localized name (distinct from the "sleep"
+// building's own floating label, now "Inn"), `cost` is what a single
+// night in that room costs, and `extraWellRestedHours`/`extraWellRestedBonus`
+// stack ON TOP OF (not instead of) whatever the player's own permanent
+// Bedroom upgrade level already grants -- the room tier is a repeatable,
+// optional splurge; the Bedroom is a one-time investment in your own bed.
+struct InnTierInfo {
+    std::string nameKey;
+    double cost = 0.0;
+    double extraWellRestedHours = 0.0;
+    double extraWellRestedBonus = 0.0;
+};
+
 // Read-only snapshot of the Storefront's auto-sell config (see
 // Business::autoSellGoodId/autoSellThreshold, Game::storefrontAutoSellInfo,
 // and GameWorld::drawAutoSellOverlay). `capacityPerDay` is already resolved
@@ -164,6 +178,11 @@ struct ActionResult {
 // ticking, sleeping, fast-forwarding). `deathMessage` is already the
 // localized cause string (see Game::simulateElapsed), ready to show as-is.
 struct TickOutcome {
+    // False only for trySleep() rejecting an unaffordable room tier (no
+    // other TickOutcome producer ever fails outright, so this defaults true
+    // and every existing call site is unaffected). When false, nothing else
+    // in this struct is meaningful -- no day passed, no money moved.
+    bool success = true;
     bool died = false;
     std::string deathMessage;
     int generation = 0;
@@ -272,13 +291,31 @@ public:
     int generation() const { return generation_; }
     double ageYears() const { return life_.ageYears(); }
     // Whole in-game days lived so far this generation (life_.ageDays starts
-    // at kStartingAgeYears * kDaysPerYear and advances by exactly 1.0 per
-    // trySleep()/tryFastForward()/tickToNow() call worth of a real day --
-    // see Life::advanceReal). Exposed as its own HUD figure since ageYears()
-    // alone (1 decimal place) barely visibly moves for a handful of days,
-    // making a few sleeps look like "nothing happened" even though the
-    // underlying math already advanced correctly.
+    // at kStartingAgeYears * kDaysPerYear and advances by however much real
+    // time trySleep()/tryFastForward()/tickToNow() actually simulated --
+    // see Life::advanceReal; trySleep() specifically now always lands
+    // exactly on next-day 8am, see its own comment, not a flat +1.0). Exposed
+    // as its own HUD figure since ageYears() alone (1 decimal place) barely
+    // visibly moves for a handful of days, making a few sleeps look like
+    // "nothing happened" even though the underlying math already advanced
+    // correctly.
     int totalDaysElapsed() const { return static_cast<int>(life_.ageDays); }
+    // Current in-game clock hour (2026-08-07, added alongside trySleep()'s
+    // next-day-8am fix so the HUD can actually show *why* sleeping moved
+    // time forward) -- the fractional part of life_.ageDays IS the time of
+    // day (0.0 = midnight, 0.5 = noon), scaled to 0..24. This is also now
+    // what GameWorld's own dayNightTint()/nightFactor() key their sky off
+    // of directly (a same-day follow-up removed GameWorld's old, purely
+    // cosmetic real-time sky timer once it was clearly the wrong clock to
+    // be reading -- see GameWorld.h's own comment) -- so this one getter is
+    // the single source of truth for "what time is it" everywhere now.
+    double timeOfDayHours() const {
+        // Truncation instead of std::floor (avoids a <cmath> include here) --
+        // safe since life_.ageDays is always positive (starts at
+        // kStartingAgeYears * kDaysPerYear, only ever increases).
+        double frac = life_.ageDays - static_cast<double>(static_cast<long long>(life_.ageDays));
+        return frac * 24.0;
+    }
     double energy() const { return life_.energy; }
     double hunger() const { return life_.hunger; }
     bool isSick() const { return life_.sick; }
@@ -298,6 +335,18 @@ public:
     static constexpr double kWellRestedHours = 8.0;          // in-game hours the bonus lasts
     static constexpr double kWellRestedProductionBonus = 0.10; // +10% production while active
     double wellRestedHoursRemaining() const { return wellRestedHoursRemaining_; }
+
+    // ---- Inn room tiers (2026-08-07): the "sleep" building is now the Inn,
+    // not a free/instant bedroom -- every night costs whichever room tier
+    // the player picks, cheapest to priciest, and a pricier room grants a
+    // longer/stronger well-rested buff on top of the Bedroom upgrade's own
+    // baseline (see trySleep). Kept deliberately affordable end to end
+    // (cheapest tier is a token fee, priciest still undercuts a single
+    // Doctor visit) -- this is meant to be a flavorful daily habit, not a
+    // toll gate on the core sleep loop. Fixed table (not player-scaling),
+    // same convention as kFoodDefs. ----
+    static constexpr int kInnTierCount = 5;
+    std::vector<InnTierInfo> innTiers() const;
 
     // ---- Bedroom: a cash-only comfort upgrade reached from the Sleep menu
     // (see menuSleep()/GameWorld::drawSleepOverlay) -- makes the well-rested
@@ -578,7 +627,13 @@ public:
     // caller should report instead of whatever qty it originally asked for.
     ActionResult tryEat(const std::string& goodId, double qty);
     ActionResult tryVisitDoctor();
-    TickOutcome trySleep();
+    // `tier` indexes into innTiers() (clamped into range) -- charges that
+    // tier's cost up front (see innTiers' own comment on why before, not
+    // after, the night's events), same "clamped, not rejected" convention
+    // as tryEat. `TickOutcome::success` is false (with no other side
+    // effects at all -- money untouched, no day passes) when the player
+    // can't afford the chosen tier.
+    TickOutcome trySleep(int tier);
     TickOutcome tryFastForward(double minutes);
 
     // ---- Bank: a separate cash pool. Theft/recession disasters and the
@@ -709,10 +764,37 @@ private:
     double dailyYieldVariance_ = 1.0;
     long long dailyYieldVarianceDay_ = -1;
 
+    // ---- Market price-noise carry-over (2026-08-10 bugfix, "价钱会一直跳
+    // 动...为什么我这个版本好像没有了" -- price jitter seemed to have
+    // stopped happening at all during live play): simulateElapsed's own
+    // `seconds` param used to compute market steps as `seconds /
+    // kMarketStepSeconds` (5) from THAT CALL ALONE, with no memory between
+    // calls -- fine for a single big offline/sleep catch-up, but Game::
+    // tickBackground (called every render frame) passes real elapsed
+    // seconds since the last call, which is almost always exactly 1 (whole-
+    // second-resolution nowEpoch(), checked far more than once per second)
+    // -- `1 / 5 == 0` in integer division, so live play never accumulated
+    // enough in a single call to ever take a price-noise step, and the
+    // leftover second was silently discarded every single tick instead of
+    // carrying toward the next one. This accumulator fixes that by
+    // tracking leftover real seconds across calls instead of deriving
+    // steps from one call's own `seconds` in isolation -- see its use in
+    // simulateElapsed. Deliberately not saved, same as dailyYieldVariance_
+    // above -- losing a few seconds of partial progress across a save/load
+    // is harmless. ----
+    long long marketStepRemainderSeconds_ = 0;
+
     // ---- Well-rested buff countdown (see kWellRestedHours/kWellRestedProductionBonus)
     // and last-eaten-food tracking (see kVarietyBonusMultiplier) -- both transient
     // flavor state, deliberately not saved, same as dailyYieldVariance_ above. ----
     double wellRestedHoursRemaining_ = 0.0;
+    // The well-rested bonus % actually in effect while wellRestedHoursRemaining_
+    // is counting down -- set once per trySleep() call to bedroomWellRestedBonus()
+    // plus whichever Inn tier was chosen that night (see innTiers()), instead of
+    // recomputing bedroomWellRestedBonus() alone at consumption time, since the
+    // tier's own extra bonus only applies for the buff IT granted, not
+    // retroactively to a buff a cheaper night already started.
+    double activeWellRestedBonus_ = 0.0;
     std::string lastFoodEatenId_;
 
     // ---- Transient UI event queues (see drainNewlyUnlockedAchievements/
@@ -747,7 +829,18 @@ private:
     // they had no chance to react while the app was closed. Every other
     // caller (live ticking, sleeping, fast-forwarding) leaves this true, so
     // neglect during an active session is exactly as lethal as it always was.
-    bool simulateElapsed(long long seconds, std::vector<std::string>& eventLog, double weatherMult = 1.0, bool allowDeath = true);
+    //
+    // `grantProduction = false` (2026-08-10 bugfix, "睡觉了,用户可以直接领
+    // 取满的仓库...睡觉只会影响时间和事件发生就ok了,不要帮忙加货" -- sleeping
+    // shouldn't hand the player a full warehouse, just advance time and let
+    // events happen) skips Pass 1/Pass 2 below (raw production and
+    // input->output processing) entirely -- construction progress, market
+    // price noise, random events, upkeep, and the life clock all still run
+    // exactly as normal. Only trySleep() passes false; every other caller
+    // (live ticking, fast-forwarding, offline catch-up) leaves this true,
+    // so sleep is now the one time skip that doesn't also silently run
+    // every business at max output for its whole duration.
+    bool simulateElapsed(long long seconds, std::vector<std::string>& eventLog, double weatherMult = 1.0, bool allowDeath = true, bool grantProduction = true);
 
     // Ticks the clock forward to "now" based on real elapsed time. Returns
     // true if the character died during this call.
