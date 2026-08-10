@@ -184,6 +184,7 @@
     <ClCompile Include="Achievements.cpp" />
     <ClCompile Include="Life.cpp" />
     <ClCompile Include="GameWorld.cpp" />
+    <ClCompile Include="GameWorld3D.cpp" />
     <ClCompile Include="Localization.cpp" />
     <ClCompile Include="SaveManager.cpp" />
     <ClCompile Include="Settings.cpp" />
@@ -199,6 +200,7 @@
     <ClInclude Include="Life.h" />
     <ClInclude Include="Format.h" />
     <ClInclude Include="GameWorld.h" />
+    <ClInclude Include="Math3D.h" />
     <ClInclude Include="Localization.h" />
     <ClInclude Include="SaveManager.h" />
     <ClInclude Include="Settings.h" />

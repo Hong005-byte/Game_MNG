@@ -6,8 +6,10 @@
 #include <optional>
 #include <functional>
 #include <unordered_map>
+#include <memory>
 #include "Game.h"
 #include "Settings.h"
+#include "Math3D.h"
 
 // A single interactable structure. `id` maps to a menu overlay (see
 // OverlayKind) rather than the console anymore.
@@ -146,6 +148,30 @@ private:
     float playerWalkTimer_ = 0.f; // advances only while actually moving -- drives drawPlayer's walk bob (see drawPixelPerson)
     sf::Font font_;
     bool fontLoaded_ = false;
+    // HD-2D 3D billboard cache (see GameWorld3D.cpp) -- each entry is one
+    // pixel-art sprite (tree/bush/lamp/a specific shirt color) pre-rendered
+    // once into an offscreen texture via the *same* drawTree/drawBush/
+    // drawLamp/drawPixelPerson functions the 2D world uses, then reused
+    // every frame as a camera-facing billboard instead of a placeholder
+    // colored box. Keyed by a string describing what's drawn (season/color)
+    // so a cache miss only happens when that actually changes (e.g. a
+    // season transition), not every frame.
+    std::unordered_map<std::string, std::unique_ptr<sf::RenderTexture>> billboardCache3D_;
+    // `repeated` (default false, matches every pre-existing caller's
+    // behavior) sets sf::Texture::setRepeated -- needed for the tileable
+    // material-grain textures (see GameWorld3D.cpp's bakeGrainPattern) that
+    // opaque 3D faces can now be textured with, whose UV coordinates
+    // intentionally run past [0, textureSize) to tile; a plain sprite
+    // billboard (tree/bush/NPC/etc.) never needs that.
+    const sf::Texture& getBillboard3D(const std::string& key, sf::Vector2u size,
+        const std::function<void(sf::RenderTexture&)>& drawFn, bool repeated = false);
+    // Mouse-wheel zoom for the 3D camera (2026-08-07) -- a multiplier on
+    // getZoneCamera3D's own fixed `kCamOffset`, so scrolling dollies the
+    // eye closer to/further from the player along the same fixed viewing
+    // angle instead of changing FOV or panning. 1.0 = the original fixed
+    // distance; see run()'s MouseWheelScrolled handler for the step/clamp.
+    float cameraZoom3D_ = 1.f;
+
     sf::Vector2u windowSize_{ 1280u, 820u }; // logical resolution -- every drawing coordinate in this file is in this space, regardless of the real window size below
     sf::Vector2u actualWindowSize_{ 1280u, 820u }; // the real OS window/fullscreen size (see applyVideoMode) -- gameView_ maps logical space onto it
     sf::View gameView_;
@@ -166,6 +192,11 @@ private:
     // OverlayKind::Eat's selected food (see drawEatOverlay/Game::foodOptions)
     // -- reset to "wheat" whenever the overlay opens.
     std::string eatSelectedGoodId_ = "wheat";
+    // OverlayKind::Sleep's selected Inn room tier (see drawSleepOverlay/
+    // Game::innTiers) -- an index into innTiers(), defaults to the cheapest
+    // room so sleeping never silently costs more than the player expects
+    // the first time they open the overlay.
+    int sleepSelectedTier_ = 0;
     // OverlayKind::WelcomeBack's collapsed/expanded toggle (see
     // drawWelcomeBackOverlay) -- starts collapsed (just a title banner),
     // clicking it reveals how long the player was away and what happened.
@@ -224,9 +255,16 @@ private:
 
     // ---- Day/night cycle + weather: purely visual (flat-color overlays,
     // matching the rest of the world's plain-shape look -- no gradients or
-    // particle-system glow), paused whenever an overlay/menu is open, same
+    // particle-system glow). Day/night itself (see dayNightTint()/
+    // nightFactor()) now reads directly off game_.timeOfDayHours() -- the
+    // real simulated in-game clock -- instead of its own independent real-
+    // time timer (removed 2026-08-07, "我看时间15.39就已经晚上了...就跟着
+    // 游戏时间跑吧" -- the old dayNightTimer_ ran on real wall-clock dt
+    // completely decoupled from the actual in-game hour, so the sky could
+    // show "night" at 3:39pm and there was no way to fix that without
+    // tying the two together). Weather timers below are untouched, still
+    // real-time-driven and paused whenever an overlay/menu is open, same
     // as movement and the world tick. ----
-    float dayNightTimer_ = 0.f;      // seconds into the current cycle
     bool raining_ = false;
     float weatherCheckTimer_ = 30.f; // counts down to the next rain/clear roll
     float rainTime_ = 0.f;           // drives the falling-rain animation while raining_
@@ -392,14 +430,24 @@ private:
     // GameWorld.cpp for the shared role-char convention (matches the Recipe
     // Book icons' O/H/B/S/A/D roles, just looked up through an explicit
     // palette here instead of one derived from a single seed color).
-    void drawPixelSprite(sf::RenderWindow& window, const std::vector<std::string>& rows, sf::FloatRect area,
+    // `window` is sf::RenderTarget (not sf::RenderWindow) on this one and
+    // the handful of others it/drawPixelPerson/drawTree/drawBush/drawLamp
+    // transitively call (drawPixelPanel, drawGroundShadow, drawGlow) --
+    // sf::RenderWindow and sf::RenderTexture both derive from RenderTarget,
+    // and every existing call site already passes an actual RenderWindow
+    // (which still binds fine, just via the base class now), so this is a
+    // pure widening. Needed so the HD-2D billboard cache (GameWorld3D.cpp)
+    // can render these same pixel-art sprites into an offscreen
+    // sf::RenderTexture once and reuse the result as a billboard texture,
+    // instead of re-implementing every sprite a second time for 3D.
+    void drawPixelSprite(sf::RenderTarget& window, const std::vector<std::string>& rows, sf::FloatRect area,
         const std::unordered_map<char, sf::Color>& palette, bool flipX = false, const sf::RenderStates& states = sf::RenderStates::Default);
     // A textured rectangle -- highlight band on top, shadow band on bottom,
     // sparse darker speckle pixels for grit -- standing in for what used to
     // be a single flat RectangleShape fill. `seedPos` just needs to be stable
     // per instance (building position works) so the speckle pattern doesn't
     // jitter frame to frame; it isn't a screen position transform.
-    void drawPixelPanel(sf::RenderWindow& window, sf::Vector2f pos, sf::Vector2f size, sf::Color baseColor,
+    void drawPixelPanel(sf::RenderTarget& window, sf::Vector2f pos, sf::Vector2f size, sf::Color baseColor,
         sf::Color outlineColor, sf::Vector2f seedPos, float pixelSize = 4.5f, const sf::RenderStates& states = sf::RenderStates::Default);
     // Hand pixel-art replacements for what used to be smooth ConvexShape
     // silhouettes -- Cottage/Workshop-family peaked roofs and the Mine/Gold
@@ -418,18 +466,18 @@ private:
     // moving (see playerWalkTimer_/Npc::isWalking) -- 0 holds the "legs
     // together" standing pose; sin(walkPhase) alternates legs apart/together
     // and also drives a small vertical bob.
-    void drawPixelPerson(sf::RenderWindow& window, sf::Vector2f pos, sf::Color shirtColor, bool flipX, float walkPhase, const sf::RenderStates& states = sf::RenderStates::Default);
+    void drawPixelPerson(sf::RenderTarget& window, sf::Vector2f pos, sf::Color shirtColor, bool flipX, float walkPhase, const sf::RenderStates& states = sf::RenderStates::Default);
     // A soft squashed-ellipse shadow under a sprite's feet -- drawn before
     // the sprite itself. Without this, a flat-shaded pixel cutout (player/
     // NPC/tree/bush) reads as floating/pasted onto the ground rather than
     // actually standing on it; this is the cheap fix for that.
-    void drawGroundShadow(sf::RenderWindow& window, sf::Vector2f feetCenter, float radiusX, const sf::RenderStates& states = sf::RenderStates::Default);
+    void drawGroundShadow(sf::RenderTarget& window, sf::Vector2f feetCenter, float radiusX, const sf::RenderStates& states = sf::RenderStates::Default);
     // Cheap stand-in for a real bloom pass (this codebase has no shader/
     // RenderTexture pipeline) -- 3 concentric circles fading outward from
     // `color`'s own alpha, layered around an already-drawn emissive element
     // (a lit window, an oven mouth, a forge's furnace glow). `radius` is the
     // reference "core" size the rings scale from.
-    void drawGlow(sf::RenderWindow& window, sf::Vector2f center, float radius, sf::Color color, const sf::RenderStates& states = sf::RenderStates::Default);
+    void drawGlow(sf::RenderTarget& window, sf::Vector2f center, float radius, sf::Color color, const sf::RenderStates& states = sf::RenderStates::Default);
 
     // ---- "Building shell" kit (2026-08-07 detail pass) -- higher-detail,
     // fully procedural (not hand-typed ASCII grids, so there's no risk of a
@@ -469,6 +517,31 @@ private:
     void drawFlowerBox(sf::RenderWindow& window, sf::Vector2f pos, sf::Vector2f size, sf::Vector2f seedPos,
         const sf::RenderStates& states = sf::RenderStates::Default);
 
+    // HD-2D renderer (see GameWorld3D.cpp and the plan doc) -- a real
+    // perspective-projected, directionally-lit 3D render of whichever zone
+    // is current, standing in for drawZone() for every zone (see its now-
+    // unconditional dispatch). Math is done CPU-side via Math3D.h and
+    // submitted as ordinary sf::VertexArray triangles -- no OpenGL calls,
+    // no depth buffer, no risk to the rest of this file's SFML 2D state.
+    void draw3DZone(sf::RenderWindow& window);
+    // Shared by draw3DZone (rendering) and raycastZoneGround3D (click
+    // hit-testing) so the two can never disagree about where the camera
+    // actually is -- pans to follow the player, clamped so the ground
+    // plane never runs out at the edge of the frame.
+    void getZoneCamera3D(Vec3& eye, Vec3& target) const;
+    // Unprojects a screen-space click into the flat (x,y) ground-plane
+    // coordinate space every building/NPC rect is already stored in --
+    // the 3D equivalent of worldObliqueTransform().getInverse() for the
+    // 2D zones, needed because a building's screen position under the 3D
+    // camera has no fixed relationship to its flat world rect anymore.
+    sf::Vector2f raycastZoneGround3D(sf::Vector2f screenClick) const;
+    // 3D equivalent of the plain 2D "nearby building" yellow outline rect
+    // (see run()'s post-drawZone highlight) -- projects the building's
+    // ground footprint through the same camera draw3DZone uses instead of
+    // drawing an untilted flat rect that wouldn't track the building's
+    // actual on-screen silhouette under the 3D camera.
+    void draw3DBuildingHighlight(sf::RenderWindow& window, const WorldBuilding& b) const;
+
     void drawZone(sf::RenderWindow& window);
     void drawBuilding(sf::RenderWindow& window, const WorldBuilding& b, const sf::RenderStates& states = sf::RenderStates::Default);
     void drawCottageShape(sf::RenderWindow& window, const WorldBuilding& b, const sf::RenderStates& states = sf::RenderStates::Default);
@@ -507,13 +580,16 @@ private:
     void drawBreweryShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor, const sf::RenderStates& states = sf::RenderStates::Default);
     void drawSmokehouseShape(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color accentColor, const sf::RenderStates& states = sf::RenderStates::Default);
     void drawAccentGlyph(sf::RenderWindow& window, const WorldBuilding& b, int accentKind, sf::Color color, const sf::RenderStates& states = sf::RenderStates::Default);
-    void drawTree(sf::RenderWindow& window, sf::Vector2f pos, const sf::RenderStates& states = sf::RenderStates::Default);
-    void drawBush(sf::RenderWindow& window, sf::Vector2f pos, const sf::RenderStates& states = sf::RenderStates::Default);
+    // sf::RenderTarget, not sf::RenderWindow -- see drawPixelSprite's
+    // comment above (this is the other end of that same chain: the actual
+    // sprite-drawing functions the HD-2D billboard cache calls).
+    void drawTree(sf::RenderTarget& window, sf::Vector2f pos, const sf::RenderStates& states = sf::RenderStates::Default);
+    void drawBush(sf::RenderTarget& window, sf::Vector2f pos, const sf::RenderStates& states = sf::RenderStates::Default);
     // A freestanding pole + lantern head -- glass panel and drawGlow halo
     // both scale with nightFactor() so it reads as "off" (a plain dark
     // lantern) by day and lit at night, same idea as the cottage window/oven/
     // forge glows but starting from near-zero instead of already-lit.
-    void drawLamp(sf::RenderWindow& window, sf::Vector2f pos, const sf::RenderStates& states = sf::RenderStates::Default);
+    void drawLamp(sf::RenderTarget& window, sf::Vector2f pos, const sf::RenderStates& states = sf::RenderStates::Default);
     void drawNpc(sf::RenderWindow& window, const Npc& npc, const sf::RenderStates& states = sf::RenderStates::Default);
     void drawLockOverlay(sf::RenderWindow& window, const WorldBuilding& b, const sf::RenderStates& states = sf::RenderStates::Default);
     // First-build construction (see Business::constructionDaysRemaining /
@@ -540,11 +616,11 @@ private:
     sf::Color dayNightTint() const;
     sf::Color seasonTint() const; // subtle per-season wash, layered under the day/night tint
     // 0 at midday, ramping up through dusk to 1 at full night, back down
-    // through dawn -- same dayNightTimer_/kDayNightCycleSeconds keyframe
-    // interpolation dayNightTint() already does, just returning a plain
-    // brightness scalar instead of a tint color. Used to make lit windows/
-    // ovens/forges and lamp posts actually glow brighter after dark instead
-    // of shining at the same flat intensity around the clock.
+    // through dawn -- same game_.timeOfDayHours() keyframe interpolation
+    // dayNightTint() already does, just returning a plain brightness scalar
+    // instead of a tint color. Used to make lit windows/ovens/forges and
+    // lamp posts actually glow brighter after dark instead of shining at
+    // the same flat intensity around the clock.
     float nightFactor() const;
     void drawDayNightOverlay(sf::RenderWindow& window);
     void drawWeather(sf::RenderWindow& window);
