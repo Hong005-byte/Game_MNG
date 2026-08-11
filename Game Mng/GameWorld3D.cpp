@@ -339,11 +339,26 @@ namespace {
     // (see draw3DZone's building loop and every hero building's wall bands),
     // where a big single-tone panel was the main thing reported as reading
     // "flat"/"not solid"/"no detail" (2026-08-07). Never includes a top
-    // face -- every call site that needs one already has a roof (or, for
-    // Clinic's flat-roofed blocks, a parapet deck) going on top of it.
+    // face BY DEFAULT -- every wall call site that needs one already has a
+    // roof (or, for Clinic's flat-roofed blocks, a parapet deck) going on
+    // top of it.
+    //
+    // `includeTop` (2026-08-11, "我看很多这种的图层都是拿泥土层来放成桌子
+    // 勒" -- a lot of these layers are using the dirt layer as the table):
+    // this function got reused, well after the "walls always get a roof"
+    // assumption above was written, for plenty of free-standing furniture
+    // that never gets one -- market/gemshop/etc counters, display tables,
+    // fruit crates, oven pedestals, baskets. Every one of those was
+    // rendering with NO top face at all, so looking down through the
+    // missing lid showed whatever ground-level geometry sat behind it --
+    // exactly the "counter reads as a flat dirt-colored patch" bug this
+    // was reported against, not something specific to one building.
+    // `includeTop` defaults to false so every existing wall-under-a-roof
+    // call site is completely unaffected; every free-standing-furniture
+    // call site now passes true.
     void addBandedBox(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
         Vec3 pos, Vec3 size, sf::Color baseColor, const LightingContext& lc,
-        const sf::Texture* tex = nullptr, float uvWorldPerTile = 40.f) {
+        const sf::Texture* tex = nullptr, float uvWorldPerTile = 40.f, bool includeTop = false) {
         Vec3 p000 = pos;
         Vec3 p100 = pos + Vec3(size.x, 0.f, 0.f);
         Vec3 p010 = pos + Vec3(0.f, size.y, 0.f);
@@ -353,6 +368,7 @@ namespace {
         Vec3 p011 = pos + Vec3(0.f, size.y, size.z);
         Vec3 p111 = pos + Vec3(size.x, size.y, size.z);
 
+        if (includeTop) addFace(out, viewProj, windowSize, eye, p010, p110, p111, p011, Vec3(0.f, 1.f, 0.f), baseColor, lc, tex, uvWorldPerTile);
         addBandedVerticalFace(out, viewProj, windowSize, eye, p000, p100, p110, p010, Vec3(0.f, 0.f, -1.f), baseColor, lc, tex, uvWorldPerTile); // north
         addBandedVerticalFace(out, viewProj, windowSize, eye, p101, p001, p011, p111, Vec3(0.f, 0.f, 1.f), baseColor, lc, tex, uvWorldPerTile);  // south
         addBandedVerticalFace(out, viewProj, windowSize, eye, p001, p000, p010, p011, Vec3(-1.f, 0.f, 0.f), baseColor, lc, tex, uvWorldPerTile); // west
@@ -368,15 +384,21 @@ namespace {
     // parameter regardless of vertex winding, so this is exact enough for a
     // plausible-looking shaded slope without the extra work of deriving it
     // per pyramid from `height`/footprint ratio.
+    // `tex`/`uvWorldPerTile` are optional (default nullptr = flat `color`
+    // fill, the original behavior every pre-2026-08-11 call site still
+    // gets) -- added so Bakery's own oven mound could pick up a stone
+    // texture instead of reading as a solid-color shape (see
+    // addBakeryBuilding's own oven rework comment below).
     void addPyramid(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
-        Vec3 pos, sf::Vector2f size, float height, sf::Color color, const LightingContext& lc) {
+        Vec3 pos, sf::Vector2f size, float height, sf::Color color, const LightingContext& lc,
+        const sf::Texture* tex = nullptr, float uvWorldPerTile = 40.f) {
         Vec3 nw(pos.x, pos.y, pos.z), ne(pos.x + size.x, pos.y, pos.z);
         Vec3 se(pos.x + size.x, pos.y, pos.z + size.y), sw(pos.x, pos.y, pos.z + size.y);
         Vec3 apex(pos.x + size.x * 0.5f, pos.y + height, pos.z + size.y * 0.5f);
-        addTri(out, viewProj, windowSize, eye, nw, ne, apex, Vec3(0.f, 0.6f, -0.8f).normalized(), color, lc);
-        addTri(out, viewProj, windowSize, eye, se, sw, apex, Vec3(0.f, 0.6f, 0.8f).normalized(), color, lc);
-        addTri(out, viewProj, windowSize, eye, ne, se, apex, Vec3(0.8f, 0.6f, 0.f).normalized(), color, lc);
-        addTri(out, viewProj, windowSize, eye, sw, nw, apex, Vec3(-0.8f, 0.6f, 0.f).normalized(), color, lc);
+        addTri(out, viewProj, windowSize, eye, nw, ne, apex, Vec3(0.f, 0.6f, -0.8f).normalized(), color, lc, tex, uvWorldPerTile);
+        addTri(out, viewProj, windowSize, eye, se, sw, apex, Vec3(0.f, 0.6f, 0.8f).normalized(), color, lc, tex, uvWorldPerTile);
+        addTri(out, viewProj, windowSize, eye, ne, se, apex, Vec3(0.8f, 0.6f, 0.f).normalized(), color, lc, tex, uvWorldPerTile);
+        addTri(out, viewProj, windowSize, eye, sw, nw, apex, Vec3(-0.8f, 0.6f, 0.f).normalized(), color, lc, tex, uvWorldPerTile);
     }
 
     // A gable roof over a building footprint [pos, pos+size] (XZ), sitting
@@ -663,6 +685,204 @@ namespace {
         addBox(out, viewProj, windowSize, eye, Vec3(pos.x + size.x - t, 0.f, pos.y), Vec3(t, h, size.y), color, lc);
     }
 
+    // Shared "Workshop family" cabin -- the log-cabin shop block (stone
+    // foundation, plank upper band, side-gable roof, door, window+flower-
+    // box, gable-end sign, chimney) that Bakery/Preserve/Goldsmith each
+    // hand-copied verbatim with only their own wall/roof/sign colors
+    // differing (2026-08-11, after the user's "有的话就试看每一间你自己
+    // 设计" -- go ahead and design the rest -- made it clear this recipe
+    // was about to get copy-pasted several more times over). Factored out
+    // now, for every NEW Workshop-family building from here on, rather
+    // than retrofitting the 3 that already shipped and were already
+    // confirmed against a screenshot (no reason to risk regressing
+    // working, user-checked geometry for a pure refactor). Returns the
+    // measurements (enclosedW/wallTop/foundationH/southZ) every caller
+    // needs to keep placing its own annex/apparatus flush against the
+    // cabin.
+    struct WorkshopCabinInfo { float enclosedW, wallTop, foundationH, southZ; };
+    WorkshopCabinInfo addWorkshopCabin(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
+        const WorldBuilding& b, const LightingContext& lc, float wallH, float roofRise, Vec3 billboardRight, const sf::Texture& glowTex,
+        const sf::Texture& stoneTex, const sf::Texture& shingleTex, const sf::Texture& flowerTex,
+        sf::Color plankWall, sf::Color roofColor, sf::Color signColor, float enclosedWFrac = 0.38f) {
+        sf::Color stone(118, 114, 108);
+        sf::Color beamColor(58, 40, 26);
+        sf::Color windowColor(255, 214, 140);
+        sf::Color plantBoxColor(96, 68, 40);
+        constexpr float kStoneUv = 20.f, kShingleUv = 15.f;
+
+        Vec3 basePos(b.position.x, 0.f, b.position.y);
+        float southZ = basePos.z + b.size.y + 1.5f;
+
+        float wallH2 = wallH * 0.72f;
+        float foundationH = wallH2 * 0.18f;
+        float upperH = wallH2 - foundationH;
+        float wallTop = wallH2;
+        float cabinRoofRise = roofRise * 0.6f;
+
+        float enclosedW = b.size.x * enclosedWFrac;
+        addBandedBox(out, viewProj, windowSize, eye, basePos, Vec3(enclosedW, foundationH, b.size.y), stone, lc, &stoneTex, kStoneUv);
+        addBandedBox(out, viewProj, windowSize, eye, Vec3(basePos.x, foundationH, basePos.z), Vec3(enclosedW, upperH, b.size.y), plankWall, lc, &shingleTex, kShingleUv);
+        addGableRoof(out, viewProj, windowSize, eye, basePos, Vec3(enclosedW, wallTop, b.size.y), wallTop, cabinRoofRise, roofColor, lc, &shingleTex, kShingleUv);
+
+        float doorW = enclosedW * 0.22f, doorH = foundationH + upperH * 0.55f;
+        Vec3 doorPos(basePos.x + enclosedW * 0.5f - doorW * 0.5f, 0.f, southZ);
+        addBox(out, viewProj, windowSize, eye, doorPos, Vec3(doorW, doorH, 3.f), beamColor, lc);
+        addBox(out, viewProj, windowSize, eye, Vec3(doorPos.x + doorW * 0.5f - 1.f, 0.f, southZ - 0.5f), Vec3(2.f, doorH, 2.f), shade3d(beamColor, -10), lc);
+
+        float winSize = enclosedW * 0.16f;
+        Vec3 winPos(basePos.x + enclosedW * 0.16f, foundationH + upperH * 0.4f, southZ);
+        addBox(out, viewProj, windowSize, eye, winPos, Vec3(winSize, winSize, 3.f), windowColor, lc);
+        addGlowBillboard(out, viewProj, windowSize, billboardRight, Vec3(winPos.x + winSize * 0.5f, winPos.y + winSize * 0.5f, southZ), winSize * 1.5f, glowTex, sf::Color(255, 214, 140, 130));
+        Vec3 boxPos(winPos.x - 2.f, winPos.y - 8.f, southZ - 3.f);
+        addBandedBox(out, viewProj, windowSize, eye, boxPos, Vec3(winSize + 4.f, 6.f, 6.f), plantBoxColor, lc, nullptr, 40.f, true);
+        addBillboard(out, viewProj, windowSize, billboardRight, Vec3(boxPos.x + (winSize + 4.f) * 0.5f, winPos.y - 2.f, southZ), winSize * 0.9f, 14.f, flowerTex, sf::Color::White);
+
+        float signW = enclosedW * 0.62f, signH = 16.f;
+        Vec3 signPos(basePos.x + enclosedW * 0.5f - signW * 0.5f, wallTop + cabinRoofRise * 0.35f, southZ - 2.f);
+        addBandedBox(out, viewProj, windowSize, eye, signPos, Vec3(signW, signH, 3.f), signColor, lc, nullptr, 40.f, true);
+
+        Vec3 chimneyPos(basePos.x + enclosedW * 0.78f, wallTop * 0.3f, basePos.z + b.size.y * 0.5f);
+        addBox(out, viewProj, windowSize, eye, chimneyPos, Vec3(11.f, wallTop * 0.75f, 11.f), sf::Color(96, 90, 86), lc);
+        addGlowBillboard(out, viewProj, windowSize, billboardRight, chimneyPos + Vec3(5.5f, wallTop * 0.75f + 12.f, 5.5f), 16.f, glowTex, sf::Color(210, 210, 214, 90));
+
+        return { enclosedW, wallTop, foundationH, southZ };
+    }
+
+    // Shared perimeter picket fence (all 4 sides, gate gap centered on the
+    // south edge) -- Pasture's own `fenceRun` lambda, hand-copied into
+    // Orchard and then Herb Garden (2026-08-11, each round adding another
+    // near-identical copy). Factored out now for the same reason
+    // `addWorkshopCabin` was -- every NEW flat-plot business from here on
+    // uses this instead of a 4th/5th/6th copy; Pasture/Orchard/Herb Garden
+    // keep their own already-shipped, already-screenshotted copies rather
+    // than being retrofitted for a pure refactor.
+    void addPerimeterFence(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
+        const WorldBuilding& b, const LightingContext& lc, sf::Color fenceColor, float gateW = 22.f) {
+        auto fenceRun = [&](float x0, float z0, float x1, float z1) {
+            float dx = x1 - x0, dz = z1 - z0;
+            float len = std::sqrt(dx * dx + dz * dz);
+            if (len < 1e-3f) return;
+            int posts = std::max(2, static_cast<int>(len / 16.f) + 1);
+            for (int i = 0; i < posts; ++i) {
+                float t = static_cast<float>(i) / static_cast<float>(posts - 1);
+                addBox(out, viewProj, windowSize, eye, Vec3(x0 + dx * t, 0.f, z0 + dz * t), Vec3(3.f, 16.f, 3.f), fenceColor, lc);
+            }
+            if (std::fabs(dz) < 1e-3f) addBox(out, viewProj, windowSize, eye, Vec3(x0, 9.f, z0 - 1.5f), Vec3(dx, 3.f, 3.f), fenceColor, lc);
+            else addBox(out, viewProj, windowSize, eye, Vec3(x0 - 1.5f, 9.f, z0), Vec3(3.f, 3.f, dz), fenceColor, lc);
+        };
+        float fx0 = b.position.x + 4.f, fx1 = b.position.x + b.size.x - 4.f;
+        float fz0 = b.position.y + 4.f, fz1 = b.position.y + b.size.y - 4.f;
+        float gateMid = b.position.x + b.size.x * 0.5f;
+        fenceRun(fx0, fz1, gateMid - gateW * 0.5f, fz1);
+        fenceRun(gateMid + gateW * 0.5f, fz1, fx1, fz1);
+        fenceRun(fx0, fz0, fx1, fz0);
+        fenceRun(fx0, fz0, fx0, fz1);
+        fenceRun(fx1, fz0, fx1, fz1);
+    }
+
+    // Shared open-air market-stall shell -- ground fill + border, 4 corner
+    // posts, a striped canopy (`addStripedAwning`, the same helper Market's
+    // own hero building already established), and a counter -- for the
+    // Stall family (isStallId in GameWorld.cpp: popcornstand/juicebar/
+    // teahouse/giftbasket/sushibar). Mirrors the 2D world's own
+    // drawStallShape ("a canvas awning over a counter instead of an
+    // enclosed shed... reads as buy here rather than goods are made here")
+    // -- these stay flat-plot-plus-props like Farm/Market, no walls at all,
+    // unlike every Workshop-family building. One stall filling most of the
+    // lot (Market's OWN hero building fits 3 side by side because it
+    // represents the whole market, not a single vendor). Returns the
+    // counter's own box so each caller can place its own goods on top.
+    struct MarketStallInfo { Vec3 counterPos; float counterW, counterD; };
+    MarketStallInfo addMarketStallShell(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
+        const WorldBuilding& b, const LightingContext& lc, sf::Color stripeA, sf::Color stripeB) {
+        sf::Color groundColor(176, 158, 122), postColor(74, 52, 32), counterColor(120, 84, 46);
+        addGroundQuad(out, viewProj, windowSize, eye, b.position.x, b.position.y, b.size.x, b.size.y, 0.6f, groundColor, lc);
+        addPlotBorder(out, viewProj, windowSize, eye, b.position, b.size, sf::Color(25, 20, 15), lc);
+
+        float postT = 5.f, backH = 58.f, frontH = 42.f;
+        float backMargin = b.size.y * 0.12f, awningDepth = b.size.y * 0.5f;
+        float counterGap = b.size.y * 0.03f, counterDepth = b.size.y * 0.22f;
+        float x0 = b.position.x + b.size.x * 0.08f, stallW = b.size.x * 0.84f;
+        float zBack = b.position.y + backMargin, zFront = zBack + awningDepth;
+
+        for (float px : { x0, x0 + stallW - postT }) {
+            addBox(out, viewProj, windowSize, eye, Vec3(px, 0.f, zBack), Vec3(postT, backH, postT), postColor, lc);
+            addBox(out, viewProj, windowSize, eye, Vec3(px, 0.f, zFront - postT), Vec3(postT, frontH, postT), postColor, lc);
+        }
+        addStripedAwning(out, viewProj, windowSize, eye, Vec3(x0, 0.f, zBack), stallW, awningDepth, backH, frontH, stripeA, stripeB, 6, lc);
+
+        float counterZ0 = zFront + counterGap;
+        Vec3 counterPos(x0 + stallW * 0.06f, 0.f, counterZ0);
+        float counterW = stallW * 0.88f;
+        addBandedBox(out, viewProj, windowSize, eye, counterPos, Vec3(counterW, 18.f, counterDepth), counterColor, lc, nullptr, 40.f, true);
+        return { counterPos, counterW, counterDepth };
+    }
+
+    // Shared dock shell for the Dock family (isDockId in GameWorld.cpp:
+    // fishing/shipyard/cannery/port/deepsea/island_ferry/fishermanplatter --
+    // spans every tier, unlike the other 8 archetype families, since even
+    // the 2D world's own drawDockShape gives tier-1 Fishing Dock the same
+    // deck+water base every other Dock business gets). Mirrors that 2D
+    // shape directly: a planked wood deck over most of the lot, a strip of
+    // water along the south edge with a low rail, no walls/roof at all --
+    // flat-plot-plus-props family, same as Market/the Stall shell above.
+    struct DockShellInfo { float deckD, waterZ0; };
+    DockShellInfo addDockShell(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
+        const WorldBuilding& b, const LightingContext& lc) {
+        sf::Color deckColor(126, 92, 56), waterColor(60, 110, 150), plankColor(100, 72, 42), railColor(90, 64, 38);
+        float deckD = b.size.y * 0.72f;
+        addGroundQuad(out, viewProj, windowSize, eye, b.position.x, b.position.y, b.size.x, deckD, 0.6f, deckColor, lc);
+        addPlotBorder(out, viewProj, windowSize, eye, b.position, b.size, sf::Color(25, 20, 15), lc);
+        for (float x = b.position.x + 8.f; x < b.position.x + b.size.x - 4.f; x += 14.f) {
+            addBox(out, viewProj, windowSize, eye, Vec3(x, 0.f, b.position.y + 3.f), Vec3(2.f, 1.5f, deckD - 6.f), plankColor, lc);
+        }
+        float waterZ0 = b.position.y + deckD;
+        addGroundQuad(out, viewProj, windowSize, eye, b.position.x, waterZ0, b.size.x, b.size.y - deckD, 0.5f, waterColor, lc);
+        for (float x = b.position.x + 6.f; x < b.position.x + b.size.x - 4.f; x += 20.f) {
+            addBox(out, viewProj, windowSize, eye, Vec3(x, 0.f, waterZ0 - 2.f), Vec3(3.f, 10.f, 3.f), railColor, lc);
+        }
+        return { deckD, waterZ0 };
+    }
+
+    // Shared shell for the Oven family's remaining 7 businesses (jamkitchen/
+    // pieshop/roaststand/picklinghouse/honeyrefinery/cakeshop/artisanbakery
+    // -- Bakery/Preserve already covered the first 2 with their own bespoke
+    // builds). `addWorkshopCabin` + an open post-and-roof bay (the Winery/
+    // Alchemist lesson applied up front: no enclosed wall hiding what's
+    // inside) holding a simple stone hearth with a fire glow -- every Oven-
+    // family business shares that same "something's cooking" read (see the
+    // 2D world's own drawOvenShape comment: "an arched, glowing oven mouth
+    // out front is the one visual every one of these businesses has in
+    // common"). Returns the cabin info AND the bay's own bounds so each
+    // caller can place its own 1-2 signature props (a cake stand, a pickle
+    // rack, ...) without every business re-deriving that math.
+    struct OvenShellInfo { WorkshopCabinInfo cab; float bayX0, bayW, bayH; };
+    OvenShellInfo addOvenFamilyShell(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
+        const WorldBuilding& b, const LightingContext& lc, float wallH, float roofRise, Vec3 billboardRight, const sf::Texture& glowTex,
+        const sf::Texture& stoneTex, const sf::Texture& shingleTex, const sf::Texture& flowerTex,
+        sf::Color plankWall, sf::Color roofColor, sf::Color signColor, sf::Color fireGlow) {
+        auto cab = addWorkshopCabin(out, viewProj, windowSize, eye, b, lc, wallH, roofRise, billboardRight, glowTex, stoneTex, shingleTex, flowerTex, plankWall, roofColor, signColor);
+        Vec3 basePos(b.position.x, 0.f, b.position.y);
+
+        float bayX0 = basePos.x + cab.enclosedW;
+        float bayW = b.size.x - cab.enclosedW;
+        float bayH = cab.wallTop * 0.68f;
+        sf::Color postColor(90, 62, 34);
+        for (float px : { bayX0 + 4.f, bayX0 + bayW - 4.f }) {
+            for (float pz : { basePos.z + 4.f, basePos.z + b.size.y - 4.f }) {
+                addBox(out, viewProj, windowSize, eye, Vec3(px, 0.f, pz), Vec3(4.f, bayH, 4.f), postColor, lc);
+            }
+        }
+        addBox(out, viewProj, windowSize, eye, Vec3(bayX0, bayH, basePos.z), Vec3(bayW, 3.f, b.size.y), shade3d(roofColor, -14), lc);
+
+        sf::Color hearthStone = shade3d(sf::Color(118, 114, 108), -6);
+        Vec3 hearthPos(bayX0 + bayW * 0.32f, 0.f, basePos.z + b.size.y * 0.5f - 9.f);
+        addBandedBox(out, viewProj, windowSize, eye, hearthPos, Vec3(18.f, 7.f, 18.f), hearthStone, lc, &stoneTex, 20.f, true);
+        addGlowBillboard(out, viewProj, windowSize, billboardRight, hearthPos + Vec3(9.f, 10.f, 9.f), 18.f, glowTex, fireGlow);
+
+        return { cab, bayX0, bayW, bayH };
+    }
+
     // A crop bed's own fill color + prop scatter, keyed by the farm's
     // ACTUAL currently-selected crop (Game::farmCropId(), one of the 7 real
     // CropType ids in Business.cpp -- wheat/strawberry/corn/watermelon/
@@ -838,32 +1058,138 @@ namespace {
 
         for (const auto& p : { sf::Vector2f(40.f, 76.f), sf::Vector2f(72.f, 77.f) }) {
             Vec3 boxPos(b.position.x + p.x, 0.f, b.position.y + p.y);
-            addBandedBox(out, viewProj, windowSize, eye, boxPos, Vec3(6.f, 6.f, 6.f), plantBoxColor, lc);
+            addBandedBox(out, viewProj, windowSize, eye, boxPos, Vec3(6.f, 6.f, 6.f), plantBoxColor, lc, nullptr, 40.f, true);
             addBillboard(out, viewProj, windowSize, billboardRight, boxPos + Vec3(3.f, 6.f, 3.f), 12.f, 14.f, flowerTex, sf::Color::White);
         }
     }
 
-    // Shared by Mine and Gold Mine (only the rock color + an extra sparkle
-    // pass differ -- see addGoldMineProps below), same as the 2D versions
-    // sharing everything but drawPixelMound's color and the sparkle loop.
-    // Mound height and arch proportions retuned 2026-08-07 (reported as "the
-    // mountain is too small, the door is too big") -- a 62-tall mound over a
-    // 110x80 footprint read as a squashed bump rather than a hill, and a
-    // 34-tall/0.34-width entrance ate more than half of it.
-    void addMineProps(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
-        const WorldBuilding& b, const LightingContext& lc, sf::Color rockColor) {
-        addPyramid(out, viewProj, windowSize, eye, Vec3(b.position.x, 0.f, b.position.y), sf::Vector2f(b.size.x, b.size.y), 130.f, rockColor, lc);
+    // Shared rocky-mound mouth, now used by BOTH Mine and Gold Mine
+    // (2026-08-11 follow-up, "那个矿场不好看,我觉得没有那个金矿好看" --
+    // regular Mine doesn't look as good as Gold Mine): this used to be 2
+    // separate shapes -- Mine kept a single flat 4-sided pyramid (never
+    // flagged UNTIL now), Gold Mine got its own 3-peak cluster + framed
+    // sign a couple of rounds back. Since the user now wants Mine brought
+    // up to the same standard, this factors the cluster+entrance geometry
+    // out into one shared function parameterized by rock/sign color, and
+    // BOTH addMineProps and Gold Mine's own dispatch call it -- no more
+    // duplicated mound code, and any future mound fix (like the "matched
+    // the pyramid to the door" and "unburied the door" rounds already
+    // logged below) only needs to happen once.
+    void addRockyMound(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
+        const WorldBuilding& b, const LightingContext& lc, Vec3 billboardRight, const sf::Texture& glowTex,
+        sf::Color rockColor, sf::Color signColor) {
+        // Entrance dimensions computed up front (2026-08-11, "矿门不见了"
+        // -- the door disappeared, from Gold Mine's own earlier round):
+        // each peak's own south base is capped at the arch's BACK face
+        // (`b.size.y - archD`), so the mound stops exactly where the
+        // doorway begins -- flush with it, but standing clear in front
+        // instead of buried inside the mound's own opaque rock.
         float archW = b.size.x * 0.20f, archD = b.size.y * 0.22f, archHeight = 24.f;
+        float moundMaxDepth = b.size.y - archD;
+        auto peak = [&](float xOff, float widthFrac, float zNorthOff, float height, sf::Color col) {
+            addPyramid(out, viewProj, windowSize, eye, Vec3(b.position.x + xOff, 0.f, b.position.y + zNorthOff),
+                sf::Vector2f(b.size.x * widthFrac, moundMaxDepth - zNorthOff), height, col, lc);
+        };
+        peak(0.f, 0.9f, 0.f, 128.f, rockColor);                                    // main mass, full depth
+        peak(-8.f, 0.5f, moundMaxDepth * 0.10f, 88.f, shade3d(rockColor, -14));     // 2nd, shorter peak, west
+        peak(b.size.x * 0.58f, 0.4f, moundMaxDepth * 0.12f, 70.f, shade3d(rockColor, 10)); // 3rd, smaller peak, east
+
+        // ---- Entrance, forward of the mound cluster's own south face --
+        // dark arch with a real crossbeam over the 2 posts and a
+        // signboard mounted above it. ----
         Vec3 archPos(b.position.x + b.size.x * 0.5f - archW * 0.5f, 0.f, b.position.y + b.size.y - archD);
         addBox(out, viewProj, windowSize, eye, archPos, Vec3(archW, archHeight, archD), sf::Color(18, 18, 20), lc);
-        addBox(out, viewProj, windowSize, eye, archPos - Vec3(5.f, 0.f, 0.f), Vec3(5.f, archHeight + 6.f, archD), sf::Color(94, 62, 32), lc);
-        addBox(out, viewProj, windowSize, eye, archPos + Vec3(archW, 0.f, 0.f), Vec3(5.f, archHeight + 6.f, archD), sf::Color(94, 62, 32), lc);
+        sf::Color beamColor(94, 62, 32);
+        addBox(out, viewProj, windowSize, eye, archPos - Vec3(5.f, 0.f, 0.f), Vec3(5.f, archHeight + 6.f, archD), beamColor, lc);
+        addBox(out, viewProj, windowSize, eye, archPos + Vec3(archW, 0.f, 0.f), Vec3(5.f, archHeight + 6.f, archD), beamColor, lc);
+        addBox(out, viewProj, windowSize, eye, Vec3(archPos.x - 5.f, archHeight + 6.f, archPos.z), Vec3(archW + 10.f, 4.f, archD), shade3d(beamColor, -10), lc);
+
+        float signW = archW + 20.f, signH = 14.f;
+        Vec3 signPos(archPos.x + archW * 0.5f - signW * 0.5f, archHeight + 12.f, archPos.z + archD - 2.f);
+        addBandedBox(out, viewProj, windowSize, eye, signPos, Vec3(signW, signH, 3.f), signColor, lc, nullptr, 40.f, true);
+        addGlowBillboard(out, viewProj, windowSize, billboardRight, Vec3(archPos.x - 9.f, archHeight * 0.6f, archPos.z + archD * 0.5f), 12.f, glowTex, sf::Color(255, 200, 120, 150));
     }
 
-    void addGoldMineProps(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
+    // Mine's own mound -- now routes through the shared addRockyMound
+    // above instead of its own flat single pyramid (see that function's
+    // own header comment for why).
+    void addMineProps(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
+        const WorldBuilding& b, const LightingContext& lc, Vec3 billboardRight, const sf::Texture& glowTex, sf::Color rockColor) {
+        addRockyMound(out, viewProj, windowSize, eye, b, lc, billboardRight, glowTex, rockColor, shade3d(rockColor, -20));
+    }
+
+    // Gold Mine's own mound -- same addRockyMound, gold rock + a
+    // gold-toned sign instead of Mine's grey/stone tones.
+    void addGoldMineMound(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
         const WorldBuilding& b, const LightingContext& lc, Vec3 billboardRight, const sf::Texture& glowTex) {
-        addMineProps(out, viewProj, windowSize, eye, b, lc, sf::Color(150, 130, 80));
-        const sf::Vector2f sparkles[] = { { 0.28f, 0.55f }, { 0.68f, 0.45f } };
+        addRockyMound(out, viewProj, windowSize, eye, b, lc, billboardRight, glowTex, sf::Color(150, 130, 80), sf::Color(150, 120, 50));
+    }
+
+    // 2026-08-11 rework ("现在到金矿场" -- against the same style of
+    // reference image Orchard/Preserve's own rounds used, showing a full
+    // mine-cart operation): stays a raw-tier flat-plot archetype like
+    // Mine/Orchard/etc (the reference's own smelting cauldrons/jars belong
+    // to Goldsmith, Gold Mine's tier-2 processor sibling, a separate
+    // build, same "raw producer vs. its processor" split Orchard/Preserve
+    // just established) -- just the mound's own yard got richer instead
+    // of a new walled building. Everything new here sits SOUTH of the
+    // footprint's own edge (the mound itself, from addGoldMineMound above,
+    // covers the FULL lot -- there's no flat ground inside the footprint
+    // to put props on without them clipping into the sloped rock, so this
+    // reuses the same "props spill past the lot's south edge" convention
+    // Bakery/Orchard already established, anchored right at the entrance
+    // archway's own mouth).
+    void addGoldMineProps(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
+        const WorldBuilding& b, const LightingContext& lc, Vec3 billboardRight, const sf::Texture& glowTex, const sf::Texture& goldOreTex) {
+        addGoldMineMound(out, viewProj, windowSize, eye, b, lc, billboardRight, glowTex);
+
+        float southZ = b.position.y + b.size.y + 1.5f;
+        float midX = b.position.x + b.size.x * 0.5f;
+
+        // ---- Mine-cart rail track running out of the entrance, into the
+        // yard -- 2 parallel rails + cross-ties every 8 units, the same
+        // "posts every N units" spacing idea Pasture/Orchard's own fences
+        // use, just laid flat. ----
+        float railGap = 10.f, trackLen = 46.f;
+        sf::Color railColor(70, 66, 62), tieColor(90, 62, 34);
+        addBox(out, viewProj, windowSize, eye, Vec3(midX - railGap * 0.5f - 1.f, 0.f, southZ), Vec3(2.f, 1.5f, trackLen), railColor, lc);
+        addBox(out, viewProj, windowSize, eye, Vec3(midX + railGap * 0.5f - 1.f, 0.f, southZ), Vec3(2.f, 1.5f, trackLen), railColor, lc);
+        for (float t = 0.f; t <= trackLen; t += 8.f) {
+            addBox(out, viewProj, windowSize, eye, Vec3(midX - railGap * 0.5f - 4.f, 0.f, southZ + t), Vec3(railGap + 8.f, 1.f, 3.f), tieColor, lc);
+        }
+
+        // An ore cart sitting on the rails, loaded with gold nuggets
+        // (`goldOreTex`, the same "outlined circle + shine" fake-volume
+        // fruit this file already uses, just tinted gold).
+        sf::Color cartColor(90, 78, 70), wheelColor(40, 38, 36);
+        Vec3 cartPos(midX - 9.f, 0.f, southZ + trackLen - 22.f);
+        addBox(out, viewProj, windowSize, eye, cartPos, Vec3(18.f, 9.f, 14.f), cartColor, lc);
+        for (float wx : { 2.f, 13.f }) {
+            addBox(out, viewProj, windowSize, eye, cartPos + Vec3(wx, -3.f, -1.f), Vec3(3.f, 3.f, 3.f), wheelColor, lc);
+            addBox(out, viewProj, windowSize, eye, cartPos + Vec3(wx, -3.f, 12.f), Vec3(3.f, 3.f, 3.f), wheelColor, lc);
+        }
+        addBillboard(out, viewProj, windowSize, billboardRight, cartPos + Vec3(9.f, 9.f, 7.f), 20.f, 14.f, goldOreTex, sf::Color::White);
+
+        // A small ore pile, west of the track -- a few stacked rock chunks
+        // topped with visible nuggets.
+        sf::Color rockColor(120, 112, 100);
+        Vec3 pilePos(b.position.x + 8.f, 0.f, southZ + 6.f);
+        for (const auto& off : { sf::Vector2f(0.f, 0.f), sf::Vector2f(8.f, 3.f), sf::Vector2f(3.f, 7.f) }) {
+            addBox(out, viewProj, windowSize, eye, pilePos + Vec3(off.x, 0.f, off.y), Vec3(9.f, 7.f, 9.f), rockColor, lc);
+        }
+        addBillboard(out, viewProj, windowSize, billboardRight, pilePos + Vec3(6.f, 9.f, 5.f), 18.f, 12.f, goldOreTex, sf::Color::White);
+
+        // A wooden A-frame winch, east of the track, for hauling ore up
+        // out of the shaft.
+        sf::Color beamColor(94, 62, 32);
+        float winchX = b.position.x + b.size.x - 20.f, winchZ = southZ + 4.f;
+        for (float lean : { -1.f, 1.f }) {
+            addBox(out, viewProj, windowSize, eye, Vec3(winchX + lean * 7.f, 0.f, winchZ), Vec3(4.f, 30.f, 4.f), beamColor, lc);
+        }
+        addBox(out, viewProj, windowSize, eye, Vec3(winchX - 7.f, 27.f, winchZ), Vec3(14.f, 3.f, 4.f), shade3d(beamColor, -10), lc);
+        addGlowBillboard(out, viewProj, windowSize, billboardRight, Vec3(winchX, 16.f, winchZ + 2.f), 10.f, glowTex, sf::Color(255, 200, 120, 120));
+
+        const sf::Vector2f sparkles[] = { { 0.28f, 0.55f }, { 0.68f, 0.45f }, { 0.5f, 0.3f } };
         for (const auto& s : sparkles) {
             Vec3 p(b.position.x + b.size.x * s.x, 46.f, b.position.y + b.size.y * s.y);
             addGlowBillboard(out, viewProj, windowSize, billboardRight, p, 22.f, glowTex, sf::Color(255, 215, 90, 210));
@@ -1120,66 +1446,485 @@ namespace {
         addBox(out, viewProj, windowSize, eye, Vec3(shedX0, shedH, shedZ0), Vec3(shedW, 3.f, shedD), roofColor, lc);
     }
 
+    // v2 (2026-08-11, from the user's own sixteenth reference image -- a
+    // working sheep ranch: a walled barn, dense flock, a water trough with
+    // a pig and chicken nearby, hay bales, a wool-loaded wheelbarrow, a
+    // sheepdog, lanterns, picket fencing, and crop beds/gravestones that
+    // read as borrowed from the same reference-image family as Farm's own
+    // rather than sheep-ranch-specific). Scope-checked with the user first
+    // (via AskUserQuestion, same caution as Quarry/Farm's own rounds) --
+    // `sheep` (Sheep Farm, wool, tier 1) has a real tier-2 sibling
+    // (`textile`/Textile Mill, wool->cloth) the reference's own barn could
+    // have meant instead, same pairing shape as lumber/sawmill and
+    // quarry/mason. User confirmed: `sheep` itself, still no building --
+    // stays in the flat-plot family alongside Farm/Lumber/Quarry, just far
+    // richer than the original 3-sheep-and-a-rail placeholder.
     void addPastureProps(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
-        const WorldBuilding& b, const LightingContext& lc, Vec3 billboardRight, const sf::Texture& sheepTex, sf::Color dayNightTint) {
+        const WorldBuilding& b, const LightingContext& lc, Vec3 billboardRight, const sf::Texture& glowTex,
+        const sf::Texture& sheepTex, const sf::Texture& chickenTex, const sf::Texture& pigTex, const sf::Texture& dogTex,
+        sf::Color dayNightTint) {
+        sf::Color fenceColor(150, 118, 76);
+        sf::Color beamColor(58, 40, 26);
+        sf::Color troughColor(110, 108, 104);
+        sf::Color waterColor(120, 168, 196);
+        sf::Color hayColor(198, 168, 78);
+        sf::Color hayCapColor(220, 196, 108);
+        sf::Color cartColor(118, 86, 52);
+        sf::Color wheelColor(60, 44, 28);
+        sf::Color woolColor(240, 238, 230);
+
         addGroundQuad(out, viewProj, windowSize, eye, b.position.x, b.position.y, b.size.x, b.size.y, 0.6f, sf::Color(102, 140, 70), lc);
         addPlotBorder(out, viewProj, windowSize, eye, b.position, b.size, sf::Color(25, 20, 15), lc);
-        Vec3 railPos(b.position.x + 4.f, 0.f, b.position.y + b.size.y - 22.f);
-        addBox(out, viewProj, windowSize, eye, railPos, Vec3(b.size.x - 8.f, 6.f, 4.f), sf::Color(150, 118, 76), lc);
-        for (float x = b.position.x + 4.f; x < b.position.x + b.size.x - 2.f; x += 16.f) {
-            addBox(out, viewProj, windowSize, eye, Vec3(x, 0.f, b.position.y + b.size.y - 16.f), Vec3(4.f, 22.f, 4.f), sf::Color(150, 118, 76), lc);
+
+        // ---- Perimeter picket fence, all 4 sides, with a gate gap centered
+        // on the south (front/camera-facing) edge -- the original version
+        // only ever fenced the south edge; this reads as a genuinely
+        // enclosed pen like the reference, not a single rail. A local
+        // `fenceRun` lambda (posts every ~16 units + one connecting rail
+        // per straight run) mirrors the exact technique Inn's own picket
+        // fence already established. ----
+        auto fenceRun = [&](float x0, float z0, float x1, float z1) {
+            float dx = x1 - x0, dz = z1 - z0;
+            float len = std::sqrt(dx * dx + dz * dz);
+            if (len < 1e-3f) return;
+            int posts = std::max(2, static_cast<int>(len / 16.f) + 1);
+            for (int i = 0; i < posts; ++i) {
+                float t = static_cast<float>(i) / static_cast<float>(posts - 1);
+                addBox(out, viewProj, windowSize, eye, Vec3(x0 + dx * t, 0.f, z0 + dz * t), Vec3(3.f, 16.f, 3.f), fenceColor, lc);
+            }
+            if (std::fabs(dz) < 1e-3f) addBox(out, viewProj, windowSize, eye, Vec3(x0, 9.f, z0 - 1.5f), Vec3(dx, 3.f, 3.f), fenceColor, lc);
+            else addBox(out, viewProj, windowSize, eye, Vec3(x0 - 1.5f, 9.f, z0), Vec3(3.f, 3.f, dz), fenceColor, lc);
+        };
+        float fx0 = b.position.x + 4.f, fx1 = b.position.x + b.size.x - 4.f;
+        float fz0 = b.position.y + 4.f, fz1 = b.position.y + b.size.y - 4.f;
+        float gateW = 22.f, gateMid = b.position.x + b.size.x * 0.5f;
+        fenceRun(fx0, fz1, gateMid - gateW * 0.5f, fz1); // south, west half (up to the gate)
+        fenceRun(gateMid + gateW * 0.5f, fz1, fx1, fz1);  // south, east half
+        fenceRun(fx0, fz0, fx1, fz0);  // north
+        fenceRun(fx0, fz0, fx0, fz1);  // west
+        fenceRun(fx1, fz0, fx1, fz1);  // east
+
+        // Water trough (west side) -- same box+blue-cap trough Farm's own
+        // yard already established, with a pig and chicken nearby.
+        Vec3 troughPos(b.position.x + 8.f, 0.f, b.position.y + 30.f);
+        addBox(out, viewProj, windowSize, eye, troughPos, Vec3(22.f, 8.f, 10.f), troughColor, lc);
+        addBox(out, viewProj, windowSize, eye, troughPos + Vec3(2.f, 5.f, 2.f), Vec3(18.f, 2.5f, 6.f), waterColor, lc);
+        addBillboard(out, viewProj, windowSize, billboardRight, Vec3(b.position.x + 10.f, 0.f, b.position.y + 44.f), 22.f, 18.f, pigTex, dayNightTint);
+        addBillboard(out, viewProj, windowSize, billboardRight, Vec3(b.position.x + 26.f, 0.f, b.position.y + 42.f), 16.f, 16.f, chickenTex, dayNightTint);
+
+        // Hay bales (east side), 2x2 grid -- Farm's own bale-stack technique.
+        Vec3 hayBase(b.position.x + 80.f, 0.f, b.position.y + 10.f);
+        for (int i = 0; i < 2; ++i) {
+            for (int j = 0; j < 2; ++j) {
+                Vec3 hp = hayBase + Vec3(static_cast<float>(i) * 11.f, 0.f, static_cast<float>(j) * 11.f);
+                addBox(out, viewProj, windowSize, eye, hp, Vec3(9.f, 8.f, 9.f), hayColor, lc);
+                addBox(out, viewProj, windowSize, eye, hp + Vec3(1.f, 8.f, 1.f), Vec3(7.f, 1.5f, 7.f), hayCapColor, lc);
+            }
         }
-        const sf::Vector2f puffs[] = { { 0.30f, 0.35f }, { 0.55f, 0.50f }, { 0.72f, 0.30f } };
+
+        // Wool-loaded wheelbarrow, just inside the south gate -- same crude
+        // cart-body-plus-wheel convention every barrow/cart in this file
+        // already uses, topped with a few small rounded white "wool"
+        // clumps instead of the produce decal Farm's own cart used.
+        Vec3 cartPos(gateMid - 8.f, 0.f, b.position.y + b.size.y - 20.f);
+        addBox(out, viewProj, windowSize, eye, cartPos, Vec3(16.f, 8.f, 10.f), cartColor, lc);
+        addBox(out, viewProj, windowSize, eye, cartPos + Vec3(6.f, -4.f, 4.f), Vec3(4.f, 4.f, 4.f), wheelColor, lc);
+        for (const auto& wp : { sf::Vector2f(2.f, 2.f), sf::Vector2f(8.f, 3.f), sf::Vector2f(5.f, 6.f) }) {
+            addBox(out, viewProj, windowSize, eye, cartPos + Vec3(wp.x, 8.f, wp.y), Vec3(5.f, 4.f, 5.f), woolColor, lc);
+        }
+
+        // 2 lantern posts flanking the gate.
+        for (float lx : { -22.f, 22.f }) {
+            Vec3 lanternPos(gateMid + lx, 0.f, fz1 - 6.f);
+            addBox(out, viewProj, windowSize, eye, lanternPos, Vec3(3.f, 24.f, 3.f), beamColor, lc);
+            addGlowBillboard(out, viewProj, windowSize, billboardRight, lanternPos + Vec3(1.5f, 28.f, 1.5f), 16.f, glowTex, sf::Color(255, 200, 120, 160));
+        }
+
+        // The sheepdog, near the wheelbarrow (watching the flock).
+        addBillboard(out, viewProj, windowSize, billboardRight, Vec3(cartPos.x + 20.f, 0.f, cartPos.z + 4.f), 20.f, 16.f, dogTex, dayNightTint);
+
+        // A denser flock -- 7 sheep scattered across the interior, clear of
+        // the trough/hay/cart/dog footprints above.
+        const sf::Vector2f puffs[] = {
+            { 0.22f, 0.20f }, { 0.42f, 0.15f }, { 0.60f, 0.22f }, { 0.78f, 0.42f },
+            { 0.30f, 0.55f }, { 0.55f, 0.60f }, { 0.68f, 0.68f },
+        };
         for (const auto& pf : puffs) {
             Vec3 p(b.position.x + b.size.x * pf.x, 0.f, b.position.y + b.size.y * pf.y);
             addBillboard(out, viewProj, windowSize, billboardRight, p, 26.f, 22.f, sheepTex, dayNightTint);
         }
     }
 
+    // 2026-08-11 rework ("现在到果园的模型...只升级果树本身" -- keep
+    // Orchard a flat plot, just upgrade the trees themselves), against a
+    // reference image of a much fuller orchard homestead. Scoped down to
+    // 3 things instead of the reference's full shop+stalls+press scene
+    // (Orchard stays a raw-tier flat plot like Farm/Lumber/Quarry/Pasture
+    // -- the reference's own shop/stalls belong to Preserve, Orchard's
+    // tier-2 sibling, a separate build): (a) Apple and Pear as 2 distinct
+    // tree sprites instead of one shared red blob, each with a real
+    // layered canopy (shadow/highlight split, same "fake volume" trick
+    // veggieTex/cabbageTex above already use) and actual visible fruit
+    // dots rather than a single flat color, (b) a proper perimeter picket
+    // fence with a south gate gap -- Pasture's own `fenceRun` technique
+    // reused outright, since a raw-tier plot fenced only by a flat border
+    // line was the odd one out once Pasture had a real fence, and (c) 2
+    // fruit crates by the gate, the same "small yard prop" convention
+    // Bakery's flour sack / Pasture's hay bales already use.
     void addOrchardProps(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
-        const WorldBuilding& b, const LightingContext& lc, Vec3 billboardRight, const sf::Texture& fruitTreeTex, sf::Color dayNightTint) {
+        const WorldBuilding& b, const LightingContext& lc, Vec3 billboardRight,
+        const sf::Texture& appleTreeTex, const sf::Texture& pearTreeTex, const sf::Texture& fruitCrateTex, sf::Color dayNightTint) {
+        sf::Color fenceColor(150, 118, 76);
+        sf::Color crateColor(150, 108, 62);
+
         addGroundQuad(out, viewProj, windowSize, eye, b.position.x, b.position.y, b.size.x, b.size.y, 0.6f, sf::Color(90, 130, 66), lc);
         addPlotBorder(out, viewProj, windowSize, eye, b.position, b.size, sf::Color(25, 20, 15), lc);
+
+        // ---- Perimeter picket fence, all 4 sides, gate gap centered on
+        // the south edge -- verbatim copy of addPastureProps's own
+        // `fenceRun` lambda above. ----
+        auto fenceRun = [&](float x0, float z0, float x1, float z1) {
+            float dx = x1 - x0, dz = z1 - z0;
+            float len = std::sqrt(dx * dx + dz * dz);
+            if (len < 1e-3f) return;
+            int posts = std::max(2, static_cast<int>(len / 16.f) + 1);
+            for (int i = 0; i < posts; ++i) {
+                float t = static_cast<float>(i) / static_cast<float>(posts - 1);
+                addBox(out, viewProj, windowSize, eye, Vec3(x0 + dx * t, 0.f, z0 + dz * t), Vec3(3.f, 16.f, 3.f), fenceColor, lc);
+            }
+            if (std::fabs(dz) < 1e-3f) addBox(out, viewProj, windowSize, eye, Vec3(x0, 9.f, z0 - 1.5f), Vec3(dx, 3.f, 3.f), fenceColor, lc);
+            else addBox(out, viewProj, windowSize, eye, Vec3(x0 - 1.5f, 9.f, z0), Vec3(3.f, 3.f, dz), fenceColor, lc);
+        };
+        float fx0 = b.position.x + 4.f, fx1 = b.position.x + b.size.x - 4.f;
+        float fz0 = b.position.y + 4.f, fz1 = b.position.y + b.size.y - 4.f;
+        float gateW = 22.f, gateMid = b.position.x + b.size.x * 0.5f;
+        fenceRun(fx0, fz1, gateMid - gateW * 0.5f, fz1); // south, west half (up to the gate)
+        fenceRun(gateMid + gateW * 0.5f, fz1, fx1, fz1);  // south, east half
+        fenceRun(fx0, fz0, fx1, fz0);  // north
+        fenceRun(fx0, fz0, fx0, fz1);  // west
+        fenceRun(fx1, fz0, fx1, fz1);  // east
+
+        // ---- 2x3 grid of trees, alternating Apple/Pear by column for the
+        // "mixed orchard" read the reference image itself has -- same grid
+        // math as before, just 2 textures instead of 1. ----
         for (int row = 0; row < 2; ++row) {
             for (int col = 0; col < 3; ++col) {
                 Vec3 p(b.position.x + b.size.x * (0.2f + 0.3f * static_cast<float>(col)), 0.f,
                     b.position.y + b.size.y * (0.35f + 0.4f * static_cast<float>(row)));
-                addBillboard(out, viewProj, windowSize, billboardRight, p, 32.f, 42.f, fruitTreeTex, dayNightTint);
+                const sf::Texture& tex = (col % 2 == 0) ? appleTreeTex : pearTreeTex;
+                addBillboard(out, viewProj, windowSize, billboardRight, p, 36.f, 46.f, tex, dayNightTint);
             }
         }
-    }
 
-    void addHerbGardenProps(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
-        const WorldBuilding& b, const LightingContext& lc, Vec3 billboardRight, const sf::Texture& herbTuftTex, sf::Color dayNightTint) {
-        addGroundQuad(out, viewProj, windowSize, eye, b.position.x, b.position.y, b.size.x, b.size.y, 0.6f, sf::Color(74, 58, 40), lc);
-        addPlotBorder(out, viewProj, windowSize, eye, b.position, b.size, sf::Color(25, 20, 15), lc);
-        const sf::Vector2f offsets[] = {
-            { 0.15f, 0.25f }, { 0.35f, 0.55f }, { 0.55f, 0.30f }, { 0.75f, 0.60f },
-            { 0.25f, 0.75f }, { 0.65f, 0.20f }, { 0.85f, 0.40f }, { 0.45f, 0.80f },
-        };
-        for (const auto& off : offsets) {
-            Vec3 p(b.position.x + b.size.x * off.x, 0.f, b.position.y + b.size.y * off.y);
-            addBillboard(out, viewProj, windowSize, billboardRight, p, 20.f, 20.f, herbTuftTex, dayNightTint);
+        // ---- 2 fruit crates flanking the gate, just outside the fence
+        // (south of fz1, same "props spill past the lot's own edge into
+        // the shared yard" convention Bakery/Sawmill already use). ----
+        for (float cx : { -20.f, 14.f }) {
+            Vec3 cratePos(gateMid + cx, 0.f, fz1 + 6.f);
+            addBandedBox(out, viewProj, windowSize, eye, cratePos, Vec3(14.f, 10.f, 14.f), crateColor, lc, nullptr, 40.f, true);
+            addBillboard(out, viewProj, windowSize, billboardRight, cratePos + Vec3(7.f, 10.f, 7.f), 14.f, 10.f, fruitCrateTex, sf::Color::White);
         }
     }
 
+    // 2026-08-11 rework ("那个药草园可以细节一点吗" -- can the Herb Garden
+    // get more detail): the old version was 8 flat herbTuftTex billboards
+    // (all the same green, all the same size) floating directly on bare
+    // dirt with nothing marking the plot but the flat border line --
+    // barely different from an empty lot. Now: a real perimeter picket
+    // fence with a south gate gap (same `fenceRun` technique Pasture/
+    // Orchard already established), each herb spot gets its own small
+    // raised soil bed (instead of floating on flat ground) with 2
+    // billboards per bed for fuller foliage, cycling through 3 tint colors
+    // on the SAME `herbTuftTex` (green/lavender/gold -- the same multiply-
+    // tint reuse trick bottleRackTex's own comment describes) so the beds
+    // read as different herb varieties instead of one repeated tuft, and a
+    // watering can prop near the gate.
+    void addHerbGardenProps(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
+        const WorldBuilding& b, const LightingContext& lc, Vec3 billboardRight, const sf::Texture& herbTuftTex, sf::Color dayNightTint) {
+        sf::Color fenceColor(150, 118, 76);
+        sf::Color soilColor(90, 66, 44);
+
+        addGroundQuad(out, viewProj, windowSize, eye, b.position.x, b.position.y, b.size.x, b.size.y, 0.6f, sf::Color(74, 58, 40), lc);
+        addPlotBorder(out, viewProj, windowSize, eye, b.position, b.size, sf::Color(25, 20, 15), lc);
+
+        auto fenceRun = [&](float x0, float z0, float x1, float z1) {
+            float dx = x1 - x0, dz = z1 - z0;
+            float len = std::sqrt(dx * dx + dz * dz);
+            if (len < 1e-3f) return;
+            int posts = std::max(2, static_cast<int>(len / 16.f) + 1);
+            for (int i = 0; i < posts; ++i) {
+                float t = static_cast<float>(i) / static_cast<float>(posts - 1);
+                addBox(out, viewProj, windowSize, eye, Vec3(x0 + dx * t, 0.f, z0 + dz * t), Vec3(3.f, 16.f, 3.f), fenceColor, lc);
+            }
+            if (std::fabs(dz) < 1e-3f) addBox(out, viewProj, windowSize, eye, Vec3(x0, 9.f, z0 - 1.5f), Vec3(dx, 3.f, 3.f), fenceColor, lc);
+            else addBox(out, viewProj, windowSize, eye, Vec3(x0 - 1.5f, 9.f, z0), Vec3(3.f, 3.f, dz), fenceColor, lc);
+        };
+        float fx0 = b.position.x + 4.f, fx1 = b.position.x + b.size.x - 4.f;
+        float fz0 = b.position.y + 4.f, fz1 = b.position.y + b.size.y - 4.f;
+        float gateW = 20.f, gateMid = b.position.x + b.size.x * 0.5f;
+        fenceRun(fx0, fz1, gateMid - gateW * 0.5f, fz1);
+        fenceRun(gateMid + gateW * 0.5f, fz1, fx1, fz1);
+        fenceRun(fx0, fz0, fx1, fz0);
+        fenceRun(fx0, fz0, fx0, fz1);
+        fenceRun(fx1, fz0, fx1, fz1);
+
+        struct Bed { sf::Vector2f off; sf::Color tint; };
+        const Bed beds[] = {
+            { {0.15f, 0.25f}, sf::Color(110, 160, 80) },
+            { {0.35f, 0.55f}, sf::Color(150, 110, 190) },
+            { {0.55f, 0.30f}, sf::Color(210, 180, 70) },
+            { {0.75f, 0.60f}, sf::Color(110, 160, 80) },
+            { {0.25f, 0.75f}, sf::Color(150, 110, 190) },
+            { {0.65f, 0.20f}, sf::Color(210, 180, 70) },
+            { {0.85f, 0.40f}, sf::Color(110, 160, 80) },
+            { {0.45f, 0.80f}, sf::Color(150, 110, 190) },
+        };
+        for (const auto& bed : beds) {
+            Vec3 p(b.position.x + b.size.x * bed.off.x, 0.f, b.position.y + b.size.y * bed.off.y);
+            addBandedBox(out, viewProj, windowSize, eye, p - Vec3(9.f, 0.f, 9.f), Vec3(18.f, 3.f, 18.f), soilColor, lc, nullptr, 40.f, true);
+            addBillboard(out, viewProj, windowSize, billboardRight, p + Vec3(-4.f, 3.f, 0.f), 16.f, 16.f, herbTuftTex, bed.tint);
+            addBillboard(out, viewProj, windowSize, billboardRight, p + Vec3(4.f, 3.f, 3.f), 14.f, 14.f, herbTuftTex, shade3d(bed.tint, -10));
+        }
+
+        // A watering can, just inside the gate.
+        sf::Color canColor(96, 98, 102);
+        Vec3 canPos(gateMid - 4.f, 0.f, fz1 - 10.f);
+        addBox(out, viewProj, windowSize, eye, canPos, Vec3(8.f, 8.f, 8.f), canColor, lc);
+        addBox(out, viewProj, windowSize, eye, canPos + Vec3(6.f, 3.f, 2.f), Vec3(6.f, 2.f, 2.f), canColor, lc);
+    }
+
+    // 2026-08-11 rework ("那个葡萄有点少,可以做那种栏杆然后有葡萄挂下来
+    // 的样子吗" -- too few grapes, make it a railing with grapes hanging
+    // off it): the old version's own "trellis" was a single 4-wide, 24-
+    // tall solid post-wall per row (read as a thin fence, not a trellis)
+    // with just 3 tiny (10-unit) grape dots floating at its mid-height --
+    // easy to miss. Now each row gets real trellis structure -- 3 posts
+    // (2 ends + 1 middle) holding up a horizontal top rail, a leafy vine
+    // band hanging just under that rail, and 5 (was 3) bigger (14, was
+    // 10) grape clusters hanging below the leaves -- reads as an actual
+    // arbor with fruit hanging off it instead of a fence with sparse dots.
     void addVineyardProps(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
         const WorldBuilding& b, const LightingContext& lc, Vec3 billboardRight, const sf::Texture& grapeTex, sf::Color dayNightTint) {
         addGroundQuad(out, viewProj, windowSize, eye, b.position.x, b.position.y, b.size.x, b.size.y, 0.6f, sf::Color(107, 84, 48), lc);
         addPlotBorder(out, viewProj, windowSize, eye, b.position, b.size, sf::Color(25, 20, 15), lc);
         constexpr int rows = 4;
         float gap = b.size.x / static_cast<float>(rows);
+        sf::Color postColor(112, 86, 52), railColor(126, 96, 58), leafColor(76, 108, 58);
         for (int i = 0; i < rows; ++i) {
             float x = b.position.x + gap * static_cast<float>(i) + gap * 0.5f;
-            // A low trellis rail running the row's full depth -- the 2D
-            // version draws this as a thin top-down line the same length;
-            // in 3D that's a short, shallow box rather than a tall post.
-            addBox(out, viewProj, windowSize, eye, Vec3(x - 2.f, 0.f, b.position.y + 5.f), Vec3(4.f, 24.f, b.size.y - 10.f), sf::Color(120, 90, 55), lc);
-            for (int j = 0; j < 3; ++j) {
-                float z = b.position.y + 15.5f + static_cast<float>(j) * 16.f;
-                Vec3 p(x, 12.f, z);
-                addBillboard(out, viewProj, windowSize, billboardRight, p, 10.f, 10.f, grapeTex, dayNightTint);
+            float z0 = b.position.y + 5.f, z1 = b.position.y + b.size.y - 5.f;
+            float railH = 28.f;
+            for (float pz : { z0, (z0 + z1) * 0.5f - 2.f, z1 - 4.f }) {
+                addBox(out, viewProj, windowSize, eye, Vec3(x - 2.f, 0.f, pz), Vec3(4.f, railH, 4.f), postColor, lc);
             }
+            addBox(out, viewProj, windowSize, eye, Vec3(x - 2.f, railH, z0), Vec3(4.f, 3.f, z1 - z0), railColor, lc);
+            addBox(out, viewProj, windowSize, eye, Vec3(x - 3.f, railH - 9.f, z0), Vec3(6.f, 9.f, z1 - z0), leafColor, lc);
+            for (float t = 0.12f; t < 0.98f; t += 0.18f) {
+                Vec3 p(x, railH - 15.f, z0 + (z1 - z0) * t);
+                addBillboard(out, viewProj, windowSize, billboardRight, p, 14.f, 14.f, grapeTex, dayNightTint);
+            }
+        }
+    }
+
+    // ---- Zone 5 (Highlands District) Field-family batch, 2026-08-11
+    // ("剩下的屋子一样可以开始进行了" -- go ahead and start on the rest):
+    // the 5 remaining raw-tier businesses in isFieldId (GameWorld.cpp) --
+    // Dairy Farm/Beehive/Trapper/Tea Field/Flax Field. Until now these
+    // fell all the way through to the plain box+gable-roof fallback (no
+    // tier-1 dispatch entry existed for them at all, unlike Farm/Orchard/
+    // etc) -- the worst offenders of the "still generic" list, since a
+    // raw-tier business rendering as a walled building was exactly the
+    // inconsistency Bakery's own very first round was created to avoid
+    // for tier-2s. All 5 are flat-plot archetypes (ground fill + border +
+    // `addPerimeterFence` + themed props), same family as every other
+    // tier-1 producer. ----
+
+    // Dairy Farm -- fenced pasture, a water trough, hay, and grazing cows
+    // (`cowTex`) -- same overall shape Pasture's own sheep pen uses, cows
+    // instead of sheep/chickens/pigs since a dairy farm's only output is
+    // milk.
+    void addDairyFarmProps(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
+        const WorldBuilding& b, const LightingContext& lc, Vec3 billboardRight, const sf::Texture& cowTex, sf::Color dayNightTint) {
+        addGroundQuad(out, viewProj, windowSize, eye, b.position.x, b.position.y, b.size.x, b.size.y, 0.6f, sf::Color(102, 140, 70), lc);
+        addPlotBorder(out, viewProj, windowSize, eye, b.position, b.size, sf::Color(25, 20, 15), lc);
+        addPerimeterFence(out, viewProj, windowSize, eye, b, lc, sf::Color(150, 118, 76));
+
+        sf::Color troughColor(110, 108, 104), waterColor(120, 168, 196);
+        Vec3 troughPos(b.position.x + 8.f, 0.f, b.position.y + 12.f);
+        addBox(out, viewProj, windowSize, eye, troughPos, Vec3(22.f, 8.f, 10.f), troughColor, lc);
+        addBox(out, viewProj, windowSize, eye, troughPos + Vec3(2.f, 5.f, 2.f), Vec3(18.f, 2.5f, 6.f), waterColor, lc);
+
+        sf::Color hayColor(198, 168, 78), hayCapColor(220, 196, 108);
+        Vec3 hayBase(b.position.x + b.size.x - 26.f, 0.f, b.position.y + 10.f);
+        addBox(out, viewProj, windowSize, eye, hayBase, Vec3(9.f, 8.f, 9.f), hayColor, lc);
+        addBox(out, viewProj, windowSize, eye, hayBase + Vec3(1.f, 8.f, 1.f), Vec3(7.f, 1.5f, 7.f), hayCapColor, lc);
+
+        const sf::Vector2f cows[] = { { 0.25f, 0.55f }, { 0.55f, 0.42f }, { 0.72f, 0.68f } };
+        for (const auto& c : cows) {
+            Vec3 p(b.position.x + b.size.x * c.x, 0.f, b.position.y + b.size.y * c.y);
+            addBillboard(out, viewProj, windowSize, billboardRight, p, 26.f, 22.f, cowTex, dayNightTint);
+        }
+    }
+
+    // Beehive -- a small cluster of striped wooden hive boxes in a fenced
+    // clearing, with a couple of wildflower patches and a "bee sparkle"
+    // glow drifting above each hive (the same glow-billboard trick this
+    // file already uses for fireflies/sparkles elsewhere).
+    //
+    // 2026-08-11 follow-up ("蜂箱上面为什么有草方块" -- why is there a
+    // grass block on top of the hive): found it -- the 3 stacked bands
+    // were built with `addBandedBox`, which by its own header comment
+    // NEVER draws a top face ("every call site that needs one already has
+    // a roof... going on top of it") -- meant for building walls with a
+    // real roof over them, not a free-standing stack. With no roof placed
+    // over the topmost band and no top face of its own, looking down into
+    // the hive showed straight through to the ground plane behind it --
+    // exactly the "grass square" reported. Switched every band to plain
+    // `addBox` (which does include a top face) and added a real peaked
+    // roof cap + a dark entrance slit on the front band, so there's
+    // nothing left un-capped.
+    void addBeehiveProps(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
+        const WorldBuilding& b, const LightingContext& lc, Vec3 billboardRight, const sf::Texture& glowTex, const sf::Texture& flowerTex) {
+        addGroundQuad(out, viewProj, windowSize, eye, b.position.x, b.position.y, b.size.x, b.size.y, 0.6f, sf::Color(102, 140, 70), lc);
+        addPlotBorder(out, viewProj, windowSize, eye, b.position, b.size, sf::Color(25, 20, 15), lc);
+        addPerimeterFence(out, viewProj, windowSize, eye, b, lc, sf::Color(150, 118, 76));
+
+        const sf::Vector2f hives[] = { { 0.30f, 0.45f }, { 0.45f, 0.55f }, { 0.62f, 0.40f } };
+        for (const auto& h : hives) {
+            Vec3 p(b.position.x + b.size.x * h.x, 0.f, b.position.y + b.size.y * h.y);
+            for (int i = 0; i < 3; ++i) {
+                sf::Color band = (i % 2 == 0) ? sf::Color(230, 180, 90) : sf::Color(200, 148, 68);
+                addBox(out, viewProj, windowSize, eye, p + Vec3(0.f, static_cast<float>(i) * 5.5f, 0.f), Vec3(12.f, 5.5f, 12.f), band, lc);
+            }
+            // A shallow peaked roof cap, wider than the boxes below it.
+            addBox(out, viewProj, windowSize, eye, p + Vec3(-1.5f, 16.5f, -1.5f), Vec3(15.f, 3.f, 15.f), sf::Color(96, 62, 40), lc);
+            addBox(out, viewProj, windowSize, eye, p + Vec3(-0.5f, 19.5f, -0.5f), Vec3(13.f, 2.f, 13.f), sf::Color(120, 78, 50), lc);
+            // A dark entrance slit on the bottom band's own south face.
+            addBox(out, viewProj, windowSize, eye, p + Vec3(3.5f, 1.5f, 12.f), Vec3(5.f, 2.f, 0.6f), sf::Color(40, 32, 24), lc);
+            addGlowBillboard(out, viewProj, windowSize, billboardRight, p + Vec3(6.f, 24.f, 6.f), 16.f, glowTex, sf::Color(255, 220, 110, 150));
+        }
+
+        for (const auto& fp : { sf::Vector2f(0.18f, 0.72f), sf::Vector2f(0.80f, 0.68f) }) {
+            Vec3 p(b.position.x + b.size.x * fp.x, 0.f, b.position.y + b.size.y * fp.y);
+            addBillboard(out, viewProj, windowSize, billboardRight, p, 16.f, 14.f, flowerTex, sf::Color::White);
+        }
+    }
+
+    // Trapper -- a rustic camp instead of a farmed plot: a hide-drying
+    // rack hung with pelts (`peltTex`), a couple of ground traps, and a
+    // small campfire -- no fence, a trapper's camp doesn't pen anything in.
+    //
+    // 2026-08-11 follow-up ("猎人小屋我觉得这个不好看,可能在旁边加个营地
+    // 之类的" -- doesn't look good, maybe add a camp beside it): the rack
+    // + 2 traps + fire read as sparse props scattered on bare ground, not
+    // an actual lived-in camp. Added a real canvas tent (reusing
+    // `addGableRoof` at ground level -- wallY near 0 with no walls under
+    // it is exactly a low A-frame tent shape, no new geometry needed), a
+    // bedroll beside it, and a cooking pot on a tripod over the fire.
+    void addTrapperProps(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
+        const WorldBuilding& b, const LightingContext& lc, Vec3 billboardRight, const sf::Texture& glowTex, const sf::Texture& peltTex) {
+        addGroundQuad(out, viewProj, windowSize, eye, b.position.x, b.position.y, b.size.x, b.size.y, 0.6f, sf::Color(96, 128, 66), lc);
+        addPlotBorder(out, viewProj, windowSize, eye, b.position, b.size, sf::Color(25, 20, 15), lc);
+
+        sf::Color postColor(90, 62, 34);
+        float rackX = b.position.x + b.size.x * 0.35f, rackZ0 = b.position.y + b.size.y * 0.3f, rackZ1 = b.position.y + b.size.y * 0.7f;
+        addBox(out, viewProj, windowSize, eye, Vec3(rackX - 2.f, 0.f, rackZ0), Vec3(4.f, 26.f, 4.f), postColor, lc);
+        addBox(out, viewProj, windowSize, eye, Vec3(rackX - 2.f, 0.f, rackZ1 - 4.f), Vec3(4.f, 26.f, 4.f), postColor, lc);
+        addBox(out, viewProj, windowSize, eye, Vec3(rackX - 2.f, 24.f, rackZ0), Vec3(4.f, 3.f, rackZ1 - rackZ0), postColor, lc);
+        for (float t : { 0.2f, 0.5f, 0.8f }) {
+            Vec3 p(rackX, 14.f, rackZ0 + (rackZ1 - rackZ0) * t);
+            addBillboard(out, viewProj, windowSize, billboardRight, p, 12.f, 18.f, peltTex, sf::Color::White);
+        }
+
+        sf::Color trapColor(70, 72, 76);
+        for (const auto& tp : { sf::Vector2f(0.65f, 0.35f), sf::Vector2f(0.78f, 0.55f) }) {
+            Vec3 p(b.position.x + b.size.x * tp.x, 0.f, b.position.y + b.size.y * tp.y);
+            addBox(out, viewProj, windowSize, eye, p, Vec3(8.f, 1.5f, 8.f), trapColor, lc);
+        }
+
+        Vec3 firePos(b.position.x + b.size.x * 0.25f, 0.f, b.position.y + b.size.y * 0.75f);
+        sf::Color logColor(90, 60, 34);
+        for (float rot : { 0.f, 1.f }) {
+            addBox(out, viewProj, windowSize, eye, firePos + Vec3(rot * -6.f, 0.f, rot * 4.f), Vec3(12.f, 3.f, 3.f), logColor, lc);
+        }
+        addGlowBillboard(out, viewProj, windowSize, billboardRight, firePos + Vec3(2.f, 4.f, 2.f), 16.f, glowTex, sf::Color(255, 140, 60, 200));
+
+        // A cooking pot on a 3-leg tripod straddling the fire.
+        sf::Color tripodColor(60, 44, 30), potColor(58, 56, 58);
+        Vec3 potCenter = firePos + Vec3(2.f, 0.f, 2.f);
+        for (const auto& lean : { sf::Vector2f(-6.f, -3.f), sf::Vector2f(6.f, -3.f), sf::Vector2f(0.f, 6.f) }) {
+            addBox(out, viewProj, windowSize, eye, potCenter + Vec3(lean.x, 0.f, lean.y), Vec3(2.f, 18.f, 2.f), tripodColor, lc);
+        }
+        addBox(out, viewProj, windowSize, eye, potCenter + Vec3(-4.f, 12.f, -4.f), Vec3(8.f, 6.f, 8.f), potColor, lc);
+
+        // A canvas A-frame tent (`addGableRoof` at ground level -- no
+        // walls under it, just the 2 roof slopes + gable ends, reads as a
+        // low tent) plus a bedroll beside it.
+        sf::Color tentColor(178, 148, 100);
+        Vec3 tentPos(b.position.x + b.size.x * 0.62f, 0.f, b.position.y + b.size.y * 0.12f);
+        addGableRoof(out, viewProj, windowSize, eye, tentPos, Vec3(22.f, 0.f, 18.f), 2.f, 15.f, tentColor, lc);
+
+        sf::Color bedrollColor(120, 60, 60);
+        Vec3 bedrollPos(tentPos.x - 14.f, 0.f, tentPos.z + 3.f);
+        addBox(out, viewProj, windowSize, eye, bedrollPos, Vec3(9.f, 2.5f, 18.f), bedrollColor, lc);
+        addBox(out, viewProj, windowSize, eye, bedrollPos + Vec3(0.f, 2.5f, 0.f), Vec3(9.f, 1.5f, 4.f), shade3d(bedrollColor, -20), lc);
+    }
+
+    // Tea Field -- dense rows of tea bushes (`teaBushTex`) instead of the
+    // flat single-color crop fill every other raw field uses, plus a
+    // woven picking basket.
+    void addTeaFieldProps(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
+        const WorldBuilding& b, const LightingContext& lc, Vec3 billboardRight, const sf::Texture& teaBushTex, sf::Color dayNightTint) {
+        addGroundQuad(out, viewProj, windowSize, eye, b.position.x, b.position.y, b.size.x, b.size.y, 0.6f, sf::Color(90, 130, 66), lc);
+        addPlotBorder(out, viewProj, windowSize, eye, b.position, b.size, sf::Color(25, 20, 15), lc);
+
+        for (int row = 0; row < 3; ++row) {
+            for (int col = 0; col < 4; ++col) {
+                Vec3 p(b.position.x + b.size.x * (0.14f + 0.24f * static_cast<float>(col)), 0.f,
+                    b.position.y + b.size.y * (0.22f + 0.28f * static_cast<float>(row)));
+                addBillboard(out, viewProj, windowSize, billboardRight, p, 20.f, 16.f, teaBushTex, dayNightTint);
+            }
+        }
+
+        sf::Color basketColor(150, 108, 62);
+        Vec3 basketPos(b.position.x + b.size.x * 0.5f - 7.f, 0.f, b.position.y + b.size.y - 14.f);
+        addBandedBox(out, viewProj, windowSize, eye, basketPos, Vec3(14.f, 10.f, 14.f), basketColor, lc, nullptr, 40.f, true);
+    }
+
+    // Flax Field -- 2026-08-11 detail pass ("亚麻田可以再细节一点吗" --
+    // can Flax Field get more detail): the old version was 20 flat
+    // `flaxFlowerTex` billboards (a lying-flat stem rectangle + 3 dots)
+    // floating directly on bare dirt, plus one lone sheaf -- no actual
+    // stalk geometry, same "flat billboard on flat ground" gap Vineyard's
+    // own trellis round already fixed for grapes. Now each spot gets a
+    // real raised stem (a thin green box, real height instead of a flat
+    // sprite) with the flower billboard sitting on top of it, a perimeter
+    // fence (`addPerimeterFence`, same as Herb Garden), and 2 tied sheaves
+    // (with a visible binding band) instead of 1 untied stack.
+    void addFlaxFieldProps(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
+        const WorldBuilding& b, const LightingContext& lc, Vec3 billboardRight, const sf::Texture& flaxFlowerTex, sf::Color dayNightTint) {
+        addGroundQuad(out, viewProj, windowSize, eye, b.position.x, b.position.y, b.size.x, b.size.y, 0.6f, sf::Color(108, 132, 78), lc);
+        addPlotBorder(out, viewProj, windowSize, eye, b.position, b.size, sf::Color(25, 20, 15), lc);
+        addPerimeterFence(out, viewProj, windowSize, eye, b, lc, sf::Color(150, 118, 76));
+
+        sf::Color stemColor(96, 132, 80);
+        for (int row = 0; row < 4; ++row) {
+            for (int col = 0; col < 5; ++col) {
+                Vec3 p(b.position.x + b.size.x * (0.10f + 0.20f * static_cast<float>(col)), 0.f,
+                    b.position.y + b.size.y * (0.16f + 0.22f * static_cast<float>(row)));
+                float stemH = 10.f + (((row + col) % 2 == 0) ? 2.f : 0.f); // slight height variance -- a perfectly even field reads as artificial
+                addBox(out, viewProj, windowSize, eye, p - Vec3(1.f, 0.f, 1.f), Vec3(2.f, stemH, 2.f), stemColor, lc);
+                addBillboard(out, viewProj, windowSize, billboardRight, p + Vec3(0.f, stemH, 0.f), 14.f, 12.f, flaxFlowerTex, dayNightTint);
+            }
+        }
+
+        // 2 tied sheaves (was 1, untied) near the south edge.
+        sf::Color sheafColor(198, 182, 96), bandColor(120, 70, 40);
+        for (float sx : { -8.f, 10.f }) {
+            Vec3 sheafPos(b.position.x + b.size.x * 0.5f + sx, 0.f, b.position.y + b.size.y - 14.f);
+            addBox(out, viewProj, windowSize, eye, sheafPos, Vec3(8.f, 16.f, 8.f), sheafColor, lc);
+            addBox(out, viewProj, windowSize, eye, sheafPos + Vec3(-1.f, 15.f, -1.f), Vec3(10.f, 3.f, 10.f), shade3d(sheafColor, -20), lc);
+            addBox(out, viewProj, windowSize, eye, sheafPos + Vec3(-1.f, 5.f, -1.f), Vec3(10.f, 2.5f, 10.f), bandColor, lc);
         }
     }
 
@@ -1387,7 +2132,7 @@ namespace {
         Vec3 signPos(mainPos.x + mainW * 0.5f - signW * 0.5f, foundationH + groundWallH - 2.f, mainPos.z + b.size.y + 5.f);
         addBox(out, viewProj, windowSize, eye, Vec3(signPos.x, signPos.y + signH, upperSouthZ - 1.f), Vec3(2.5f, 8.f, 2.5f), beamColor, lc);
         addBox(out, viewProj, windowSize, eye, Vec3(signPos.x + signW - 2.5f, signPos.y + signH, upperSouthZ - 1.f), Vec3(2.5f, 8.f, 2.5f), beamColor, lc);
-        addBandedBox(out, viewProj, windowSize, eye, signPos, Vec3(signW, signH, 3.f), signColor, lc);
+        addBandedBox(out, viewProj, windowSize, eye, signPos, Vec3(signW, signH, 3.f), signColor, lc, nullptr, 40.f, true);
 
         // Side-wall accents (east/west corner posts) -- whichever face the
         // camera can actually see depends on the player's position (see
@@ -1591,7 +2336,7 @@ namespace {
         Vec3 signPos(basePos.x + b.size.x * 0.5f - signW * 0.5f, groundH + trimH + upperH * 0.7f, southZ - 1.f);
         addBox(out, viewProj, windowSize, eye, Vec3(signPos.x, signPos.y + signH + 4.f, signPos.z - 1.f), Vec3(2.5f, 8.f, 2.5f), beamColor, lc);
         addBox(out, viewProj, windowSize, eye, Vec3(signPos.x + signW - 2.5f, signPos.y + signH + 4.f, signPos.z - 1.f), Vec3(2.5f, 8.f, 2.5f), beamColor, lc);
-        addBandedBox(out, viewProj, windowSize, eye, signPos, Vec3(signW, signH, 3.f), signColor, lc);
+        addBandedBox(out, viewProj, windowSize, eye, signPos, Vec3(signW, signH, 3.f), signColor, lc, nullptr, 40.f, true);
 
         float eastX = basePos.x + b.size.x + 1.5f;
         float sideSignW = b.size.y * 0.34f, sideSignZ0 = basePos.z + b.size.y * 0.12f;
@@ -1809,7 +2554,7 @@ namespace {
         Vec3 signPos(mainPos.x + mainW * 0.5f - signW * 0.5f, groundH - 2.f, mainPos.z + b.size.y + 5.f);
         addBox(out, viewProj, windowSize, eye, Vec3(signPos.x, signPos.y + signH + 4.f, signPos.z - 1.f), Vec3(2.5f, 8.f, 2.5f), beamColor, lc);
         addBox(out, viewProj, windowSize, eye, Vec3(signPos.x + signW - 2.5f, signPos.y + signH + 4.f, signPos.z - 1.f), Vec3(2.5f, 8.f, 2.5f), beamColor, lc);
-        addBandedBox(out, viewProj, windowSize, eye, signPos, Vec3(signW, signH, 3.f), signColor, lc);
+        addBandedBox(out, viewProj, windowSize, eye, signPos, Vec3(signW, signH, 3.f), signColor, lc, nullptr, 40.f, true);
 
         // ---- Chimney ----
         //
@@ -1984,7 +2729,7 @@ namespace {
         Vec3 signPos(basePos.x + b.size.x * 0.5f - signW * 0.5f, upperBase - 2.f, southZ + 4.f);
         addBox(out, viewProj, windowSize, eye, Vec3(signPos.x, signPos.y + signH + 4.f, southZ - 1.f), Vec3(2.5f, 8.f, 2.5f), beamColor, lc);
         addBox(out, viewProj, windowSize, eye, Vec3(signPos.x + signW - 2.5f, signPos.y + signH + 4.f, southZ - 1.f), Vec3(2.5f, 8.f, 2.5f), beamColor, lc);
-        addBandedBox(out, viewProj, windowSize, eye, signPos, Vec3(signW, signH, 3.f), signColor, lc);
+        addBandedBox(out, viewProj, windowSize, eye, signPos, Vec3(signW, signH, 3.f), signColor, lc, nullptr, 40.f, true);
 
         // ---- 2 chimneys, each with a cap lip and a soft smoke puff.
         //
@@ -2449,7 +3194,7 @@ namespace {
             // v2 made for its own open check-in desk.
             float counterZ0 = zFront + counterGap;
             Vec3 counterPos(x0 + stallW * 0.08f, 0.f, counterZ0);
-            addBandedBox(out, viewProj, windowSize, eye, counterPos, Vec3(stallW * 0.84f, 18.f, counterDepth), counterColor, lc);
+            addBandedBox(out, viewProj, windowSize, eye, counterPos, Vec3(stallW * 0.84f, 18.f, counterDepth), counterColor, lc, nullptr, 40.f, true);
 
             // Produce crate decal on the counter -- a wood crate with a few
             // round fruits/vegetables poking over the rim, the market's own
@@ -2690,7 +3435,7 @@ namespace {
             float fx = b.position.x + b.size.x * (0.06f + 0.88f * static_cast<float>(i) / static_cast<float>(kBoxes - 1));
             if (fx > porchX0 - 16.f && fx < porchX0 + porchW + 16.f) continue;
             Vec3 boxPos(fx, 0.f, southZ + 2.f);
-            addBandedBox(out, viewProj, windowSize, eye, boxPos, Vec3(14.f, 10.f, 10.f), sf::Color(96, 68, 40), lc);
+            addBandedBox(out, viewProj, windowSize, eye, boxPos, Vec3(14.f, 10.f, 10.f), sf::Color(96, 68, 40), lc, nullptr, 40.f, true);
             addBillboard(out, viewProj, windowSize, billboardRight, Vec3(fx + 7.f, 10.f, southZ + 7.f), 18.f, 18.f, flowerTex, sf::Color::White);
         }
     }
@@ -2794,7 +3539,7 @@ namespace {
 
         float signW = b.size.x * 0.55f, signH = upperH * 0.35f;
         Vec3 signPos(basePos.x + b.size.x * 0.5f - signW * 0.5f, groundH + trimH + upperH * 0.12f, southZ - 1.f);
-        addBandedBox(out, viewProj, windowSize, eye, signPos, Vec3(signW, signH, 3.f), signColor, lc);
+        addBandedBox(out, viewProj, windowSize, eye, signPos, Vec3(signW, signH, 3.f), signColor, lc, nullptr, 40.f, true);
 
         // ---- 2 ground-floor cart-sized doors: left CLOSED (plank door +
         // iron straps), right OPEN (a dark recessed opening) -- the
@@ -2827,8 +3572,8 @@ namespace {
         // 4 separate spots with no clear read as one thing, 2026-08-07
         // detail pass, "左边很大不懂什么东西...拿这个仓库先做优化看看"). ----
         Vec3 crateBase(leftX0 - 40.f, 0.f, southZ + 4.f); // far enough west to clear the south-west corner quoins below, with margin
-        addBandedBox(out, viewProj, windowSize, eye, crateBase, Vec3(14.f, 14.f, 12.f), crateColor, lc);
-        addBandedBox(out, viewProj, windowSize, eye, crateBase + Vec3(1.f, 14.f, 1.f), Vec3(12.f, 12.f, 10.f), crateColor, lc);
+        addBandedBox(out, viewProj, windowSize, eye, crateBase, Vec3(14.f, 14.f, 12.f), crateColor, lc, nullptr, 40.f, true);
+        addBandedBox(out, viewProj, windowSize, eye, crateBase + Vec3(1.f, 14.f, 1.f), Vec3(12.f, 12.f, 10.f), crateColor, lc, nullptr, 40.f, true);
         addBox(out, viewProj, windowSize, eye, crateBase + Vec3(15.f, 0.f, 1.f), Vec3(11.f, 15.f, 10.f), sackColor, lc); // sack leaning against the stack's east side
         Vec3 barrelPos = crateBase + Vec3(-2.f, 0.f, -10.f);
         addBox(out, viewProj, windowSize, eye, barrelPos, Vec3(14.f, 22.f, 14.f), barrelColor, lc);
@@ -3184,7 +3929,7 @@ namespace {
             addGlowBillboard(out, viewProj, windowSize, billboardRight, Vec3(winPos.x + winSize * 0.5f, winY + winSize * 0.5f, upperSouthZ), winSize * 1.5f, glowTex, sf::Color(255, 214, 140, 140));
 
             Vec3 boxPos(winPos.x - 2.f, winY - 8.f, upperSouthZ - 3.f);
-            addBandedBox(out, viewProj, windowSize, eye, boxPos, Vec3(winSize + 4.f, 6.f, 6.f), plantBoxColor, lc);
+            addBandedBox(out, viewProj, windowSize, eye, boxPos, Vec3(winSize + 4.f, 6.f, 6.f), plantBoxColor, lc, nullptr, 40.f, true);
             addBillboard(out, viewProj, windowSize, billboardRight, Vec3(boxPos.x + (winSize + 4.f) * 0.5f, winY - 2.f, upperSouthZ), winSize * 0.9f, 14.f, flowerTex, sf::Color::White);
 
             // Flanking shutters (2026-08-07 detail pass) -- Staff Office's
@@ -3201,7 +3946,7 @@ namespace {
         // floating name label already covers that. ----
         float signW = b.size.x * 0.7f, signH = upperH * 0.42f;
         Vec3 signPos(basePos.x + b.size.x * 0.5f - signW * 0.5f, groundH + trimH + upperH * 0.3f, upperSouthZ - 1.f);
-        addBandedBox(out, viewProj, windowSize, eye, signPos, Vec3(signW, signH, 3.f), signColor, lc);
+        addBandedBox(out, viewProj, windowSize, eye, signPos, Vec3(signW, signH, 3.f), signColor, lc, nullptr, 40.f, true);
 
         // ---- A row of hanging lanterns along the jetty eave -- the
         // reference's own well-lit shopfront. ----
@@ -3228,7 +3973,7 @@ namespace {
         addBox(out, viewProj, windowSize, eye, barrelPos + Vec3(-0.8f, 9.f, -0.8f), Vec3(15.6f, 4.f, 15.6f), sf::Color(70, 46, 26), lc);
 
         Vec3 cratePos(basePos.x + b.size.x * 0.5f - 8.f, 0.f, southZ + 12.f);
-        addBandedBox(out, viewProj, windowSize, eye, cratePos, Vec3(16.f, 14.f, 14.f), sf::Color(120, 86, 50), lc);
+        addBandedBox(out, viewProj, windowSize, eye, cratePos, Vec3(16.f, 14.f, 14.f), sf::Color(120, 86, 50), lc, nullptr, 40.f, true);
         addBillboard(out, viewProj, windowSize, billboardRight, cratePos + Vec3(8.f, 14.f, 7.f), 20.f, 18.f, goodsTex, sf::Color::White);
 
         // Pottery jar -- a narrow-necked box on a wider base box, the crude
@@ -3301,13 +4046,13 @@ namespace {
         addFacadeBeam(out, viewProj, windowSize, eye, southZ, sf::Vector2f(winPos.x + winSize * 0.5f, winPos.y), sf::Vector2f(winPos.x + winSize * 0.5f, winPos.y + winSize), 2.f, beamColor, lc);
         addGlowBillboard(out, viewProj, windowSize, billboardRight, Vec3(winPos.x + winSize * 0.5f, winPos.y + winSize * 0.5f, southZ), winSize * 1.5f, glowTex, sf::Color(255, 214, 140, 130));
         Vec3 boxPos(winPos.x - 2.f, winPos.y - 8.f, southZ - 3.f);
-        addBandedBox(out, viewProj, windowSize, eye, boxPos, Vec3(winSize + 4.f, 6.f, 6.f), plantBoxColor, lc);
+        addBandedBox(out, viewProj, windowSize, eye, boxPos, Vec3(winSize + 4.f, 6.f, 6.f), plantBoxColor, lc, nullptr, 40.f, true);
         addBillboard(out, viewProj, windowSize, billboardRight, Vec3(boxPos.x + (winSize + 4.f) * 0.5f, winPos.y - 2.f, southZ), winSize * 0.9f, 14.f, flowerTex, sf::Color::White);
 
         // Sign, flush on the gable end above the eave.
         float signW = enclosedW * 0.6f, signH = 16.f;
         Vec3 signPos(basePos.x + enclosedW * 0.5f - signW * 0.5f, wallTop + roofRise * 0.35f, southZ - 2.f);
-        addBandedBox(out, viewProj, windowSize, eye, signPos, Vec3(signW, signH, 3.f), signColor, lc);
+        addBandedBox(out, viewProj, windowSize, eye, signPos, Vec3(signW, signH, 3.f), signColor, lc, nullptr, 40.f, true);
 
         // ---- Open saw bay (east 38%): 2 stone piers, a recessed back wall
         // with the blade decal mounted on it, a log resting on a support in
@@ -3600,7 +4345,7 @@ namespace {
         // Sign on the gable end.
         float signW = b.size.x * 0.5f, signH = 16.f;
         Vec3 signPos(basePos.x + b.size.x * 0.5f - signW * 0.5f, wallTop + roofRise * 0.3f, southZ - 1.f);
-        addBandedBox(out, viewProj, windowSize, eye, signPos, Vec3(signW, signH, 3.f), signColor, lc);
+        addBandedBox(out, viewProj, windowSize, eye, signPos, Vec3(signW, signH, 3.f), signColor, lc, nullptr, 40.f, true);
 
         // Big stone chimney, east side, plus a soft smoke puff -- reuses
         // every other hero building's own chimney+glow-smoke trick.
@@ -3689,70 +4434,24 @@ namespace {
             addBox(out, viewProj, windowSize, eye, colPos + Vec3(-1.5f, 34.f, -1.5f), Vec3(11.f, 3.f, 11.f), shade3d(columnColor, -10), lc);
         }
 
-        // ---- A few more stone elements (2026-08-10 follow-up, "有石像了,
-        // 可以的话在那个院子可以做多几个石头的元素吗" -- now that there's a
-        // statue, add a few more stone pieces to the yard). An obelisk, a
-        // stone urn on a pedestal, and 2 small stacked-stone cairns -- each
-        // placed in a gap the existing dense layout had left clear (checked
-        // by hand against every neighboring prop, same discipline as every
-        // layout round in this file), not a blanket re-density pass. ----
-        {
-            // Obelisk -- a tall banded shaft capped with a small pyramid
-            // tip, reusing `addPyramid` (the same primitive Mine/Gold
-            // Mine's rock mound and Town Hall's clock-tower spire already
-            // use), east side between the tombstones and the columns.
-            Vec3 obeliskPos(basePos.x + 84.f, 0.f, basePos.y + 46.f);
-            addBandedBox(out, viewProj, windowSize, eye, obeliskPos, Vec3(8.f, 34.f, 8.f), columnColor, lc);
-            addPyramid(out, viewProj, windowSize, eye, obeliskPos + Vec3(0.f, 34.f, 0.f), sf::Vector2f(8.f, 8.f), 10.f, shade3d(columnColor, -10), lc);
-
-            // A stone urn -- a narrow-necked box on a wider base box (the
-            // same "no curved primitive, fake it as stacked boxes" trick
-            // Storefront's own pottery jar already uses), on a short
-            // pedestal, tucked between the 2 columns.
-            Vec3 urnPedPos(basePos.x + 98.f, 0.f, basePos.y + 52.f);
-            addBox(out, viewProj, windowSize, eye, urnPedPos, Vec3(6.f, 6.f, 6.f), columnColor, lc);
-            addBox(out, viewProj, windowSize, eye, urnPedPos + Vec3(0.5f, 6.f, 0.5f), Vec3(5.f, 6.f, 5.f), stone, lc);
-            addBox(out, viewProj, windowSize, eye, urnPedPos + Vec3(1.5f, 12.f, 1.5f), Vec3(3.f, 3.f, 3.f), shade3d(stone, -10), lc);
-
-            // 2 small stone cairns (3 shrinking stacked stones each,
-            // reusing the tombstone colors) in the open gap between the
-            // bench and the walkway.
-            for (const auto& c : { sf::Vector2f(34.f, 70.f), sf::Vector2f(42.f, 75.f) }) {
-                Vec3 cp(basePos.x + c.x, 0.f, basePos.y + c.y);
-                addBox(out, viewProj, windowSize, eye, cp, Vec3(6.f, 4.f, 6.f), tombColor, lc);
-                addBox(out, viewProj, windowSize, eye, cp + Vec3(1.f, 4.f, 1.f), Vec3(4.f, 3.f, 4.f), shade3d(tombColor, -8), lc);
-                addBox(out, viewProj, windowSize, eye, cp + Vec3(1.8f, 7.f, 1.8f), Vec3(2.4f, 2.5f, 2.4f), tombCapColor, lc);
-            }
-
-            // Stacked stone blocks -- a neat pile (reusing Quarry's own
-            // "cut stone block stack" layering technique).
-            //
-            // 2026-08-10, 3rd attempt at this same request ("依旧没有" --
-            // still not there, after the previous round moved it to dx 89
-            // near the east column/chimney): moving it closer to the
-            // building didn't fix it, which means the earlier "it's just
-            // south of the wall, should be in frame" reasoning was
-            // incomplete -- the confirmed-visible west work station sits
-            // at dx 10-31 (24-45 units WEST of the door's own center),
-            // while dx 89 is only 34 units EAST of center, closer to
-            // center than the west items yet still not shown. That
-            // asymmetry only makes sense if the camera's actual visible
-            // window isn't centered on the building's own midpoint at
-            // all (most likely the player themselves wasn't standing
-            // exactly center-door when either screenshot was taken) --
-            // not something predictable from this building's own geometry
-            // alone. Rather than guess at an even-more-precise X offset
-            // again, moved this as close to the door as the yard's own
-            // layout allows (right past the east jamb, mirroring how
-            // close the work station's own block sits to the west jamb)
-            // -- the 2nd east tombstone (previously dx 80, dz 38) was
-            // relocated (see the tombstone list above) specifically to
-            // free this spot, the same "move what's in the way" call the
-            // west apron's own tombstone relocations already made twice.
-            Vec3 stackA(basePos.x + 78.f, 0.f, basePos.y + 37.f);
-            for (int i = 0; i < 2; ++i) {
-                addBox(out, viewProj, windowSize, eye, stackA + Vec3(0.f, static_cast<float>(i) * 5.4f, 0.f), Vec3(7.f, 5.f, 7.f), shade3d(stone, (i % 2) * 8 - 4), lc);
-            }
+        // ---- 2 small stone cairns (3 shrinking stacked stones each,
+        // reusing the tombstone colors) in the open gap between the bench
+        // and the walkway.
+        //
+        // 2026-08-11: the obelisk, stone urn, and stacked-stone pile that
+        // used to live in this same block are gone -- removed outright at
+        // the user's own explicit request ("一样还在删了吧" -- still
+        // showing up, just delete them) after the whole "pale shapes near
+        // Sawmill" saga (see this file's own long log above) survived 3
+        // real fixes in a row (relocating the cluster, shrinking the
+        // obelisk, moving Mason's own position off Sawmill's shared X
+        // column) without resolving. The cairns were never implicated in
+        // any of those reports and are kept. ----
+        for (const auto& c : { sf::Vector2f(34.f, 70.f), sf::Vector2f(42.f, 75.f) }) {
+            Vec3 cp(basePos.x + c.x, 0.f, basePos.y + c.y);
+            addBox(out, viewProj, windowSize, eye, cp, Vec3(6.f, 4.f, 6.f), tombColor, lc);
+            addBox(out, viewProj, windowSize, eye, cp + Vec3(1.f, 4.f, 1.f), Vec3(4.f, 3.f, 4.f), shade3d(tombColor, -8), lc);
+            addBox(out, viewProj, windowSize, eye, cp + Vec3(1.8f, 7.f, 1.8f), Vec3(2.4f, 2.5f, 2.4f), tombCapColor, lc);
         }
 
         // A bench (4 legs + a seat plank), south-west corner of the yard.
@@ -3771,7 +4470,7 @@ namespace {
         // yard's own north edge (the walkway's own start).
         for (float px : { 44.f, 66.f }) {
             Vec3 boxPos(basePos.x + px, 0.f, basePos.y + 35.f);
-            addBandedBox(out, viewProj, windowSize, eye, boxPos, Vec3(6.f, 6.f, 6.f), plantBoxColor, lc);
+            addBandedBox(out, viewProj, windowSize, eye, boxPos, Vec3(6.f, 6.f, 6.f), plantBoxColor, lc, nullptr, 40.f, true);
             addBillboard(out, viewProj, windowSize, billboardRight, boxPos + Vec3(3.f, 6.f, 3.f), 12.f, 14.f, flowerTex, sf::Color::White);
         }
 
@@ -3782,6 +4481,1606 @@ namespace {
             addBox(out, viewProj, windowSize, eye, lanternPos, Vec3(3.f, 24.f, 3.f), beamColor, lc);
             addGlowBillboard(out, viewProj, windowSize, billboardRight, lanternPos + Vec3(1.5f, 28.f, 1.5f), 16.f, glowTex, sf::Color(255, 200, 120, 160));
         }
+    }
+
+    // Bakery -- from a seventeenth reference image, explicitly labeled
+    // "面包坊" (Bakery) itself, no scope-check needed (`bakery` is a plain
+    // tier-2 wheat->bread processor -- no raw-tier sibling to confuse it
+    // with, unlike the lumber/quarry/sheep pairings): a log-cabin shop
+    // building next to a big outdoor beehive-shaped brick oven with its
+    // own chimney, display tables of bread out front, hay bales, and a
+    // flour sack pile. Only `b.id == "bakery"` uses this -- one of the
+    // ~33 non-Town-Square processor businesses this file's own header
+    // comment flagged as still generic box+roof, restored the same
+    // "Workshop family" way Sawmill/Mason already were.
+    void addBakeryBuilding(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
+        const WorldBuilding& b, const LightingContext& lc, float wallH, float roofRise, Vec3 billboardRight, const sf::Texture& glowTex,
+        const sf::Texture& stoneTex, const sf::Texture& shingleTex, const sf::Texture& flowerTex,
+        const sf::Texture& archTex, const sf::Texture& breadTex) {
+        sf::Color stone(118, 114, 108);
+        sf::Color plankWall(150, 112, 68);
+        sf::Color beamColor(58, 40, 26);
+        sf::Color roofColor(96, 60, 40);
+        sf::Color windowColor(255, 214, 140);
+        sf::Color signColor(120, 84, 48);
+        sf::Color plantBoxColor(96, 68, 40);
+        sf::Color brickColor(150, 82, 56);
+        sf::Color hayColor(198, 168, 78);
+        sf::Color hayCapColor(220, 196, 108);
+        sf::Color sackColor(196, 168, 118);
+        sf::Color tableColor(110, 78, 46);
+
+        constexpr float kStoneUv = 20.f, kShingleUv = 15.f;
+
+        Vec3 basePos(b.position.x, 0.f, b.position.y);
+        float southZ = basePos.z + b.size.y + 1.5f;
+
+        // 2026-08-11 follow-up ("面包房可以做矮和拉宽吗,高高尖尖的有点丑" --
+        // make it shorter and wider, it reads too tall/pointy): wallH2 cut
+        // to 0.72x (was the full, un-reduced wallH -- the tallest cabin of
+        // any Workshop-family building so far) and the gable roof gets its
+        // own locally-reduced rise (`bakeryRoofRise`, 0.6x the shared
+        // `roofRise` every other building's roof uses) instead of the flat
+        // constant -- between this and the widened WorldBuilding rect (see
+        // buildZones()'s own comment), the cabin's own height:width ratio
+        // drops on both ends at once instead of just one.
+        float wallH2 = wallH * 0.72f;
+        float foundationH = wallH2 * 0.18f;
+        float upperH = wallH2 - foundationH;
+        float wallTop = wallH2;
+        float bakeryRoofRise = roofRise * 0.6f;
+
+        // ---- Enclosed cabin (west 40% of the -- now widened -- footprint,
+        // narrowed from 52% a round ago to free room for the boiler-room
+        // annex right next to it -- see its own comment below): stone
+        // foundation, timber-plank upper band, a real side-gable roof --
+        // same recipe Sawmill's own enclosed block already established. ----
+        float enclosedW = b.size.x * 0.40f;
+        addBandedBox(out, viewProj, windowSize, eye, basePos, Vec3(enclosedW, foundationH, b.size.y), stone, lc, &stoneTex, kStoneUv);
+        addBandedBox(out, viewProj, windowSize, eye, Vec3(basePos.x, foundationH, basePos.z), Vec3(enclosedW, upperH, b.size.y), plankWall, lc, &shingleTex, kShingleUv);
+        addGableRoof(out, viewProj, windowSize, eye, basePos, Vec3(enclosedW, wallTop, b.size.y), wallTop, bakeryRoofRise, roofColor, lc, &shingleTex, kShingleUv);
+
+        // Plain timber door, centered on the cabin's own width.
+        float doorW = enclosedW * 0.22f, doorH = foundationH + upperH * 0.55f;
+        Vec3 doorPos(basePos.x + enclosedW * 0.5f - doorW * 0.5f, 0.f, southZ);
+        addBox(out, viewProj, windowSize, eye, doorPos, Vec3(doorW, doorH, 3.f), beamColor, lc);
+        addBox(out, viewProj, windowSize, eye, Vec3(doorPos.x + doorW * 0.5f - 1.f, 0.f, southZ - 0.5f), Vec3(2.f, doorH, 2.f), shade3d(beamColor, -10), lc);
+
+        // A window with a flower box, west of the door.
+        float winSize = enclosedW * 0.15f;
+        Vec3 winPos(basePos.x + enclosedW * 0.15f, foundationH + upperH * 0.4f, southZ);
+        addBox(out, viewProj, windowSize, eye, winPos, Vec3(winSize, winSize, 3.f), windowColor, lc);
+        addGlowBillboard(out, viewProj, windowSize, billboardRight, Vec3(winPos.x + winSize * 0.5f, winPos.y + winSize * 0.5f, southZ), winSize * 1.5f, glowTex, sf::Color(255, 214, 140, 130));
+        Vec3 boxPos(winPos.x - 2.f, winPos.y - 8.f, southZ - 3.f);
+        addBandedBox(out, viewProj, windowSize, eye, boxPos, Vec3(winSize + 4.f, 6.f, 6.f), plantBoxColor, lc, nullptr, 40.f, true);
+        addBillboard(out, viewProj, windowSize, billboardRight, Vec3(boxPos.x + (winSize + 4.f) * 0.5f, winPos.y - 2.f, southZ), winSize * 0.9f, 14.f, flowerTex, sf::Color::White);
+
+        // Sign on the gable end.
+        float signW = enclosedW * 0.6f, signH = 16.f;
+        Vec3 signPos(basePos.x + enclosedW * 0.5f - signW * 0.5f, wallTop + bakeryRoofRise * 0.35f, southZ - 2.f);
+        addBandedBox(out, viewProj, windowSize, eye, signPos, Vec3(signW, signH, 3.f), signColor, lc, nullptr, 40.f, true);
+
+        // The cabin's own chimney, plus a smoke puff.
+        Vec3 chimneyPos(basePos.x + enclosedW * 0.78f, wallTop * 0.3f, basePos.z + b.size.y * 0.5f);
+        addBox(out, viewProj, windowSize, eye, chimneyPos, Vec3(11.f, wallTop * 0.75f, 11.f), sf::Color(96, 90, 86), lc);
+        addGlowBillboard(out, viewProj, windowSize, billboardRight, chimneyPos + Vec3(5.5f, wallTop * 0.75f + 12.f, 5.5f), 16.f, glowTex, sf::Color(210, 210, 214, 90));
+
+        // ---- Boiler-room annex (2026-08-11 follow-up, "面包房可以做多一
+        // 个锅炉房的造型...就做在屋子的隔壁吧" -- add a boiler-room shape,
+        // right next to the house): a narrow stone-walled lean-to flush
+        // against the cabin's own east wall, between it and the oven bay
+        // -- a real walled room reading as "where the heat for baking
+        // actually comes from," distinct from the outdoor oven mound.
+        // Kept shallower than the cabin's own full depth (40 units, not
+        // 80) specifically so its own flat roof stays under
+        // `kGroundSliceZ`'s 60-unit single-quad-depth-sort threshold (see
+        // `addGroundQuad`'s own header comment on the bug class a wider
+        // unsliced flat quad already caused once, on Clinic's own roof
+        // deck) -- a plain `addBox` roof this shallow can't trip that
+        // bug the way a full-depth one could. ----
+        float annexX0 = basePos.x + enclosedW;
+        float annexW = 16.f, annexD = 40.f;
+        float annexZ0 = basePos.z + (b.size.y - annexD);
+        float annexWallH = wallTop * 0.65f;
+        sf::Color boilerStone = shade3d(stone, -6);
+        sf::Color boilerMetal(96, 98, 102);
+        addBandedBox(out, viewProj, windowSize, eye, Vec3(annexX0, 0.f, annexZ0), Vec3(annexW, annexWallH, annexD), boilerStone, lc, &stoneTex, kStoneUv);
+        addBox(out, viewProj, windowSize, eye, Vec3(annexX0, annexWallH, annexZ0), Vec3(annexW, 3.f, annexD), shade3d(roofColor, -14), lc);
+
+        // A dark open archway (Kitchen's own `archTex`, reused) on the
+        // annex's south face, showing the boiler within, plus 2 small
+        // flanking firebox glows -- offset beside the arch, not
+        // overlapping it, the same lesson the oven's own firebox below
+        // (and Clinic's cross-decal round before it) already learned.
+        float annexArchCenterX = annexX0 + annexW * 0.5f, annexArchZ = annexZ0 + annexD + 0.5f;
+        addBillboard(out, viewProj, windowSize, billboardRight, Vec3(annexArchCenterX, 0.f, annexArchZ), 12.f, 18.f, archTex, sf::Color(50, 46, 44));
+        addGlowBillboard(out, viewProj, windowSize, billboardRight, Vec3(annexArchCenterX - 9.f, 5.f, annexArchZ), 12.f, glowTex, sf::Color(255, 140, 60, 160));
+        addGlowBillboard(out, viewProj, windowSize, billboardRight, Vec3(annexArchCenterX + 9.f, 5.f, annexArchZ), 12.f, glowTex, sf::Color(255, 140, 60, 160));
+
+        // A glimpse of the boiler tank itself, just inside the archway --
+        // 2 stacked grey boxes with a darker rim band, the same barrel
+        // technique this file already reuses for barrels/dye vats.
+        Vec3 boilerPos(annexX0 + annexW * 0.5f - 5.f, 0.f, annexZ0 + annexD - 14.f);
+        addBox(out, viewProj, windowSize, eye, boilerPos, Vec3(10.f, 20.f, 10.f), boilerMetal, lc);
+        addBox(out, viewProj, windowSize, eye, boilerPos + Vec3(-0.8f, 18.f, -0.8f), Vec3(11.6f, 2.f, 11.6f), shade3d(boilerMetal, -18), lc);
+
+        // A tall, thick brick smokestack -- noticeably bigger than the
+        // cabin's own chimney, the industrial-boiler read a mere room
+        // shape alone wouldn't sell on its own.
+        Vec3 boilerChimneyPos(annexX0 + annexW * 0.5f - 7.f, annexWallH, annexZ0 + 10.f);
+        addBox(out, viewProj, windowSize, eye, boilerChimneyPos, Vec3(14.f, wallTop * 0.75f, 14.f), sf::Color(120, 66, 50), lc);
+        addGlowBillboard(out, viewProj, windowSize, billboardRight, boilerChimneyPos + Vec3(7.f, wallTop * 0.75f + 14.f, 7.f), 20.f, glowTex, sf::Color(150, 150, 154, 130));
+
+        // ---- Big outdoor brick oven (east of the annex) -- a beehive-
+        // shaped brick mound (addPyramid, same primitive Mine/Gold Mine's
+        // own rock mound and Mason's obelisk already use, here low/wide
+        // instead of tall for a dome-ish read) on its own low stone
+        // hearth platform, a firebox arch decal on its south face
+        // (Kitchen's own `archTex` reused outright rather than baking a
+        // near-duplicate), 2 flanking warm glows (offset beside the arch,
+        // not overlapping it -- the same lesson Clinic's own cross-decal
+        // round learned the hard way), and its own small chimney.
+        //
+        // 2026-08-11 rework ("面包房的模型...那个三角形的东西...看起来很
+        // 奇怪" -- the pyramid read as an odd solid-orange shape floating
+        // alone in the grass): the previous version centered a flat-color
+        // mound of a fixed size inside whatever leftover space the annex
+        // left behind, which after the footprint's own widen left large
+        // empty gaps on every side with nothing tying the mound to the
+        // rest of the building cluster. Now the mound (a) scales with the
+        // oven area instead of a flat constant, so it actually fills most
+        // of its own yard the way Mine's identical-primitive mountain
+        // fills its whole lot (see addMineProps above), (b) sits a fixed
+        // small gap off the annex instead of centered with slack on both
+        // sides, (c) gets a stoneTex-textured pedestal underneath (a few
+        // units wider than the pyramid's own base on every side) so it
+        // reads as something built on a hearth platform rather than a
+        // solid-color shape resting straight on grass, and (d) the
+        // pyramid itself now takes `stoneTex` too (tinted by `brickColor`,
+        // via addPyramid's new optional-texture param above) instead of a
+        // flat fill. ----
+        float ovenX0 = annexX0 + annexW;
+        float ovenAreaW = b.size.x - enclosedW - annexW;
+        float pedestalH = 6.f, pedMargin = 6.f;
+        float moundW = ovenAreaW * 0.62f, moundD = b.size.y * 0.5f;
+        Vec3 pedPos(ovenX0 + pedMargin, 0.f, basePos.z + (b.size.y - moundD) * 0.5f - pedMargin);
+        Vec3 moundPos(pedPos.x + pedMargin, pedestalH, pedPos.z + pedMargin);
+        addBandedBox(out, viewProj, windowSize, eye, pedPos, Vec3(moundW + pedMargin * 2.f, pedestalH, moundD + pedMargin * 2.f), stone, lc, &stoneTex, kStoneUv, true);
+        float moundH = 30.f;
+        addPyramid(out, viewProj, windowSize, eye, moundPos, sf::Vector2f(moundW, moundD), moundH, brickColor, lc, &stoneTex, kStoneUv);
+        float archW = 16.f, archCenterX = moundPos.x + moundW * 0.5f, archZ = moundPos.z + moundD + 0.5f;
+        addBillboard(out, viewProj, windowSize, billboardRight, Vec3(archCenterX - archW * 0.5f, pedestalH, archZ), archW, 16.f, archTex, sf::Color(80, 60, 50));
+        addGlowBillboard(out, viewProj, windowSize, billboardRight, Vec3(archCenterX - archW * 0.9f, pedestalH + 6.f, archZ), 16.f, glowTex, sf::Color(255, 150, 70, 170));
+        addGlowBillboard(out, viewProj, windowSize, billboardRight, Vec3(archCenterX + archW * 0.9f, pedestalH + 6.f, archZ), 16.f, glowTex, sf::Color(255, 150, 70, 170));
+
+        // No chimney stack on the mound itself anymore (2026-08-11
+        // follow-up, "可以让那个橙色三角形头上的石柱子消失吗" -- make the
+        // stone column on top of the orange triangle disappear): the oven
+        // already has its own smoke tell from the annex's boiler
+        // smokestack right next to it (see boilerChimneyPos above) and the
+        // cabin's own chimney further west, so this 3rd grey box balanced
+        // on the pyramid's apex wasn't pulling its own weight -- just an
+        // odd stick poking out of a triangle from most angles.
+
+        // Hay bales, north of the oven mound, clear of its own footprint.
+        Vec3 hayBase(ovenX0 + 8.f, 0.f, basePos.z + 2.f);
+        for (int i = 0; i < 2; ++i) {
+            Vec3 hp = hayBase + Vec3(static_cast<float>(i) * 11.f, 0.f, 0.f);
+            addBox(out, viewProj, windowSize, eye, hp, Vec3(9.f, 8.f, 9.f), hayColor, lc);
+            addBox(out, viewProj, windowSize, eye, hp + Vec3(1.f, 8.f, 1.f), Vec3(7.f, 1.5f, 7.f), hayCapColor, lc);
+        }
+
+        // ---- 2 outdoor display tables with bread baskets, south of the
+        // whole building (the same "props extend past the lot's own south
+        // edge into the shared yard" convention Sawmill's own log piles
+        // already use). ----
+        for (float tx : { 8.f, 42.f }) {
+            float tableLegH = 12.f;
+            Vec3 tablePos(basePos.x + tx, 0.f, southZ + 3.f);
+            for (float lx : { 2.f, 22.f }) {
+                for (float lz : { 2.f, 9.f }) {
+                    addBox(out, viewProj, windowSize, eye, tablePos + Vec3(lx, 0.f, lz), Vec3(2.f, tableLegH, 2.f), beamColor, lc);
+                }
+            }
+            addBandedBox(out, viewProj, windowSize, eye, tablePos + Vec3(0.f, tableLegH, 0.f), Vec3(26.f, 3.f, 12.f), tableColor, lc, nullptr, 40.f, true);
+            addBillboard(out, viewProj, windowSize, billboardRight, tablePos + Vec3(8.f, tableLegH + 3.f, 6.f), 22.f, 15.f, breadTex, sf::Color::White);
+            addBillboard(out, viewProj, windowSize, billboardRight, tablePos + Vec3(18.f, tableLegH + 3.f, 6.f), 18.f, 12.f, breadTex, sf::Color::White);
+        }
+
+        // Flour sack pile, south of the gap between the cabin and the oven
+        // -- south of both display tables (z+18, past their own z+15
+        // southern edge) to stay clear of the 2nd table's own footprint.
+        Vec3 sackPos(basePos.x + enclosedW - 3.f, 0.f, southZ + 18.f);
+        addBox(out, viewProj, windowSize, eye, sackPos, Vec3(9.f, 9.f, 9.f), sackColor, lc);
+        addBox(out, viewProj, windowSize, eye, sackPos + Vec3(2.f, 8.f, 1.f), Vec3(7.f, 7.f, 7.f), shade3d(sackColor, -12), lc);
+    }
+
+    // Preserve -- from the same reference image as Orchard's own
+    // 2026-08-11 tree rework (see addOrchardProps above), this time asked
+    // for by name ("现在到果酱坊" -- now onto the Jam Workshop): the
+    // reference's own shop building, fruit press, and jar-lined stalls
+    // belong here, not on Orchard itself (Orchard stayed a raw-tier flat
+    // plot; Preserve is its tier-2 processor sibling, the exact "not yet
+    // built" business npc_orchardist's own dialogue already name-drops).
+    // Same 3-volume "Workshop family" recipe Bakery established (cabin +
+    // annex + outdoor apparatus), reskinned for jam instead of bread: a
+    // log-cabin shop, a press annex housing a wooden screw press over a
+    // catch-barrel, and an open stone hearth with a cauldron simmering
+    // over a real fire (no chimney stack on the cauldron itself -- see
+    // Bakery's own 2026-08-11 "remove the pointless stone column" fix
+    // just above, same lesson applied up front here instead of having to
+    // walk it back later), plus a jam-jar display table and a fruit
+    // crate/sack out front. Only `b.id == "preserve"` uses this -- the
+    // 3rd Workshop-family processor building after Bakery/Textile.
+    void addPreserveBuilding(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
+        const WorldBuilding& b, const LightingContext& lc, float wallH, float roofRise, Vec3 billboardRight, const sf::Texture& glowTex,
+        const sf::Texture& stoneTex, const sf::Texture& shingleTex, const sf::Texture& flowerTex,
+        const sf::Texture& archTex, const sf::Texture& jamJarsTex, const sf::Texture& pressWheelTex, const sf::Texture& fruitCrateTex) {
+        sf::Color stone(118, 114, 108);
+        sf::Color plankWall(148, 96, 92);   // a touch more red than Bakery's plankWall -- this shop's own identity color, echoing preserve's 2D accent (190,70,70)
+        sf::Color beamColor(58, 40, 26);
+        sf::Color roofColor(92, 54, 52);
+        sf::Color windowColor(255, 214, 140);
+        sf::Color signColor(120, 60, 58);
+        sf::Color plantBoxColor(96, 68, 40);
+        sf::Color tableColor(110, 78, 46);
+        sf::Color sackColor(196, 150, 118);
+
+        constexpr float kStoneUv = 20.f, kShingleUv = 15.f;
+
+        Vec3 basePos(b.position.x, 0.f, b.position.y);
+        float southZ = basePos.z + b.size.y + 1.5f;
+
+        // Same shortened/widened proportions Bakery's own 2026-08-11 fix
+        // established for this file's 3-volume Workshop-family shape.
+        float wallH2 = wallH * 0.72f;
+        float foundationH = wallH2 * 0.18f;
+        float upperH = wallH2 - foundationH;
+        float wallTop = wallH2;
+        float presRoofRise = roofRise * 0.6f;
+
+        // ---- Enclosed cabin (west ~38% of the footprint) -- same recipe
+        // Bakery's own cabin already established. ----
+        float enclosedW = b.size.x * 0.38f;
+        addBandedBox(out, viewProj, windowSize, eye, basePos, Vec3(enclosedW, foundationH, b.size.y), stone, lc, &stoneTex, kStoneUv);
+        addBandedBox(out, viewProj, windowSize, eye, Vec3(basePos.x, foundationH, basePos.z), Vec3(enclosedW, upperH, b.size.y), plankWall, lc, &shingleTex, kShingleUv);
+        addGableRoof(out, viewProj, windowSize, eye, basePos, Vec3(enclosedW, wallTop, b.size.y), wallTop, presRoofRise, roofColor, lc, &shingleTex, kShingleUv);
+
+        float doorW = enclosedW * 0.22f, doorH = foundationH + upperH * 0.55f;
+        Vec3 doorPos(basePos.x + enclosedW * 0.5f - doorW * 0.5f, 0.f, southZ);
+        addBox(out, viewProj, windowSize, eye, doorPos, Vec3(doorW, doorH, 3.f), beamColor, lc);
+        addBox(out, viewProj, windowSize, eye, Vec3(doorPos.x + doorW * 0.5f - 1.f, 0.f, southZ - 0.5f), Vec3(2.f, doorH, 2.f), shade3d(beamColor, -10), lc);
+
+        float winSize = enclosedW * 0.16f;
+        Vec3 winPos(basePos.x + enclosedW * 0.16f, foundationH + upperH * 0.4f, southZ);
+        addBox(out, viewProj, windowSize, eye, winPos, Vec3(winSize, winSize, 3.f), windowColor, lc);
+        addGlowBillboard(out, viewProj, windowSize, billboardRight, Vec3(winPos.x + winSize * 0.5f, winPos.y + winSize * 0.5f, southZ), winSize * 1.5f, glowTex, sf::Color(255, 214, 140, 130));
+        Vec3 boxPos(winPos.x - 2.f, winPos.y - 8.f, southZ - 3.f);
+        addBandedBox(out, viewProj, windowSize, eye, boxPos, Vec3(winSize + 4.f, 6.f, 6.f), plantBoxColor, lc, nullptr, 40.f, true);
+        addBillboard(out, viewProj, windowSize, billboardRight, Vec3(boxPos.x + (winSize + 4.f) * 0.5f, winPos.y - 2.f, southZ), winSize * 0.9f, 14.f, flowerTex, sf::Color::White);
+
+        float signW = enclosedW * 0.62f, signH = 16.f;
+        Vec3 signPos(basePos.x + enclosedW * 0.5f - signW * 0.5f, wallTop + presRoofRise * 0.35f, southZ - 2.f);
+        addBandedBox(out, viewProj, windowSize, eye, signPos, Vec3(signW, signH, 3.f), signColor, lc, nullptr, 40.f, true);
+
+        Vec3 chimneyPos(basePos.x + enclosedW * 0.78f, wallTop * 0.3f, basePos.z + b.size.y * 0.5f);
+        addBox(out, viewProj, windowSize, eye, chimneyPos, Vec3(11.f, wallTop * 0.75f, 11.f), sf::Color(96, 90, 86), lc);
+        addGlowBillboard(out, viewProj, windowSize, billboardRight, chimneyPos + Vec3(5.5f, wallTop * 0.75f + 12.f, 5.5f), 16.f, glowTex, sf::Color(210, 210, 214, 90));
+
+        // ---- Press annex (east of the cabin) -- a narrow stone lean-to
+        // like Bakery's own boiler room, but housing a wooden screw press
+        // over a catch-barrel instead of a boiler: a central post topped
+        // with `pressWheelTex`'s cross-handle, and a squat barrel below it
+        // (the same "2 stacked boxes, darker rim band" barrel technique
+        // Bakery's boiler tank already used). No fire/glow in here -- a
+        // press has nothing burning, unlike the boiler room it's replacing. ----
+        float annexX0 = basePos.x + enclosedW;
+        float annexW = 18.f, annexD = 40.f;
+        float annexZ0 = basePos.z + (b.size.y - annexD);
+        float annexWallH = wallTop * 0.65f;
+        sf::Color annexStone = shade3d(stone, -6);
+        addBandedBox(out, viewProj, windowSize, eye, Vec3(annexX0, 0.f, annexZ0), Vec3(annexW, annexWallH, annexD), annexStone, lc, &stoneTex, kStoneUv);
+        addBox(out, viewProj, windowSize, eye, Vec3(annexX0, annexWallH, annexZ0), Vec3(annexW, 3.f, annexD), shade3d(roofColor, -14), lc);
+
+        float annexArchCenterX = annexX0 + annexW * 0.5f, annexArchZ = annexZ0 + annexD + 0.5f;
+        addBillboard(out, viewProj, windowSize, billboardRight, Vec3(annexArchCenterX - 6.f, 0.f, annexArchZ), 12.f, 18.f, archTex, sf::Color(60, 50, 44));
+
+        sf::Color pressPostColor(110, 78, 44);
+        Vec3 pressPostPos(annexX0 + annexW * 0.5f - 3.f, 0.f, annexZ0 + annexD - 16.f);
+        addBox(out, viewProj, windowSize, eye, pressPostPos, Vec3(6.f, annexWallH * 0.9f, 6.f), pressPostColor, lc);
+        addBillboard(out, viewProj, windowSize, billboardRight, pressPostPos + Vec3(3.f, annexWallH * 0.9f, 3.f), 16.f, 16.f, pressWheelTex, sf::Color::White);
+
+        sf::Color barrelColor(120, 86, 50);
+        Vec3 barrelPos(annexX0 + annexW * 0.5f - 5.f, 0.f, annexZ0 + 6.f);
+        addBox(out, viewProj, windowSize, eye, barrelPos, Vec3(10.f, 14.f, 10.f), barrelColor, lc);
+        addBox(out, viewProj, windowSize, eye, barrelPos + Vec3(-0.6f, 12.f, -0.6f), Vec3(11.2f, 2.f, 11.2f), shade3d(barrelColor, -18), lc);
+
+        // ---- Open stone hearth with a simmering cauldron (east of the
+        // annex) -- same low stoneTex-textured pedestal Bakery's own oven
+        // rework introduced, but topped with a real pot silhouette (wide
+        // iron body + a narrower darker rim band, the same "2-box taper"
+        // trick the barrel above just used) instead of a brick pyramid,
+        // since a jam cauldron reads as a pot, not a beehive oven. A
+        // visible dark-red "jam surface" strip sits just inside the rim,
+        // and steam (not smoke) rises off it -- no separate chimney/
+        // column on top, learning Bakery's own "pointless stone stick"
+        // lesson up front. ----
+        float hearthX0 = annexX0 + annexW;
+        float hearthAreaW = b.size.x - enclosedW - annexW;
+        float pedestalH = 6.f, pedMargin = 6.f;
+        float cauldronW = std::min(hearthAreaW * 0.4f, 40.f), cauldronD = b.size.y * 0.42f;
+        sf::Color potColor(50, 48, 50);
+        sf::Color jamColor(150, 40, 46);
+        Vec3 pedPos(hearthX0 + pedMargin, 0.f, basePos.z + (b.size.y - cauldronD) * 0.5f - pedMargin);
+        Vec3 potPos(pedPos.x + pedMargin, pedestalH, pedPos.z + pedMargin);
+        addBandedBox(out, viewProj, windowSize, eye, pedPos, Vec3(cauldronW + pedMargin * 2.f, pedestalH, cauldronD + pedMargin * 2.f), stone, lc, &stoneTex, kStoneUv, true);
+        addBox(out, viewProj, windowSize, eye, potPos, Vec3(cauldronW, 20.f, cauldronD), potColor, lc);
+        addBox(out, viewProj, windowSize, eye, potPos + Vec3(cauldronW * 0.08f, 20.f, cauldronD * 0.08f), Vec3(cauldronW * 0.84f, 3.f, cauldronD * 0.84f), shade3d(potColor, -16), lc);
+        addBox(out, viewProj, windowSize, eye, potPos + Vec3(cauldronW * 0.16f, 22.5f, cauldronD * 0.16f), Vec3(cauldronW * 0.68f, 1.5f, cauldronD * 0.68f), jamColor, lc);
+        addGlowBillboard(out, viewProj, windowSize, billboardRight, potPos + Vec3(cauldronW * 0.5f, 26.f, cauldronD * 0.5f), 20.f, glowTex, sf::Color(230, 230, 235, 110));
+        addGlowBillboard(out, viewProj, windowSize, billboardRight, Vec3(potPos.x + cauldronW * 0.3f, 4.f, potPos.z + cauldronD + 1.f), 14.f, glowTex, sf::Color(255, 150, 60, 170));
+        addGlowBillboard(out, viewProj, windowSize, billboardRight, Vec3(potPos.x + cauldronW * 0.7f, 4.f, potPos.z + cauldronD + 1.f), 14.f, glowTex, sf::Color(255, 150, 60, 170));
+
+        // A couple of firewood logs at the hearth's own base.
+        sf::Color logColor(90, 60, 34);
+        for (float lx : { -4.f, 8.f }) {
+            Vec3 logPos(potPos.x + cauldronW * 0.5f + lx, 0.f, potPos.z + cauldronD + 5.f);
+            addBox(out, viewProj, windowSize, eye, logPos, Vec3(12.f, 4.f, 4.f), logColor, lc);
+        }
+
+        // ---- Jam-jar display table, south of the cabin (Bakery's own
+        // bread-table convention, one table instead of 2, topped with
+        // `jamJarsTex` instead of bread). ----
+        float tableLegH = 12.f;
+        Vec3 tablePos(basePos.x + 10.f, 0.f, southZ + 3.f);
+        for (float lx : { 2.f, 22.f }) {
+            for (float lz : { 2.f, 9.f }) {
+                addBox(out, viewProj, windowSize, eye, tablePos + Vec3(lx, 0.f, lz), Vec3(2.f, tableLegH, 2.f), beamColor, lc);
+            }
+        }
+        addBandedBox(out, viewProj, windowSize, eye, tablePos + Vec3(0.f, tableLegH, 0.f), Vec3(26.f, 3.f, 12.f), tableColor, lc, nullptr, 40.f, true);
+        addBillboard(out, viewProj, windowSize, billboardRight, tablePos + Vec3(13.f, tableLegH + 3.f, 6.f), 24.f, 14.f, jamJarsTex, sf::Color::White);
+
+        // A fruit crate and a fruit-mash sack, south of the press annex --
+        // same "props spill past the lot's south edge" convention as
+        // Bakery's own flour sack, `fruitCrateTex` reused outright from
+        // Orchard's own 2026-08-11 rework rather than baking a near-dupe.
+        Vec3 cratePos(annexX0 + 2.f, 0.f, southZ + 4.f);
+        addBandedBox(out, viewProj, windowSize, eye, cratePos, Vec3(14.f, 10.f, 14.f), sf::Color(150, 108, 62), lc, nullptr, 40.f, true);
+        addBillboard(out, viewProj, windowSize, billboardRight, cratePos + Vec3(7.f, 10.f, 7.f), 14.f, 10.f, fruitCrateTex, sf::Color::White);
+
+        Vec3 sackPos(basePos.x + enclosedW - 3.f, 0.f, southZ + 18.f);
+        addBox(out, viewProj, windowSize, eye, sackPos, Vec3(9.f, 9.f, 9.f), sackColor, lc);
+        addBox(out, viewProj, windowSize, eye, sackPos + Vec3(2.f, 8.f, 1.f), Vec3(7.f, 7.f, 7.f), shade3d(sackColor, -12), lc);
+    }
+
+    // Goldsmith -- from the same reference image family as Preserve above
+    // (2026-08-11, "现在到金匠铺" -- now onto the Goldsmith), Gold Mine's
+    // own tier-2 processor sibling (the ore->ingot/jewelry step
+    // npc_prospector2's own dialogue already name-drops). Same 3-volume
+    // Workshop-family recipe, reskinned around fire and metal instead of
+    // dough or fruit: a log-cabin shop (gold-accented trim, matching this
+    // business's own 2D accent color), a forge annex with a real fire
+    // glow, an anvil, and a bellows -- instead of Preserve's press or
+    // Bakery's oven, a goldsmith's own outdoor apparatus is a display
+    // counter (glass-look case top, stacked gold bars, a gem tray) plus a
+    // nugget-loaded wheelbarrow tying it back visually to Gold Mine's own
+    // ore cart. Only `b.id == "goldsmith"` uses this -- the 4th Workshop-
+    // family processor building after Bakery/Textile/Preserve.
+    void addGoldsmithBuilding(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
+        const WorldBuilding& b, const LightingContext& lc, float wallH, float roofRise, Vec3 billboardRight, const sf::Texture& glowTex,
+        const sf::Texture& stoneTex, const sf::Texture& shingleTex, const sf::Texture& flowerTex,
+        const sf::Texture& archTex, const sf::Texture& goldBarTex, const sf::Texture& gemTrayTex, const sf::Texture& goldOreTex) {
+        sf::Color stone(118, 114, 108);
+        sf::Color plankWall(120, 104, 76);
+        sf::Color beamColor(58, 40, 26);
+        sf::Color roofColor(84, 66, 40);
+        sf::Color windowColor(255, 214, 140);
+        sf::Color signColor(150, 120, 50);   // gold-accented trim, echoing goldsmith's 2D accent (220,180,60)
+        sf::Color plantBoxColor(96, 68, 40);
+        sf::Color tableColor(110, 78, 46);
+
+        constexpr float kStoneUv = 20.f, kShingleUv = 15.f;
+
+        Vec3 basePos(b.position.x, 0.f, b.position.y);
+        float southZ = basePos.z + b.size.y + 1.5f;
+
+        float wallH2 = wallH * 0.72f;
+        float foundationH = wallH2 * 0.18f;
+        float upperH = wallH2 - foundationH;
+        float wallTop = wallH2;
+        float smithRoofRise = roofRise * 0.6f;
+
+        // ---- Enclosed cabin (west ~38%) -- same recipe Bakery/Preserve
+        // already established. ----
+        float enclosedW = b.size.x * 0.38f;
+        addBandedBox(out, viewProj, windowSize, eye, basePos, Vec3(enclosedW, foundationH, b.size.y), stone, lc, &stoneTex, kStoneUv);
+        addBandedBox(out, viewProj, windowSize, eye, Vec3(basePos.x, foundationH, basePos.z), Vec3(enclosedW, upperH, b.size.y), plankWall, lc, &shingleTex, kShingleUv);
+        addGableRoof(out, viewProj, windowSize, eye, basePos, Vec3(enclosedW, wallTop, b.size.y), wallTop, smithRoofRise, roofColor, lc, &shingleTex, kShingleUv);
+
+        float doorW = enclosedW * 0.22f, doorH = foundationH + upperH * 0.55f;
+        Vec3 doorPos(basePos.x + enclosedW * 0.5f - doorW * 0.5f, 0.f, southZ);
+        addBox(out, viewProj, windowSize, eye, doorPos, Vec3(doorW, doorH, 3.f), beamColor, lc);
+        addBox(out, viewProj, windowSize, eye, Vec3(doorPos.x + doorW * 0.5f - 1.f, 0.f, southZ - 0.5f), Vec3(2.f, doorH, 2.f), shade3d(beamColor, -10), lc);
+
+        float winSize = enclosedW * 0.16f;
+        Vec3 winPos(basePos.x + enclosedW * 0.16f, foundationH + upperH * 0.4f, southZ);
+        addBox(out, viewProj, windowSize, eye, winPos, Vec3(winSize, winSize, 3.f), windowColor, lc);
+        addGlowBillboard(out, viewProj, windowSize, billboardRight, Vec3(winPos.x + winSize * 0.5f, winPos.y + winSize * 0.5f, southZ), winSize * 1.5f, glowTex, sf::Color(255, 214, 140, 130));
+        Vec3 boxPos(winPos.x - 2.f, winPos.y - 8.f, southZ - 3.f);
+        addBandedBox(out, viewProj, windowSize, eye, boxPos, Vec3(winSize + 4.f, 6.f, 6.f), plantBoxColor, lc, nullptr, 40.f, true);
+        addBillboard(out, viewProj, windowSize, billboardRight, Vec3(boxPos.x + (winSize + 4.f) * 0.5f, winPos.y - 2.f, southZ), winSize * 0.9f, 14.f, flowerTex, sf::Color::White);
+
+        float signW = enclosedW * 0.62f, signH = 16.f;
+        Vec3 signPos(basePos.x + enclosedW * 0.5f - signW * 0.5f, wallTop + smithRoofRise * 0.35f, southZ - 2.f);
+        addBandedBox(out, viewProj, windowSize, eye, signPos, Vec3(signW, signH, 3.f), signColor, lc, nullptr, 40.f, true);
+
+        Vec3 chimneyPos(basePos.x + enclosedW * 0.78f, wallTop * 0.3f, basePos.z + b.size.y * 0.5f);
+        addBox(out, viewProj, windowSize, eye, chimneyPos, Vec3(11.f, wallTop * 0.75f, 11.f), sf::Color(96, 90, 86), lc);
+        addGlowBillboard(out, viewProj, windowSize, billboardRight, chimneyPos + Vec3(5.5f, wallTop * 0.75f + 12.f, 5.5f), 16.f, glowTex, sf::Color(210, 210, 214, 90));
+
+        // ---- Forge annex (east of the cabin) -- same narrow stone
+        // lean-to shape as Preserve's press annex, but this one actually
+        // has fire in it: an anvil block, a real firebox glow instead of a
+        // cold interior, and a bellows-shaped box beside it. ----
+        float annexX0 = basePos.x + enclosedW;
+        float annexW = 18.f, annexD = 40.f;
+        float annexZ0 = basePos.z + (b.size.y - annexD);
+        float annexWallH = wallTop * 0.65f;
+        sf::Color annexStone = shade3d(stone, -6);
+        addBandedBox(out, viewProj, windowSize, eye, Vec3(annexX0, 0.f, annexZ0), Vec3(annexW, annexWallH, annexD), annexStone, lc, &stoneTex, kStoneUv);
+        addBox(out, viewProj, windowSize, eye, Vec3(annexX0, annexWallH, annexZ0), Vec3(annexW, 3.f, annexD), shade3d(roofColor, -14), lc);
+
+        float annexArchCenterX = annexX0 + annexW * 0.5f, annexArchZ = annexZ0 + annexD + 0.5f;
+        addBillboard(out, viewProj, windowSize, billboardRight, Vec3(annexArchCenterX - 6.f, 0.f, annexArchZ), 12.f, 18.f, archTex, sf::Color(50, 40, 36));
+        addGlowBillboard(out, viewProj, windowSize, billboardRight, Vec3(annexArchCenterX, 6.f, annexArchZ), 14.f, glowTex, sf::Color(255, 140, 50, 190));
+
+        sf::Color anvilColor(58, 56, 58);
+        Vec3 anvilPos(annexX0 + annexW * 0.5f - 5.f, 0.f, annexZ0 + annexD - 16.f);
+        addBox(out, viewProj, windowSize, eye, anvilPos, Vec3(4.f, 8.f, 4.f), shade3d(anvilColor, -10), lc);
+        addBox(out, viewProj, windowSize, eye, anvilPos + Vec3(-3.f, 8.f, -1.f), Vec3(10.f, 3.f, 6.f), anvilColor, lc);
+
+        sf::Color bellowsColor(120, 78, 46);
+        Vec3 bellowsPos(annexX0 + annexW * 0.5f - 4.f, 0.f, annexZ0 + 6.f);
+        addBox(out, viewProj, windowSize, eye, bellowsPos, Vec3(8.f, 6.f, 10.f), bellowsColor, lc);
+        addBox(out, viewProj, windowSize, eye, bellowsPos + Vec3(1.f, 6.f, 1.f), Vec3(6.f, 4.f, 8.f), shade3d(bellowsColor, 14), lc);
+
+        // ---- Display counter (east of the annex) -- a wood counter
+        // topped with a glass-look case (a pale translucent-tinted box),
+        // stacked gold bars, and a gem tray, flanked by 2 lantern posts
+        // (the same "2 lanterns beside a shop counter" convention Farm's
+        // own yard already uses). ----
+        float counterX0 = annexX0 + annexW;
+        float counterAreaW = b.size.x - enclosedW - annexW;
+        float counterW = std::min(counterAreaW * 0.7f, 70.f), counterD = b.size.y * 0.4f;
+        Vec3 counterPos(counterX0 + (counterAreaW - counterW) * 0.5f, 0.f, basePos.z + (b.size.y - counterD) * 0.5f);
+        addBandedBox(out, viewProj, windowSize, eye, counterPos, Vec3(counterW, 14.f, counterD), tableColor, lc, nullptr, 40.f, true);
+        addBox(out, viewProj, windowSize, eye, counterPos + Vec3(2.f, 14.f, 2.f), Vec3(counterW - 4.f, 6.f, counterD - 4.f), sf::Color(190, 214, 224, 200), lc);
+        addBillboard(out, viewProj, windowSize, billboardRight, Vec3(counterPos.x + counterW * 0.28f, 20.f, counterPos.z + counterD * 0.5f), 20.f, 12.f, goldBarTex, sf::Color::White);
+        addBillboard(out, viewProj, windowSize, billboardRight, Vec3(counterPos.x + counterW * 0.72f, 20.f, counterPos.z + counterD * 0.5f), 20.f, 12.f, gemTrayTex, sf::Color::White);
+        for (float lx : { -6.f, 6.f }) {
+            Vec3 lanternPos(counterPos.x + counterW * 0.5f + lx, 0.f, counterPos.z - 10.f);
+            addBox(out, viewProj, windowSize, eye, lanternPos, Vec3(3.f, 24.f, 3.f), beamColor, lc);
+            addGlowBillboard(out, viewProj, windowSize, billboardRight, lanternPos + Vec3(1.5f, 28.f, 1.5f), 16.f, glowTex, sf::Color(255, 200, 120, 160));
+        }
+
+        // ---- Nugget-loaded wheelbarrow, south of the cabin -- ties back
+        // to Gold Mine's own ore cart visually (`goldOreTex` reused
+        // outright), same crude cart-body-plus-wheel convention every
+        // barrow in this file already uses. ----
+        sf::Color cartColor(118, 86, 52), wheelColor(60, 44, 28);
+        Vec3 cartPos(basePos.x + 10.f, 0.f, southZ + 4.f);
+        addBox(out, viewProj, windowSize, eye, cartPos, Vec3(16.f, 8.f, 10.f), cartColor, lc);
+        addBox(out, viewProj, windowSize, eye, cartPos + Vec3(6.f, -4.f, 4.f), Vec3(4.f, 4.f, 4.f), wheelColor, lc);
+        addBillboard(out, viewProj, windowSize, billboardRight, cartPos + Vec3(8.f, 8.f, 5.f), 18.f, 12.f, goldOreTex, sf::Color::White);
+    }
+
+    // ---- Zone 2 (Mining District) batch, 2026-08-11 ("有的话就试看每一
+    // 间你自己设计" -- go ahead and design the rest yourself): the 5
+    // remaining Mining District businesses, using the shared
+    // `addWorkshopCabin` helper above instead of each hand-copying the
+    // cabin recipe again. The 2D world already sorts every non-Town-
+    // Square tier-2/3 processor into 8 themed archetype families
+    // (isOvenId/isForgeId/isSawmillId/isFiberId/isMasonGemId/isBreweryId/
+    // isStallId/isSmokehouseId, see their own comments near the top of
+    // GameWorld.cpp) -- these 5 mirror that same grouping instead of
+    // inventing fresh themes per building: Smelter/Blacksmith are Forge
+    // family (fire + metal, like Goldsmith), Carpenter is Sawmill family
+    // (timber), Tailor is Fiber family (cloth, like Textile), Gemshop is
+    // MasonGem family (stone/gems, like Mason). ----
+
+    // Smelter -- Forge family, tier-2 ore->ingot processor. Un-widened
+    // (110x80, see buildZones()'s own comment on column 2's path-spine
+    // clearance) -- the furnace annex fills the lot's entire remaining
+    // east span instead of leaving a side margin, same convention Sawmill/
+    // Mason/Textile used before any of them got widened. Bigger/louder
+    // than Goldsmith's own forge annex (a full-depth furnace + its own
+    // smokestack, not a lean-to) since smelting ore is the loud industrial
+    // step, not a finishing one.
+    void addSmelterBuilding(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
+        const WorldBuilding& b, const LightingContext& lc, float wallH, float roofRise, Vec3 billboardRight, const sf::Texture& glowTex,
+        const sf::Texture& stoneTex, const sf::Texture& shingleTex, const sf::Texture& flowerTex,
+        const sf::Texture& archTex, const sf::Texture& ironBarTex) {
+        sf::Color plankWall(112, 98, 92), roofColor(80, 60, 54), signColor(178, 96, 44); // smelter's own 2D accent (230,110,40), muted for a sign board
+        auto cab = addWorkshopCabin(out, viewProj, windowSize, eye, b, lc, wallH, roofRise, billboardRight, glowTex, stoneTex, shingleTex, flowerTex, plankWall, roofColor, signColor);
+        Vec3 basePos(b.position.x, 0.f, b.position.y);
+        sf::Color annexStone = shade3d(sf::Color(118, 114, 108), -6);
+
+        float annexX0 = basePos.x + cab.enclosedW;
+        float annexW = b.size.x - cab.enclosedW;
+        float annexWallH = cab.wallTop * 0.85f;
+        addBandedBox(out, viewProj, windowSize, eye, Vec3(annexX0, 0.f, basePos.z), Vec3(annexW, annexWallH, b.size.y), annexStone, lc, &stoneTex, 20.f);
+        addBox(out, viewProj, windowSize, eye, Vec3(annexX0, annexWallH, basePos.z), Vec3(annexW, 3.f, b.size.y), shade3d(roofColor, -14), lc);
+        float archCenterX = annexX0 + annexW * 0.5f, archZ = basePos.z + b.size.y + 0.5f;
+        addBillboard(out, viewProj, windowSize, billboardRight, Vec3(archCenterX - 8.f, 0.f, archZ), 16.f, 22.f, archTex, sf::Color(40, 30, 26));
+        addGlowBillboard(out, viewProj, windowSize, billboardRight, Vec3(archCenterX, 8.f, archZ), 22.f, glowTex, sf::Color(255, 120, 40, 220));
+        Vec3 stackPos(annexX0 + annexW * 0.5f - 7.f, annexWallH, basePos.z + 8.f);
+        addBox(out, viewProj, windowSize, eye, stackPos, Vec3(14.f, cab.wallTop * 0.9f, 14.f), shade3d(annexStone, -14), lc);
+        addGlowBillboard(out, viewProj, windowSize, billboardRight, stackPos + Vec3(7.f, cab.wallTop * 0.9f + 14.f, 7.f), 20.f, glowTex, sf::Color(150, 150, 154, 140));
+
+        // ---- Iron ingot stack + a raw-ore pile, south yard. ----
+        Vec3 ingotPos(basePos.x + 8.f, 0.f, cab.southZ + 4.f);
+        addBandedBox(out, viewProj, windowSize, eye, ingotPos, Vec3(20.f, 8.f, 14.f), sf::Color(150, 108, 62), lc, nullptr, 40.f, true);
+        addBillboard(out, viewProj, windowSize, billboardRight, ingotPos + Vec3(10.f, 8.f, 7.f), 18.f, 10.f, ironBarTex, sf::Color::White);
+
+        sf::Color rockColor(120, 112, 100);
+        Vec3 pilePos(annexX0 + 6.f, 0.f, cab.southZ + 6.f);
+        for (const auto& off : { sf::Vector2f(0.f, 0.f), sf::Vector2f(7.f, 3.f), sf::Vector2f(2.f, 6.f) }) {
+            addBox(out, viewProj, windowSize, eye, pilePos + Vec3(off.x, 0.f, off.y), Vec3(9.f, 7.f, 9.f), rockColor, lc);
+        }
+    }
+
+    // Blacksmith -- Forge family, tier-3 tools/weapons processor.
+    // Widened to 190x80 (column 1 has room, see buildZones()). The forge
+    // annex itself is near-verbatim Goldsmith's own (a blacksmith's and a
+    // goldsmith's forge are the same basic shape) -- what tells them apart
+    // is the outdoor apparatus: a weapon rack + water-quench barrel here
+    // instead of a jewelry display counter.
+    void addBlacksmithBuilding(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
+        const WorldBuilding& b, const LightingContext& lc, float wallH, float roofRise, Vec3 billboardRight, const sf::Texture& glowTex,
+        const sf::Texture& stoneTex, const sf::Texture& shingleTex, const sf::Texture& flowerTex,
+        const sf::Texture& archTex, const sf::Texture& weaponRackTex) {
+        sf::Color plankWall(96, 92, 96), roofColor(64, 62, 68), signColor(90, 90, 100); // blacksmith's own 2D accent (80,80,90), a cool steel palette
+        auto cab = addWorkshopCabin(out, viewProj, windowSize, eye, b, lc, wallH, roofRise, billboardRight, glowTex, stoneTex, shingleTex, flowerTex, plankWall, roofColor, signColor);
+        Vec3 basePos(b.position.x, 0.f, b.position.y);
+        sf::Color annexStone = shade3d(sf::Color(118, 114, 108), -6);
+
+        float annexX0 = basePos.x + cab.enclosedW;
+        float annexW = 18.f, annexD = 40.f;
+        float annexZ0 = basePos.z + (b.size.y - annexD);
+        float annexWallH = cab.wallTop * 0.65f;
+        addBandedBox(out, viewProj, windowSize, eye, Vec3(annexX0, 0.f, annexZ0), Vec3(annexW, annexWallH, annexD), annexStone, lc, &stoneTex, 20.f);
+        addBox(out, viewProj, windowSize, eye, Vec3(annexX0, annexWallH, annexZ0), Vec3(annexW, 3.f, annexD), shade3d(roofColor, -14), lc);
+        float archCenterX = annexX0 + annexW * 0.5f, archZ = annexZ0 + annexD + 0.5f;
+        addBillboard(out, viewProj, windowSize, billboardRight, Vec3(archCenterX - 6.f, 0.f, archZ), 12.f, 18.f, archTex, sf::Color(50, 40, 36));
+        addGlowBillboard(out, viewProj, windowSize, billboardRight, Vec3(archCenterX, 6.f, archZ), 14.f, glowTex, sf::Color(255, 140, 50, 190));
+
+        sf::Color anvilColor(58, 56, 58);
+        Vec3 anvilPos(annexX0 + annexW * 0.5f - 5.f, 0.f, annexZ0 + annexD - 16.f);
+        addBox(out, viewProj, windowSize, eye, anvilPos, Vec3(4.f, 8.f, 4.f), shade3d(anvilColor, -10), lc);
+        addBox(out, viewProj, windowSize, eye, anvilPos + Vec3(-3.f, 8.f, -1.f), Vec3(10.f, 3.f, 6.f), anvilColor, lc);
+
+        sf::Color bellowsColor(120, 78, 46);
+        Vec3 bellowsPos(annexX0 + annexW * 0.5f - 4.f, 0.f, annexZ0 + 6.f);
+        addBox(out, viewProj, windowSize, eye, bellowsPos, Vec3(8.f, 6.f, 10.f), bellowsColor, lc);
+        addBox(out, viewProj, windowSize, eye, bellowsPos + Vec3(1.f, 6.f, 1.f), Vec3(6.f, 4.f, 8.f), shade3d(bellowsColor, 14), lc);
+
+        // ---- Weapon rack + water-quench barrel, east of the annex. ----
+        float rackX0 = annexX0 + annexW + 10.f;
+        Vec3 rackPos(rackX0, 0.f, basePos.z + b.size.y * 0.35f);
+        addBox(out, viewProj, windowSize, eye, rackPos, Vec3(3.f, 26.f, 3.f), sf::Color(90, 62, 34), lc);
+        addBox(out, viewProj, windowSize, eye, rackPos + Vec3(-9.f, 20.f, -1.f), Vec3(21.f, 3.f, 2.f), sf::Color(90, 62, 34), lc);
+        addBillboard(out, viewProj, windowSize, billboardRight, rackPos + Vec3(-9.f, 8.f, 0.f), 22.f, 20.f, weaponRackTex, sf::Color::White);
+
+        sf::Color barrelColor(90, 100, 108);
+        Vec3 barrelPos(rackX0 + 4.f, 0.f, cab.southZ + 6.f);
+        addBox(out, viewProj, windowSize, eye, barrelPos, Vec3(12.f, 16.f, 12.f), barrelColor, lc);
+        addBox(out, viewProj, windowSize, eye, barrelPos + Vec3(-0.8f, 14.f, -0.8f), Vec3(13.6f, 2.f, 13.6f), shade3d(barrelColor, 20), lc);
+        addGlowBillboard(out, viewProj, windowSize, billboardRight, barrelPos + Vec3(6.f, 16.f, 6.f), 12.f, glowTex, sf::Color(150, 190, 210, 90));
+    }
+
+    // Gemshop -- MasonGem family, tier-2 cut-gem processor. Widened to
+    // 170x80 (column 3 has plenty of room, see buildZones()). A boutique
+    // display counter (Goldsmith's own "wood counter + tinted glass case"
+    // recipe) plus a stone cutting wheel and a raw-rock pile -- no forge,
+    // cutting gems doesn't need fire.
+    void addGemshopBuilding(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
+        const WorldBuilding& b, const LightingContext& lc, float wallH, float roofRise, Vec3 billboardRight, const sf::Texture& glowTex,
+        const sf::Texture& stoneTex, const sf::Texture& shingleTex, const sf::Texture& flowerTex,
+        const sf::Texture& gemTrayTex, const sf::Texture& grindWheelTex) {
+        sf::Color plankWall(140, 150, 156), roofColor(70, 92, 100), signColor(90, 170, 180); // gemshop's own 2D accent (110,210,220), a cool teal palette
+        auto cab = addWorkshopCabin(out, viewProj, windowSize, eye, b, lc, wallH, roofRise, billboardRight, glowTex, stoneTex, shingleTex, flowerTex, plankWall, roofColor, signColor, 0.42f);
+        Vec3 basePos(b.position.x, 0.f, b.position.y);
+
+        float counterX0 = basePos.x + cab.enclosedW + 6.f;
+        float counterAreaW = b.size.x - cab.enclosedW - 6.f;
+        float counterW = std::min(counterAreaW * 0.6f, 70.f), counterD = b.size.y * 0.4f;
+        Vec3 counterPos(counterX0, 0.f, basePos.z + (b.size.y - counterD) * 0.5f);
+        addBandedBox(out, viewProj, windowSize, eye, counterPos, Vec3(counterW, 14.f, counterD), sf::Color(110, 78, 46), lc, nullptr, 40.f, true);
+        addBox(out, viewProj, windowSize, eye, counterPos + Vec3(2.f, 14.f, 2.f), Vec3(counterW - 4.f, 6.f, counterD - 4.f), sf::Color(190, 214, 224, 200), lc);
+        addBillboard(out, viewProj, windowSize, billboardRight, Vec3(counterPos.x + counterW * 0.5f, 20.f, counterPos.z + counterD * 0.5f), 24.f, 14.f, gemTrayTex, sf::Color::White);
+
+        Vec3 wheelPos(counterX0 + counterW + 14.f, 14.f, counterPos.z + counterD * 0.5f);
+        addBox(out, viewProj, windowSize, eye, Vec3(wheelPos.x - 2.f, 0.f, wheelPos.z - 2.f), Vec3(4.f, 14.f, 4.f), sf::Color(94, 62, 32), lc);
+        addBillboard(out, viewProj, windowSize, billboardRight, wheelPos, 18.f, 18.f, grindWheelTex, sf::Color::White);
+
+        sf::Color rockColor(120, 112, 100);
+        Vec3 pilePos(counterX0 + 4.f, 0.f, cab.southZ + 4.f);
+        for (const auto& off : { sf::Vector2f(0.f, 0.f), sf::Vector2f(7.f, 3.f) }) {
+            addBox(out, viewProj, windowSize, eye, pilePos + Vec3(off.x, 0.f, off.y), Vec3(8.f, 6.f, 8.f), rockColor, lc);
+        }
+    }
+
+    // Carpenter -- Sawmill family, tier-3 furniture processor. Un-widened
+    // (110x80, same column-2 path-spine constraint as Smelter) -- an open
+    // workshop bay (posts + roof slab, no walls, the same open-bay
+    // convention Sawmill's own saw bay established) fills the lot's
+    // remaining east span, holding a workbench.
+    void addCarpenterBuilding(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
+        const WorldBuilding& b, const LightingContext& lc, float wallH, float roofRise, Vec3 billboardRight, const sf::Texture& glowTex,
+        const sf::Texture& stoneTex, const sf::Texture& shingleTex, const sf::Texture& flowerTex,
+        const sf::Texture& furnitureTex) {
+        sf::Color plankWall(150, 116, 72), roofColor(96, 66, 40), signColor(160, 116, 66); // carpenter's own 2D accent (170,120,70)
+        auto cab = addWorkshopCabin(out, viewProj, windowSize, eye, b, lc, wallH, roofRise, billboardRight, glowTex, stoneTex, shingleTex, flowerTex, plankWall, roofColor, signColor);
+        Vec3 basePos(b.position.x, 0.f, b.position.y);
+
+        float bayX0 = basePos.x + cab.enclosedW;
+        float bayW = b.size.x - cab.enclosedW;
+        float bayH = cab.wallTop * 0.75f;
+        sf::Color postColor(90, 62, 34);
+        for (float px : { bayX0 + 4.f, bayX0 + bayW - 4.f }) {
+            for (float pz : { basePos.z + 4.f, basePos.z + b.size.y - 4.f }) {
+                addBox(out, viewProj, windowSize, eye, Vec3(px, 0.f, pz), Vec3(4.f, bayH, 4.f), postColor, lc);
+            }
+        }
+        addBox(out, viewProj, windowSize, eye, Vec3(bayX0, bayH, basePos.z), Vec3(bayW, 3.f, b.size.y), shade3d(roofColor, -10), lc);
+
+        sf::Color benchColor(120, 86, 50);
+        Vec3 benchPos(bayX0 + bayW * 0.5f - 16.f, 0.f, basePos.z + b.size.y * 0.5f - 7.f);
+        addBandedBox(out, viewProj, windowSize, eye, benchPos, Vec3(32.f, 12.f, 14.f), benchColor, lc, nullptr, 40.f, true);
+        addBillboard(out, viewProj, windowSize, billboardRight, benchPos + Vec3(16.f, 12.f, 7.f), 22.f, 14.f, furnitureTex, sf::Color::White);
+
+        // ---- Plank stack + sawdust pile, south yard. ----
+        sf::Color plankStackColor(180, 148, 96);
+        Vec3 stackPos(basePos.x + 10.f, 0.f, cab.southZ + 4.f);
+        for (int i = 0; i < 4; ++i) {
+            addBox(out, viewProj, windowSize, eye, stackPos + Vec3(0.f, static_cast<float>(i) * 3.f, 0.f), Vec3(26.f, 2.5f, 10.f), i % 2 == 0 ? plankStackColor : shade3d(plankStackColor, -14), lc);
+        }
+        sf::Color sawdustColor(214, 190, 140);
+        Vec3 dustPos(bayX0 + 6.f, 0.f, cab.southZ + 2.f);
+        addBox(out, viewProj, windowSize, eye, dustPos, Vec3(14.f, 3.f, 14.f), sawdustColor, lc);
+    }
+
+    // Tailor -- Fiber family, tier-3 fine-clothing processor. Widened to
+    // 170x80 (column 3, same room as Gemshop). No 2nd walled volume --
+    // unlike the fire-needing Forge-family annexes, a tailor's own
+    // workspace doesn't need one -- just a dress form on a small platform
+    // flanked by fabric bolts (`yarnTex` reused outright from Textile
+    // Mill, a bolt display isn't different enough from spooled yarn to
+    // earn its own decal).
+    void addTailorBuilding(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
+        const WorldBuilding& b, const LightingContext& lc, float wallH, float roofRise, Vec3 billboardRight, const sf::Texture& glowTex,
+        const sf::Texture& stoneTex, const sf::Texture& shingleTex, const sf::Texture& flowerTex,
+        const sf::Texture& dressFormTex, const sf::Texture& yarnTex) {
+        sf::Color plankWall(150, 128, 140), roofColor(92, 66, 78), signColor(190, 140, 170); // tailor's own 2D accent (190,140,170)
+        auto cab = addWorkshopCabin(out, viewProj, windowSize, eye, b, lc, wallH, roofRise, billboardRight, glowTex, stoneTex, shingleTex, flowerTex, plankWall, roofColor, signColor, 0.42f);
+        Vec3 basePos(b.position.x, 0.f, b.position.y);
+
+        float dispX0 = basePos.x + cab.enclosedW + 10.f;
+        float dispAreaW = b.size.x - cab.enclosedW - 10.f;
+        Vec3 platformPos(dispX0 + dispAreaW * 0.3f, 0.f, basePos.z + b.size.y * 0.3f);
+        addBandedBox(out, viewProj, windowSize, eye, platformPos - Vec3(10.f, 0.f, 10.f), Vec3(20.f, 4.f, 20.f), sf::Color(110, 78, 46), lc, nullptr, 40.f, true);
+        addBillboard(out, viewProj, windowSize, billboardRight, platformPos + Vec3(0.f, 4.f, 0.f), 20.f, 34.f, dressFormTex, sf::Color::White);
+
+        for (float fx : { -1.f, 1.f }) {
+            Vec3 rollPos(dispX0 + dispAreaW * 0.5f + fx * 22.f, 0.f, basePos.z + b.size.y * 0.62f);
+            addBox(out, viewProj, windowSize, eye, rollPos, Vec3(8.f, 16.f, 8.f), sf::Color(70, 60, 66), lc);
+            addBillboard(out, viewProj, windowSize, billboardRight, rollPos + Vec3(4.f, 16.f, 4.f), 14.f, 10.f, yarnTex, sf::Color::White);
+        }
+
+        // A folded-fabric stack, south yard.
+        Vec3 foldPos(basePos.x + 10.f, 0.f, cab.southZ + 4.f);
+        const sf::Color foldColors[] = { sf::Color(150, 90, 110), sf::Color(90, 110, 150), sf::Color(180, 160, 90) };
+        for (int i = 0; i < 3; ++i) {
+            addBox(out, viewProj, windowSize, eye, foldPos + Vec3(0.f, static_cast<float>(i) * 3.5f, 0.f), Vec3(18.f, 3.f, 12.f), foldColors[i], lc);
+        }
+    }
+
+    // ---- Zone 3 (Valley District) finishing batch, 2026-08-11 ("其他的
+    //你可以开始设计了" -- go ahead and design the rest): Apothecary/
+    // Alchemist/Winery are Brewery family (isBreweryId in GameWorld.cpp --
+    // liquids simmered/fermented/distilled into something bottled), Jeweler
+    // is MasonGem family (like Mason/Gemshop). All 4 use the shared
+    // `addWorkshopCabin` helper. ----
+
+    // Apothecary -- Brewery family, tier-2 herbal-tincture processor.
+    // Widened to 170x80. Annex holds a simmering herbal brew (green glow,
+    // not fire-orange) and a hanging dried-herb bundle (`herbTuftTex`
+    // reused, tinted brown); outdoor a mortar-and-pestle and a
+    // green-tinted bottle rack.
+    void addApothecaryBuilding(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
+        const WorldBuilding& b, const LightingContext& lc, float wallH, float roofRise, Vec3 billboardRight, const sf::Texture& glowTex,
+        const sf::Texture& stoneTex, const sf::Texture& shingleTex, const sf::Texture& flowerTex,
+        const sf::Texture& archTex, const sf::Texture& herbTuftTex, const sf::Texture& bottleRackTex) {
+        sf::Color plankWall(122, 140, 108), roofColor(72, 90, 66), signColor(96, 138, 82); // apothecary's own 2D accent (110,160,90)
+        auto cab = addWorkshopCabin(out, viewProj, windowSize, eye, b, lc, wallH, roofRise, billboardRight, glowTex, stoneTex, shingleTex, flowerTex, plankWall, roofColor, signColor);
+        Vec3 basePos(b.position.x, 0.f, b.position.y);
+        sf::Color annexStone = shade3d(sf::Color(118, 114, 108), -6);
+
+        float annexX0 = basePos.x + cab.enclosedW;
+        float annexW = 20.f, annexD = 42.f;
+        float annexZ0 = basePos.z + (b.size.y - annexD);
+        float annexWallH = cab.wallTop * 0.68f;
+        addBandedBox(out, viewProj, windowSize, eye, Vec3(annexX0, 0.f, annexZ0), Vec3(annexW, annexWallH, annexD), annexStone, lc, &stoneTex, 20.f);
+        addBox(out, viewProj, windowSize, eye, Vec3(annexX0, annexWallH, annexZ0), Vec3(annexW, 3.f, annexD), shade3d(roofColor, -14), lc);
+        float archCenterX = annexX0 + annexW * 0.5f, archZ = annexZ0 + annexD + 0.5f;
+        addBillboard(out, viewProj, windowSize, billboardRight, Vec3(archCenterX - 6.f, 0.f, archZ), 12.f, 18.f, archTex, sf::Color(40, 50, 40));
+        addGlowBillboard(out, viewProj, windowSize, billboardRight, Vec3(archCenterX, 8.f, archZ), 16.f, glowTex, sf::Color(120, 220, 130, 190));
+
+        // A dried-herb bundle, hanging under the annex's own eave.
+        addBillboard(out, viewProj, windowSize, billboardRight, Vec3(annexX0 + 4.f, annexWallH - 4.f, annexZ0 + 6.f), 14.f, 16.f, herbTuftTex, sf::Color(150, 120, 70));
+
+        // A mortar-and-pestle, south yard.
+        sf::Color mortarColor(150, 148, 140);
+        Vec3 mortarPos(basePos.x + 8.f, 0.f, cab.southZ + 4.f);
+        addBox(out, viewProj, windowSize, eye, mortarPos, Vec3(10.f, 6.f, 10.f), mortarColor, lc);
+        addBox(out, viewProj, windowSize, eye, mortarPos + Vec3(6.f, 5.f, 3.f), Vec3(2.5f, 8.f, 2.5f), shade3d(mortarColor, -16), lc);
+
+        // Green-tinted bottle rack, east of the mortar.
+        Vec3 rackPos(mortarPos.x + 18.f, 0.f, cab.southZ + 2.f);
+        addBandedBox(out, viewProj, windowSize, eye, rackPos, Vec3(20.f, 4.f, 10.f), sf::Color(110, 78, 46), lc, nullptr, 40.f, true);
+        addBillboard(out, viewProj, windowSize, billboardRight, rackPos + Vec3(10.f, 4.f, 5.f), 18.f, 14.f, bottleRackTex, sf::Color(150, 200, 130));
+    }
+
+    // Alchemist -- Brewery family, tier-3 potion processor. Un-widened
+    // (only 60 units clear to the zone's own east tree wall) -- annex
+    // fills the lot's remaining east span, same convention Smelter/
+    // Carpenter used in Zone 2.
+    //
+    // 2026-08-11 follow-up ("这个酒庄可以把右边的墙打掉让可以看到里面大
+    // 小姐...炼金坊同理" -- knock the annex's own wall down so the inside
+    // is actually visible, same for Alchemist): the annex was a fully
+    // enclosed `addBandedBox` with just a flat archway BILLBOARD glued to
+    // its south face standing in for an opening -- the wall behind that
+    // decal was still a solid opaque box, so the alembic/press/barrels
+    // "inside" were sitting in near-total shadow of their own walls,
+    // barely readable. Switched to the same open post-and-roof-slab bay
+    // Carpenter's own workshop already uses (no wall boxes at all) --
+    // genuinely open on every side instead of one fake doorway.
+    void addAlchemistBuilding(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
+        const WorldBuilding& b, const LightingContext& lc, float wallH, float roofRise, Vec3 billboardRight, const sf::Texture& glowTex,
+        const sf::Texture& stoneTex, const sf::Texture& shingleTex, const sf::Texture& flowerTex,
+        const sf::Texture& bottleRackTex) {
+        sf::Color plankWall(112, 98, 130), roofColor(64, 54, 90), signColor(132, 88, 186); // alchemist's own 2D accent (140,90,190)
+        auto cab = addWorkshopCabin(out, viewProj, windowSize, eye, b, lc, wallH, roofRise, billboardRight, glowTex, stoneTex, shingleTex, flowerTex, plankWall, roofColor, signColor);
+        Vec3 basePos(b.position.x, 0.f, b.position.y);
+
+        float bayX0 = basePos.x + cab.enclosedW;
+        float bayW = b.size.x - cab.enclosedW;
+        float bayH = cab.wallTop * 0.7f;
+        sf::Color postColor(90, 62, 34);
+        for (float px : { bayX0 + 4.f, bayX0 + bayW - 4.f }) {
+            for (float pz : { basePos.z + 4.f, basePos.z + b.size.y - 4.f }) {
+                addBox(out, viewProj, windowSize, eye, Vec3(px, 0.f, pz), Vec3(4.f, bayH, 4.f), postColor, lc);
+            }
+        }
+        addBox(out, viewProj, windowSize, eye, Vec3(bayX0, bayH, basePos.z), Vec3(bayW, 3.f, b.size.y), shade3d(roofColor, -14), lc);
+
+        // The alembic (2 stacked tinted glass-look boxes, the same "fake a
+        // curved vessel with flat shapes" trick this file leans on
+        // everywhere) bubbling with a magical glow instead of fire.
+        sf::Color glassColor(150, 190, 210, 190);
+        Vec3 flaskPos(bayX0 + bayW * 0.5f - 5.f, 0.f, basePos.z + b.size.y * 0.5f);
+        addBox(out, viewProj, windowSize, eye, flaskPos, Vec3(10.f, 14.f, 10.f), glassColor, lc);
+        addBox(out, viewProj, windowSize, eye, flaskPos + Vec3(2.5f, 14.f, 2.5f), Vec3(5.f, 8.f, 5.f), shade3d(glassColor, -20), lc);
+        addGlowBillboard(out, viewProj, windowSize, billboardRight, flaskPos + Vec3(5.f, 20.f, 5.f), 18.f, glowTex, sf::Color(150, 90, 220, 210));
+
+        // A small shelf of spare vials, beside the alembic -- now that the
+        // bay is genuinely open, worth a 2nd prop to fill it.
+        Vec3 shelfPos(bayX0 + 6.f, 0.f, basePos.z + 6.f);
+        addBandedBox(out, viewProj, windowSize, eye, shelfPos, Vec3(16.f, 4.f, 8.f), sf::Color(90, 62, 34), lc, nullptr, 40.f, true);
+        addBillboard(out, viewProj, windowSize, billboardRight, shelfPos + Vec3(8.f, 4.f, 4.f), 14.f, 10.f, bottleRackTex, sf::Color(160, 130, 210));
+
+        // Purple-tinted bottle rack, south yard.
+        Vec3 rackPos(basePos.x + 8.f, 0.f, cab.southZ + 4.f);
+        addBandedBox(out, viewProj, windowSize, eye, rackPos, Vec3(20.f, 4.f, 10.f), sf::Color(110, 78, 46), lc, nullptr, 40.f, true);
+        addBillboard(out, viewProj, windowSize, billboardRight, rackPos + Vec3(10.f, 4.f, 5.f), 18.f, 14.f, bottleRackTex, sf::Color(160, 130, 210));
+    }
+
+    // Winery -- Brewery family, tier-2 wine processor. Un-widened (only 60
+    // units clear to the zone's own east tree wall) -- annex fills the
+    // lot's remaining east span holding a wine press (near-verbatim
+    // Preserve's own screw press over a catch-barrel, wine and jam are
+    // both "crush the fruit" businesses) instead of a cauldron/still.
+    //
+    // 2026-08-11 follow-up ("这个酒庄可以把右边的墙打掉让可以看到里面大
+    // 小姐" -- open the annex wall up): same enclosed-box-plus-fake-arch
+    // problem Alchemist's own comment above describes, same fix -- an
+    // open post-and-roof bay instead of walls, so the press/barrels are
+    // actually visible rather than sitting behind a solid wall with only a
+    // flat archway decal hinting at what's inside.
+    void addWineryBuilding(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
+        const WorldBuilding& b, const LightingContext& lc, float wallH, float roofRise, Vec3 billboardRight, const sf::Texture& glowTex,
+        const sf::Texture& stoneTex, const sf::Texture& shingleTex, const sf::Texture& flowerTex,
+        const sf::Texture& pressWheelTex, const sf::Texture& bottleRackTex) {
+        sf::Color plankWall(150, 108, 104), roofColor(90, 56, 54), signColor(120, 50, 60); // winery's own 2D accent (120,50,60)
+        auto cab = addWorkshopCabin(out, viewProj, windowSize, eye, b, lc, wallH, roofRise, billboardRight, glowTex, stoneTex, shingleTex, flowerTex, plankWall, roofColor, signColor);
+        Vec3 basePos(b.position.x, 0.f, b.position.y);
+
+        float bayX0 = basePos.x + cab.enclosedW;
+        float bayW = b.size.x - cab.enclosedW;
+        float bayH = cab.wallTop * 0.65f;
+        sf::Color postColor(90, 62, 34);
+        for (float px : { bayX0 + 4.f, bayX0 + bayW - 4.f }) {
+            for (float pz : { basePos.z + 4.f, basePos.z + b.size.y - 4.f }) {
+                addBox(out, viewProj, windowSize, eye, Vec3(px, 0.f, pz), Vec3(4.f, bayH, 4.f), postColor, lc);
+            }
+        }
+        addBox(out, viewProj, windowSize, eye, Vec3(bayX0, bayH, basePos.z), Vec3(bayW, 3.f, b.size.y), shade3d(roofColor, -14), lc);
+
+        // ---- Wine press, bay center -- 2026-08-11 follow-up ("压酒机看
+        // 起来不明显" -- the press doesn't read clearly): it used to be
+        // just a thin 6-wide post topped with a 16-unit wheel, squeezed
+        // between 2 barrels that were each bigger than it -- easy to miss
+        // entirely. Now built around a real press BASKET (a wide banded
+        // box, wood-slat colored, bigger than either barrel) with a plate
+        // on top, so the post+wheel reads as sitting on top of an actual
+        // press mechanism instead of floating alone, and the wheel itself
+        // is bigger (22, was 16). ----
+        sf::Color basketColor(150, 112, 68), pressPostColor(94, 62, 32);
+        Vec3 basketPos(bayX0 + bayW * 0.5f - 9.f, 0.f, basePos.z + b.size.y * 0.55f);
+        addBandedBox(out, viewProj, windowSize, eye, basketPos, Vec3(18.f, 12.f, 18.f), basketColor, lc, nullptr, 40.f, true);
+        addBox(out, viewProj, windowSize, eye, basketPos + Vec3(-1.f, 12.f, -1.f), Vec3(20.f, 2.f, 20.f), shade3d(basketColor, -20), lc);
+        Vec3 pressPostPos(basketPos.x + 6.f, 14.f, basketPos.z + 6.f);
+        addBox(out, viewProj, windowSize, eye, pressPostPos, Vec3(6.f, bayH * 0.75f, 6.f), pressPostColor, lc);
+        addBillboard(out, viewProj, windowSize, billboardRight, pressPostPos + Vec3(3.f, bayH * 0.75f, 3.f), 22.f, 22.f, pressWheelTex, sf::Color::White);
+
+        sf::Color barrelColor(120, 86, 50);
+        for (float bx : { -22.f, 22.f }) {
+            Vec3 barrelPos(bayX0 + bayW * 0.5f + bx - 5.f, 0.f, basePos.z + b.size.y * 0.25f);
+            addBox(out, viewProj, windowSize, eye, barrelPos, Vec3(10.f, 14.f, 10.f), barrelColor, lc);
+            addBox(out, viewProj, windowSize, eye, barrelPos + Vec3(-0.6f, 12.f, -0.6f), Vec3(11.2f, 2.f, 11.2f), shade3d(barrelColor, -18), lc);
+        }
+
+        // A crate of empty wine bottles, beside the press -- now that the
+        // bay is genuinely open, worth a 2nd prop to fill it.
+        Vec3 crateBottlesPos(bayX0 + 6.f, 0.f, basePos.z + 6.f);
+        addBandedBox(out, viewProj, windowSize, eye, crateBottlesPos, Vec3(16.f, 4.f, 8.f), sf::Color(90, 62, 34), lc, nullptr, 40.f, true);
+        addBillboard(out, viewProj, windowSize, billboardRight, crateBottlesPos + Vec3(8.f, 4.f, 4.f), 14.f, 10.f, bottleRackTex, sf::Color(170, 70, 80));
+
+        // Dark-red-tinted bottle rack, south yard.
+        Vec3 rackPos(basePos.x + 8.f, 0.f, cab.southZ + 4.f);
+        addBandedBox(out, viewProj, windowSize, eye, rackPos, Vec3(20.f, 4.f, 10.f), sf::Color(110, 78, 46), lc, nullptr, 40.f, true);
+        addBillboard(out, viewProj, windowSize, billboardRight, rackPos + Vec3(10.f, 4.f, 5.f), 18.f, 14.f, bottleRackTex, sf::Color(170, 70, 80));
+    }
+
+    // Jeweler -- MasonGem family, tier-3 finished-jewelry processor.
+    // Widened to 170x80. Gemshop's own counter recipe, plus a small
+    // canopy awning over it (a boutique's own "storefront" read) and
+    // `jewelryTex` instead of loose gems -- a jeweler sells finished
+    // pieces, its raw-gem sibling doesn't.
+    void addJewelerBuilding(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
+        const WorldBuilding& b, const LightingContext& lc, float wallH, float roofRise, Vec3 billboardRight, const sf::Texture& glowTex,
+        const sf::Texture& stoneTex, const sf::Texture& shingleTex, const sf::Texture& flowerTex,
+        const sf::Texture& jewelryTex) {
+        sf::Color plankWall(148, 128, 142), roofColor(90, 66, 96), signColor(200, 130, 168); // jeweler's own 2D accent (220,140,180)
+        auto cab = addWorkshopCabin(out, viewProj, windowSize, eye, b, lc, wallH, roofRise, billboardRight, glowTex, stoneTex, shingleTex, flowerTex, plankWall, roofColor, signColor, 0.42f);
+        Vec3 basePos(b.position.x, 0.f, b.position.y);
+
+        float counterX0 = basePos.x + cab.enclosedW + 6.f;
+        float counterAreaW = b.size.x - cab.enclosedW - 6.f;
+        float counterW = std::min(counterAreaW * 0.7f, 76.f), counterD = b.size.y * 0.42f;
+        Vec3 counterPos(counterX0, 0.f, basePos.z + (b.size.y - counterD) * 0.5f);
+        addBandedBox(out, viewProj, windowSize, eye, counterPos, Vec3(counterW, 14.f, counterD), sf::Color(110, 78, 46), lc, nullptr, 40.f, true);
+        addBox(out, viewProj, windowSize, eye, counterPos + Vec3(2.f, 14.f, 2.f), Vec3(counterW - 4.f, 6.f, counterD - 4.f), sf::Color(220, 200, 220, 200), lc);
+        addBillboard(out, viewProj, windowSize, billboardRight, Vec3(counterPos.x + counterW * 0.5f, 20.f, counterPos.z + counterD * 0.5f), 24.f, 14.f, jewelryTex, sf::Color::White);
+
+        // A small canopy awning over the counter -- 4 thin posts + a flat
+        // slab roof, the reference's own "boutique storefront" read.
+        sf::Color postColor(150, 130, 145), canopyColor(200, 130, 168);
+        float canopyH = 34.f;
+        for (float cx : { counterPos.x + 4.f, counterPos.x + counterW - 4.f }) {
+            for (float cz : { counterPos.z + 4.f, counterPos.z + counterD - 4.f }) {
+                addBox(out, viewProj, windowSize, eye, Vec3(cx, 14.f, cz), Vec3(2.5f, canopyH - 14.f, 2.5f), postColor, lc);
+            }
+        }
+        addBox(out, viewProj, windowSize, eye, counterPos + Vec3(-3.f, canopyH, -3.f), Vec3(counterW + 6.f, 3.f, counterD + 6.f), canopyColor, lc);
+
+        // A small raw-gem pile, south of the counter -- even a finished-
+        // jewelry shop keeps a bit of uncut stock on hand.
+        sf::Color rockColor(120, 112, 100);
+        Vec3 pilePos(counterX0 + 4.f, 0.f, cab.southZ + 4.f);
+        for (const auto& off : { sf::Vector2f(0.f, 0.f), sf::Vector2f(7.f, 3.f) }) {
+            addBox(out, viewProj, windowSize, eye, pilePos + Vec3(off.x, 0.f, off.y), Vec3(8.f, 6.f, 8.f), rockColor, lc);
+        }
+    }
+
+    // ---- Zone 5 (Highlands District) batch, 2026-08-11 ("其他的屋子可以
+    // 继续进行了" -- carry on with the rest): Creamery/Meadery are Brewery
+    // family (like Winery/Alchemist), Tannery/Linen Mill are Fiber family
+    // (like Textile/Tailor). All 4 use the open post-and-roof bay
+    // (`addWorkshopCabin` + posts/roof-slab, no wall boxes) up front this
+    // time -- Winery/Alchemist's own "enclosed box + fake archway billboard
+    // hid everything inside" mistake is now a known lesson, not something
+    // to re-learn per building. ----
+
+    // Creamery -- Brewery family, tier-2 milk->cheese processor. A butter
+    // churn (barrel + `pressWheelTex` crank, same shape Winery's own press
+    // post uses) and a stack of cheese wheels.
+    void addCreameryBuilding(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
+        const WorldBuilding& b, const LightingContext& lc, float wallH, float roofRise, Vec3 billboardRight, const sf::Texture& glowTex,
+        const sf::Texture& stoneTex, const sf::Texture& shingleTex, const sf::Texture& flowerTex,
+        const sf::Texture& pressWheelTex, const sf::Texture& bottleRackTex) {
+        sf::Color plankWall(150, 140, 118), roofColor(96, 84, 64), signColor(140, 128, 104); // creamery's own 2D accent (235,225,200), muted for a sign
+        auto cab = addWorkshopCabin(out, viewProj, windowSize, eye, b, lc, wallH, roofRise, billboardRight, glowTex, stoneTex, shingleTex, flowerTex, plankWall, roofColor, signColor);
+        Vec3 basePos(b.position.x, 0.f, b.position.y);
+
+        float bayX0 = basePos.x + cab.enclosedW;
+        float bayW = b.size.x - cab.enclosedW;
+        float bayH = cab.wallTop * 0.65f;
+        sf::Color postColor(90, 62, 34);
+        for (float px : { bayX0 + 4.f, bayX0 + bayW - 4.f }) {
+            for (float pz : { basePos.z + 4.f, basePos.z + b.size.y - 4.f }) {
+                addBox(out, viewProj, windowSize, eye, Vec3(px, 0.f, pz), Vec3(4.f, bayH, 4.f), postColor, lc);
+            }
+        }
+        addBox(out, viewProj, windowSize, eye, Vec3(bayX0, bayH, basePos.z), Vec3(bayW, 3.f, b.size.y), shade3d(roofColor, -14), lc);
+
+        sf::Color churnColor(150, 132, 96);
+        Vec3 churnPos(bayX0 + bayW * 0.3f, 0.f, basePos.z + b.size.y * 0.5f - 7.f);
+        addBox(out, viewProj, windowSize, eye, churnPos, Vec3(14.f, 20.f, 14.f), churnColor, lc);
+        addBox(out, viewProj, windowSize, eye, churnPos + Vec3(4.f, 20.f, 4.f), Vec3(6.f, 3.f, 6.f), shade3d(churnColor, -16), lc);
+        Vec3 crankPost(churnPos.x + 7.f, 23.f, churnPos.z + 7.f);
+        addBox(out, viewProj, windowSize, eye, crankPost, Vec3(3.f, 8.f, 3.f), sf::Color(94, 62, 32), lc);
+        addBillboard(out, viewProj, windowSize, billboardRight, crankPost + Vec3(1.5f, 8.f, 1.5f), 14.f, 14.f, pressWheelTex, sf::Color::White);
+
+        sf::Color cheeseColor(230, 200, 110);
+        Vec3 cheesePos(bayX0 + bayW * 0.65f, 0.f, basePos.z + b.size.y * 0.4f);
+        for (int i = 0; i < 3; ++i) {
+            addBox(out, viewProj, windowSize, eye, cheesePos + Vec3(0.f, static_cast<float>(i) * 7.f, 0.f), Vec3(16.f, 7.f, 16.f), (i % 2 == 0) ? cheeseColor : shade3d(cheeseColor, -10), lc);
+        }
+
+        Vec3 rackPos(basePos.x + 8.f, 0.f, cab.southZ + 4.f);
+        addBandedBox(out, viewProj, windowSize, eye, rackPos, Vec3(20.f, 4.f, 10.f), sf::Color(110, 78, 46), lc, nullptr, 40.f, true);
+        addBillboard(out, viewProj, windowSize, billboardRight, rackPos + Vec3(10.f, 4.f, 5.f), 18.f, 14.f, bottleRackTex, sf::Color(235, 232, 224));
+    }
+
+    // Meadery -- Brewery family, tier-2 honey->mead processor. Fermentation
+    // barrels (same pair Winery's own press annex uses) plus a honeycomb
+    // stack (Beehive's own striped-box hive, reused at a smaller scale).
+    void addMeaderyBuilding(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
+        const WorldBuilding& b, const LightingContext& lc, float wallH, float roofRise, Vec3 billboardRight, const sf::Texture& glowTex,
+        const sf::Texture& stoneTex, const sf::Texture& shingleTex, const sf::Texture& flowerTex,
+        const sf::Texture& bottleRackTex) {
+        sf::Color plankWall(150, 128, 92), roofColor(96, 74, 44), signColor(180, 132, 44); // meadery's own 2D accent (220,160,50)
+        auto cab = addWorkshopCabin(out, viewProj, windowSize, eye, b, lc, wallH, roofRise, billboardRight, glowTex, stoneTex, shingleTex, flowerTex, plankWall, roofColor, signColor);
+        Vec3 basePos(b.position.x, 0.f, b.position.y);
+
+        float bayX0 = basePos.x + cab.enclosedW;
+        float bayW = b.size.x - cab.enclosedW;
+        float bayH = cab.wallTop * 0.65f;
+        sf::Color postColor(90, 62, 34);
+        for (float px : { bayX0 + 4.f, bayX0 + bayW - 4.f }) {
+            for (float pz : { basePos.z + 4.f, basePos.z + b.size.y - 4.f }) {
+                addBox(out, viewProj, windowSize, eye, Vec3(px, 0.f, pz), Vec3(4.f, bayH, 4.f), postColor, lc);
+            }
+        }
+        addBox(out, viewProj, windowSize, eye, Vec3(bayX0, bayH, basePos.z), Vec3(bayW, 3.f, b.size.y), shade3d(roofColor, -14), lc);
+
+        sf::Color barrelColor(120, 86, 50);
+        for (float bx : { 0.f, 22.f }) {
+            Vec3 barrelPos(bayX0 + bayW * 0.3f + bx, 0.f, basePos.z + b.size.y * 0.6f);
+            addBox(out, viewProj, windowSize, eye, barrelPos, Vec3(10.f, 14.f, 10.f), barrelColor, lc);
+            addBox(out, viewProj, windowSize, eye, barrelPos + Vec3(-0.6f, 12.f, -0.6f), Vec3(11.2f, 2.f, 11.2f), shade3d(barrelColor, -18), lc);
+        }
+
+        Vec3 combPos(bayX0 + bayW * 0.68f, 0.f, basePos.z + b.size.y * 0.3f);
+        for (int i = 0; i < 2; ++i) {
+            sf::Color band = (i % 2 == 0) ? sf::Color(230, 180, 90) : sf::Color(200, 148, 68);
+            addBox(out, viewProj, windowSize, eye, combPos + Vec3(0.f, static_cast<float>(i) * 6.f, 0.f), Vec3(13.f, 6.f, 13.f), band, lc);
+        }
+        addGlowBillboard(out, viewProj, windowSize, billboardRight, combPos + Vec3(6.5f, 16.f, 6.5f), 14.f, glowTex, sf::Color(255, 220, 110, 140));
+
+        Vec3 rackPos(basePos.x + 8.f, 0.f, cab.southZ + 4.f);
+        addBandedBox(out, viewProj, windowSize, eye, rackPos, Vec3(20.f, 4.f, 10.f), sf::Color(110, 78, 46), lc, nullptr, 40.f, true);
+        addBillboard(out, viewProj, windowSize, billboardRight, rackPos + Vec3(10.f, 4.f, 5.f), 18.f, 14.f, bottleRackTex, sf::Color(220, 168, 70));
+    }
+
+    // Tannery -- Fiber family, tier-2 hide->leather processor. Hides
+    // stretched on drying frames (`peltTex`, bigger scale than Trapper's
+    // own hanging pelts) plus a tanning vat and a stack of finished
+    // leather.
+    void addTanneryBuilding(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
+        const WorldBuilding& b, const LightingContext& lc, float wallH, float roofRise, Vec3 billboardRight, const sf::Texture& glowTex,
+        const sf::Texture& stoneTex, const sf::Texture& shingleTex, const sf::Texture& flowerTex,
+        const sf::Texture& peltTex) {
+        sf::Color plankWall(138, 108, 88), roofColor(84, 62, 48), signColor(140, 100, 70); // tannery's own 2D accent (140,100,70)
+        auto cab = addWorkshopCabin(out, viewProj, windowSize, eye, b, lc, wallH, roofRise, billboardRight, glowTex, stoneTex, shingleTex, flowerTex, plankWall, roofColor, signColor);
+        Vec3 basePos(b.position.x, 0.f, b.position.y);
+
+        float bayX0 = basePos.x + cab.enclosedW;
+        float bayW = b.size.x - cab.enclosedW;
+        float bayH = cab.wallTop * 0.65f;
+        sf::Color postColor(90, 62, 34);
+        for (float px : { bayX0 + 4.f, bayX0 + bayW - 4.f }) {
+            for (float pz : { basePos.z + 4.f, basePos.z + b.size.y - 4.f }) {
+                addBox(out, viewProj, windowSize, eye, Vec3(px, 0.f, pz), Vec3(4.f, bayH, 4.f), postColor, lc);
+            }
+        }
+        addBox(out, viewProj, windowSize, eye, Vec3(bayX0, bayH, basePos.z), Vec3(bayW, 3.f, b.size.y), shade3d(roofColor, -14), lc);
+
+        // 2 stretching frames, each holding a big hide.
+        for (float fx : { 0.f, 32.f }) {
+            float frameX = bayX0 + 14.f + fx, frameZ0 = basePos.z + 6.f, frameZ1 = basePos.z + b.size.y - 6.f;
+            addBox(out, viewProj, windowSize, eye, Vec3(frameX - 2.f, 0.f, frameZ0), Vec3(4.f, 24.f, 4.f), postColor, lc);
+            addBox(out, viewProj, windowSize, eye, Vec3(frameX - 2.f, 0.f, frameZ1 - 4.f), Vec3(4.f, 24.f, 4.f), postColor, lc);
+            addBox(out, viewProj, windowSize, eye, Vec3(frameX - 2.f, 22.f, frameZ0), Vec3(4.f, 3.f, frameZ1 - frameZ0), postColor, lc);
+            addBillboard(out, viewProj, windowSize, billboardRight, Vec3(frameX, 12.f, (frameZ0 + frameZ1) * 0.5f), 20.f, 26.f, peltTex, sf::Color::White);
+        }
+
+        sf::Color vatColor(90, 90, 84);
+        Vec3 vatPos(bayX0 + 6.f, 0.f, basePos.z + b.size.y - 20.f);
+        addBox(out, viewProj, windowSize, eye, vatPos, Vec3(16.f, 10.f, 16.f), vatColor, lc);
+        addBox(out, viewProj, windowSize, eye, vatPos + Vec3(2.f, 9.f, 2.f), Vec3(12.f, 1.5f, 12.f), sf::Color(90, 70, 50), lc);
+
+        sf::Color leatherColor(140, 92, 58);
+        Vec3 stackPos(basePos.x + 10.f, 0.f, cab.southZ + 4.f);
+        for (int i = 0; i < 4; ++i) {
+            addBox(out, viewProj, windowSize, eye, stackPos + Vec3(0.f, static_cast<float>(i) * 3.f, 0.f), Vec3(20.f, 2.5f, 12.f), (i % 2 == 0) ? leatherColor : shade3d(leatherColor, -14), lc);
+        }
+    }
+
+    // Linen Mill -- Fiber family, tier-2 flax->linen processor. A spinning
+    // wheel (`pressWheelTex` reused as a plain wheel decal -- a spinning
+    // wheel and a press crank are both "wooden wheel on a post" shapes)
+    // plus stacked linen bolts (`yarnTex` reused from Textile Mill).
+    void addLinenMillBuilding(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
+        const WorldBuilding& b, const LightingContext& lc, float wallH, float roofRise, Vec3 billboardRight, const sf::Texture& glowTex,
+        const sf::Texture& stoneTex, const sf::Texture& shingleTex, const sf::Texture& flowerTex,
+        const sf::Texture& pressWheelTex, const sf::Texture& yarnTex) {
+        sf::Color plankWall(160, 158, 142), roofColor(100, 96, 84), signColor(180, 176, 158); // linen mill's own 2D accent (220,215,195)
+        auto cab = addWorkshopCabin(out, viewProj, windowSize, eye, b, lc, wallH, roofRise, billboardRight, glowTex, stoneTex, shingleTex, flowerTex, plankWall, roofColor, signColor);
+        Vec3 basePos(b.position.x, 0.f, b.position.y);
+
+        float bayX0 = basePos.x + cab.enclosedW;
+        float bayW = b.size.x - cab.enclosedW;
+        float bayH = cab.wallTop * 0.65f;
+        sf::Color postColor(90, 62, 34);
+        for (float px : { bayX0 + 4.f, bayX0 + bayW - 4.f }) {
+            for (float pz : { basePos.z + 4.f, basePos.z + b.size.y - 4.f }) {
+                addBox(out, viewProj, windowSize, eye, Vec3(px, 0.f, pz), Vec3(4.f, bayH, 4.f), postColor, lc);
+            }
+        }
+        addBox(out, viewProj, windowSize, eye, Vec3(bayX0, bayH, basePos.z), Vec3(bayW, 3.f, b.size.y), shade3d(roofColor, -14), lc);
+
+        Vec3 wheelPostPos(bayX0 + bayW * 0.35f, 0.f, basePos.z + b.size.y * 0.5f);
+        addBox(out, viewProj, windowSize, eye, wheelPostPos - Vec3(2.f, 0.f, 2.f), Vec3(4.f, 16.f, 4.f), sf::Color(94, 62, 32), lc);
+        addBillboard(out, viewProj, windowSize, billboardRight, wheelPostPos + Vec3(0.f, 16.f, 0.f), 22.f, 22.f, pressWheelTex, sf::Color::White);
+
+        sf::Color boltColor(200, 196, 178);
+        for (float lx : { -1.f, 1.f }) {
+            Vec3 boltPos(bayX0 + bayW * 0.68f + lx * 10.f, 0.f, basePos.z + b.size.y * 0.35f);
+            addBox(out, viewProj, windowSize, eye, boltPos, Vec3(8.f, 16.f, 8.f), boltColor, lc);
+            addBillboard(out, viewProj, windowSize, billboardRight, boltPos + Vec3(4.f, 16.f, 4.f), 14.f, 10.f, yarnTex, sf::Color::White);
+        }
+
+        // A folded-linen stack, south yard.
+        Vec3 foldPos(basePos.x + 10.f, 0.f, cab.southZ + 4.f);
+        for (int i = 0; i < 3; ++i) {
+            addBox(out, viewProj, windowSize, eye, foldPos + Vec3(0.f, static_cast<float>(i) * 3.5f, 0.f), Vec3(18.f, 3.f, 12.f), (i % 2 == 0) ? boltColor : shade3d(boltColor, -14), lc);
+        }
+    }
+
+    // ---- Stall family, 2026-08-11 ("继续进行" -- carry on) -- first 2 of
+    // isStallId's 5 businesses, using the new shared `addMarketStallShell`
+    // above (mirrors the 2D world's own drawStallShape: an open awning +
+    // counter, no walls at all, unlike every Workshop-family building so
+    // far). ----
+
+    // Teahouse -- Stall family, tier-2. A teapot + cups (`teapotTex`) on
+    // the counter, steam rising, plus a couple of tea crates beside it.
+    void addTeahouseBuilding(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
+        const WorldBuilding& b, const LightingContext& lc, Vec3 billboardRight, const sf::Texture& glowTex,
+        const sf::Texture& teapotTex, const sf::Texture& teaBushTex) {
+        auto stall = addMarketStallShell(out, viewProj, windowSize, eye, b, lc, sf::Color(120, 150, 90), sf::Color(232, 228, 214)); // teahouse's own 2D accent (120,150,90)
+
+        Vec3 potPos(stall.counterPos.x + stall.counterW * 0.5f, 18.f, stall.counterPos.z + stall.counterD * 0.5f);
+        addBillboard(out, viewProj, windowSize, billboardRight, potPos, 26.f, 16.f, teapotTex, sf::Color::White);
+        addGlowBillboard(out, viewProj, windowSize, billboardRight, potPos + Vec3(-6.f, 12.f, 0.f), 12.f, glowTex, sf::Color(230, 230, 235, 100));
+
+        sf::Color crateColor(150, 108, 62);
+        for (float cx : { stall.counterPos.x + 4.f, stall.counterPos.x + stall.counterW - 16.f }) {
+            Vec3 cratePos(cx, 0.f, stall.counterPos.z + stall.counterD + 4.f);
+            addBandedBox(out, viewProj, windowSize, eye, cratePos, Vec3(12.f, 9.f, 10.f), crateColor, lc, nullptr, 40.f, true);
+            addBillboard(out, viewProj, windowSize, billboardRight, cratePos + Vec3(6.f, 9.f, 5.f), 12.f, 9.f, teaBushTex, sf::Color(70, 116, 58));
+        }
+    }
+
+    // Country Gift Basket -- Stall family, tier-3, the multi-input recipe
+    // sourced from Creamery/Meadery/Teahouse within this same district
+    // (see buildZones()'s own comment on this business). A big basket on
+    // the counter with cheese, honey, and tea all poking out of it --
+    // reusing this file's own existing decals (`bottleRackTex`,
+    // `teaBushTex`) rather than baking a bespoke basket-contents sprite.
+    void addGiftBasketBuilding(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
+        const WorldBuilding& b, const LightingContext& lc, Vec3 billboardRight,
+        const sf::Texture& bottleRackTex, const sf::Texture& teaBushTex) {
+        auto stall = addMarketStallShell(out, viewProj, windowSize, eye, b, lc, sf::Color(210, 160, 200), sf::Color(232, 228, 214)); // giftbasket's own 2D accent (210,160,200)
+
+        sf::Color basketColor(150, 108, 62), cheeseColor(230, 200, 110);
+        Vec3 basketPos(stall.counterPos.x + stall.counterW * 0.5f - 10.f, 18.f, stall.counterPos.z + stall.counterD * 0.5f - 8.f);
+        addBandedBox(out, viewProj, windowSize, eye, basketPos, Vec3(20.f, 11.f, 16.f), basketColor, lc, nullptr, 40.f, true);
+        addBox(out, viewProj, windowSize, eye, basketPos + Vec3(2.f, 11.f, 2.f), Vec3(8.f, 6.f, 8.f), cheeseColor, lc);
+        addBillboard(out, viewProj, windowSize, billboardRight, basketPos + Vec3(15.f, 11.f, 10.f), 14.f, 10.f, bottleRackTex, sf::Color(220, 168, 70));
+        addBillboard(out, viewProj, windowSize, billboardRight, basketPos + Vec3(8.f, 14.f, 14.f), 14.f, 10.f, teaBushTex, sf::Color(70, 116, 58));
+    }
+
+    // ============================================================
+    // 2026-08-11 final batch ("剩下一次过都来吧" -- get the rest done in
+    // one go): every business still left across Zone 4 (Harbor District),
+    // Zone 6 (Market Row), and Zone 7 (Fisher's Isle). None of these are
+    // widened -- each design fits the plain 110x80 `bSize` the same way
+    // Sawmill/Mason/Textile did before Bakery's own widen precedent, so
+    // this whole batch needed zero position/size edits in
+    // buildZones() -- just the dispatch wiring below.
+    // ============================================================
+
+    // ---- Zone 4: Harbor District ----
+
+    // Sea Salt -- Field family, tier-1. Shallow evaporation pools with a
+    // salt crust mound in each, instead of a farmed-crop row.
+    void addSeaSaltProps(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
+        const WorldBuilding& b, const LightingContext& lc) {
+        addGroundQuad(out, viewProj, windowSize, eye, b.position.x, b.position.y, b.size.x, b.size.y, 0.6f, sf::Color(196, 190, 168), lc);
+        addPlotBorder(out, viewProj, windowSize, eye, b.position, b.size, sf::Color(25, 20, 15), lc);
+        sf::Color poolColor(224, 222, 210), saltColor(245, 245, 240);
+        const sf::Vector2f pools[] = { {0.22f, 0.3f}, {0.5f, 0.32f}, {0.78f, 0.3f}, {0.22f, 0.68f}, {0.5f, 0.66f}, {0.78f, 0.68f} };
+        for (const auto& pp : pools) {
+            Vec3 p(b.position.x + b.size.x * pp.x, 0.f, b.position.y + b.size.y * pp.y);
+            addBox(out, viewProj, windowSize, eye, p - Vec3(11.f, 0.f, 11.f), Vec3(22.f, 1.5f, 22.f), poolColor, lc);
+            addBox(out, viewProj, windowSize, eye, p - Vec3(7.f, -1.5f, 7.f), Vec3(14.f, 3.f, 14.f), saltColor, lc);
+        }
+    }
+
+    // Pearl Farm -- Field family, tier-1. The plot itself reads as open
+    // water (blue ground fill) with floating oyster-cage rafts instead of
+    // dry farmland.
+    void addPearlFarmProps(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
+        const WorldBuilding& b, const LightingContext& lc, Vec3 billboardRight, const sf::Texture& pearlTex) {
+        addGroundQuad(out, viewProj, windowSize, eye, b.position.x, b.position.y, b.size.x, b.size.y, 0.6f, sf::Color(70, 130, 160), lc);
+        addPlotBorder(out, viewProj, windowSize, eye, b.position, b.size, sf::Color(25, 20, 15), lc);
+        sf::Color cageColor(90, 80, 70);
+        const sf::Vector2f cages[] = { {0.25f, 0.35f}, {0.55f, 0.45f}, {0.75f, 0.3f}, {0.4f, 0.7f} };
+        for (const auto& cp : cages) {
+            Vec3 p(b.position.x + b.size.x * cp.x, 0.f, b.position.y + b.size.y * cp.y);
+            addBox(out, viewProj, windowSize, eye, p - Vec3(7.f, 0.f, 7.f), Vec3(14.f, 3.f, 14.f), cageColor, lc);
+            addBillboard(out, viewProj, windowSize, billboardRight, p + Vec3(0.f, 4.f, 0.f), 14.f, 10.f, pearlTex, sf::Color::White);
+        }
+    }
+
+    // Fishing Dock -- Dock family, tier-1 (see addDockShell's own header
+    // comment on why even a raw-tier Dock business gets the deck+water
+    // shell, unlike every other tier-1 producer). A net-drying rack and a
+    // basket of the day's catch (`fishTex`).
+    void addFishingProps(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
+        const WorldBuilding& b, const LightingContext& lc, Vec3 billboardRight, const sf::Texture& fishTex) {
+        auto dock = addDockShell(out, viewProj, windowSize, eye, b, lc);
+        sf::Color postColor(90, 62, 34);
+        Vec3 rackBase(b.position.x + b.size.x * 0.2f, 0.f, b.position.y + 8.f);
+        addBox(out, viewProj, windowSize, eye, rackBase, Vec3(4.f, 26.f, 4.f), postColor, lc);
+        addBox(out, viewProj, windowSize, eye, rackBase + Vec3(30.f, 0.f, 0.f), Vec3(4.f, 26.f, 4.f), postColor, lc);
+        addBox(out, viewProj, windowSize, eye, rackBase + Vec3(0.f, 24.f, 0.f), Vec3(34.f, 3.f, 4.f), postColor, lc);
+        addBillboard(out, viewProj, windowSize, billboardRight, rackBase + Vec3(17.f, 12.f, 2.f), 26.f, 18.f, fishTex, sf::Color::White);
+
+        Vec3 basketPos(b.position.x + b.size.x * 0.62f, 0.f, b.position.y + dock.deckD * 0.55f);
+        addBandedBox(out, viewProj, windowSize, eye, basketPos, Vec3(14.f, 10.f, 14.f), sf::Color(150, 108, 62), lc, nullptr, 40.f, true);
+        addBillboard(out, viewProj, windowSize, billboardRight, basketPos + Vec3(7.f, 10.f, 7.f), 16.f, 12.f, fishTex, sf::Color::White);
+    }
+
+    // Shipyard -- Dock family, tier-2. A ship's hull skeleton (keel + rib
+    // posts) under construction, the classic "half-built ship" read.
+    void addShipyardBuilding(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
+        const WorldBuilding& b, const LightingContext& lc, Vec3 billboardRight) {
+        auto dock = addDockShell(out, viewProj, windowSize, eye, b, lc);
+        sf::Color hullColor(160, 120, 80), ribColor(120, 86, 50);
+        Vec3 keelPos(b.position.x + b.size.x * 0.15f, 0.f, b.position.y + 8.f);
+        float keelLen = b.size.x * 0.7f;
+        addBox(out, viewProj, windowSize, eye, keelPos, Vec3(keelLen, 4.f, dock.deckD - 14.f), hullColor, lc);
+        for (float t : { 0.15f, 0.4f, 0.65f, 0.9f }) {
+            Vec3 rp(keelPos.x + keelLen * t, 4.f, keelPos.z + 6.f);
+            addBox(out, viewProj, windowSize, eye, rp, Vec3(3.f, 22.f, 3.f), ribColor, lc);
+            addBox(out, viewProj, windowSize, eye, rp + Vec3(-9.f, 18.f, 0.f), Vec3(12.f, 3.f, 3.f), ribColor, lc);
+        }
+        Vec3 cratePos(b.position.x + 8.f, 0.f, dock.waterZ0 - 16.f);
+        addBandedBox(out, viewProj, windowSize, eye, cratePos, Vec3(14.f, 10.f, 14.f), sf::Color(150, 108, 62), lc, nullptr, 40.f, true);
+    }
+
+    // Port -- Dock family, tier-3. Stacked cargo crates/barrels and a
+    // signal mast flying a flag in the business's own accent color.
+    void addPortBuilding(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
+        const WorldBuilding& b, const LightingContext& lc, Vec3 billboardRight) {
+        auto dock = addDockShell(out, viewProj, windowSize, eye, b, lc);
+        sf::Color crateColor(150, 108, 62), barrelColor(120, 86, 50);
+        for (const auto& cp : { sf::Vector2f(0.2f, 0.3f), sf::Vector2f(0.36f, 0.36f), sf::Vector2f(0.2f, 0.5f) }) {
+            Vec3 p(b.position.x + b.size.x * cp.x, 0.f, b.position.y + dock.deckD * cp.y);
+            addBandedBox(out, viewProj, windowSize, eye, p, Vec3(14.f, 12.f, 14.f), crateColor, lc, nullptr, 40.f, true);
+        }
+        Vec3 barrelPos(b.position.x + b.size.x * 0.6f, 0.f, b.position.y + dock.deckD * 0.4f);
+        addBox(out, viewProj, windowSize, eye, barrelPos, Vec3(10.f, 14.f, 10.f), barrelColor, lc);
+        addBox(out, viewProj, windowSize, eye, barrelPos + Vec3(-0.6f, 12.f, -0.6f), Vec3(11.2f, 2.f, 11.2f), shade3d(barrelColor, -18), lc);
+
+        Vec3 mastPos(b.position.x + b.size.x * 0.75f, 0.f, b.position.y + dock.deckD * 0.55f);
+        addBox(out, viewProj, windowSize, eye, mastPos, Vec3(4.f, 40.f, 4.f), sf::Color(94, 62, 32), lc);
+        addBox(out, viewProj, windowSize, eye, mastPos + Vec3(4.f, 32.f, -1.f), Vec3(14.f, 8.f, 1.f), sf::Color(90, 160, 200), lc); // port's own 2D accent (90,160,200)
+    }
+
+    // Pearl Atelier -- MasonGem family, tier-2 (like Mason/Gemshop/
+    // Jeweler). Gemshop's own counter recipe, `pearlTex` instead of loose
+    // gems/gold.
+    void addPearlAtelierBuilding(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
+        const WorldBuilding& b, const LightingContext& lc, float wallH, float roofRise, Vec3 billboardRight, const sf::Texture& glowTex,
+        const sf::Texture& stoneTex, const sf::Texture& shingleTex, const sf::Texture& flowerTex, const sf::Texture& pearlTex) {
+        sf::Color plankWall(150, 155, 160), roofColor(84, 96, 104), signColor(190, 195, 200); // pearlatelier's own 2D accent (225,225,230)
+        auto cab = addWorkshopCabin(out, viewProj, windowSize, eye, b, lc, wallH, roofRise, billboardRight, glowTex, stoneTex, shingleTex, flowerTex, plankWall, roofColor, signColor, 0.42f);
+        Vec3 basePos(b.position.x, 0.f, b.position.y);
+
+        float counterX0 = basePos.x + cab.enclosedW + 6.f;
+        float counterAreaW = b.size.x - cab.enclosedW - 6.f;
+        float counterW = std::min(counterAreaW * 0.7f, 70.f), counterD = b.size.y * 0.4f;
+        Vec3 counterPos(counterX0, 0.f, basePos.z + (b.size.y - counterD) * 0.5f);
+        addBandedBox(out, viewProj, windowSize, eye, counterPos, Vec3(counterW, 14.f, counterD), sf::Color(110, 78, 46), lc, nullptr, 40.f, true);
+        addBox(out, viewProj, windowSize, eye, counterPos + Vec3(2.f, 14.f, 2.f), Vec3(counterW - 4.f, 6.f, counterD - 4.f), sf::Color(210, 225, 230, 200), lc);
+        addBillboard(out, viewProj, windowSize, billboardRight, Vec3(counterPos.x + counterW * 0.5f, 20.f, counterPos.z + counterD * 0.5f), 20.f, 14.f, pearlTex, sf::Color::White);
+    }
+
+    // ---- Zone 6: Market Row (Oven family x7, Stall family x2) ----
+
+    // Jam Kitchen -- Oven family, tier-2. A smaller-scale sibling of
+    // Preserve's own jam operation -- same `jamJarsTex`.
+    void addJamKitchenBuilding(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
+        const WorldBuilding& b, const LightingContext& lc, float wallH, float roofRise, Vec3 billboardRight, const sf::Texture& glowTex,
+        const sf::Texture& stoneTex, const sf::Texture& shingleTex, const sf::Texture& flowerTex, const sf::Texture& jamJarsTex) {
+        sf::Color plankWall(148, 96, 92), roofColor(92, 54, 52), signColor(150, 60, 58); // jamkitchen's own 2D accent (200,90,110)
+        auto shell = addOvenFamilyShell(out, viewProj, windowSize, eye, b, lc, wallH, roofRise, billboardRight, glowTex, stoneTex, shingleTex, flowerTex, plankWall, roofColor, signColor, sf::Color(255, 150, 60, 200));
+        Vec3 tablePos(shell.bayX0 + shell.bayW * 0.65f, 0.f, b.position.y + b.size.y * 0.5f - 6.f);
+        addBandedBox(out, viewProj, windowSize, eye, tablePos, Vec3(20.f, 10.f, 14.f), sf::Color(110, 78, 46), lc, nullptr, 40.f, true);
+        addBillboard(out, viewProj, windowSize, billboardRight, tablePos + Vec3(10.f, 10.f, 7.f), 18.f, 12.f, jamJarsTex, sf::Color::White);
+    }
+
+    // Pie Shop -- Oven family, tier-2. `pieTex` on the display table.
+    void addPieShopBuilding(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
+        const WorldBuilding& b, const LightingContext& lc, float wallH, float roofRise, Vec3 billboardRight, const sf::Texture& glowTex,
+        const sf::Texture& stoneTex, const sf::Texture& shingleTex, const sf::Texture& flowerTex, const sf::Texture& pieTex) {
+        sf::Color plankWall(160, 130, 90), roofColor(100, 70, 40), signColor(180, 140, 80); // pieshop's own 2D accent (210,170,110)
+        auto shell = addOvenFamilyShell(out, viewProj, windowSize, eye, b, lc, wallH, roofRise, billboardRight, glowTex, stoneTex, shingleTex, flowerTex, plankWall, roofColor, signColor, sf::Color(255, 150, 60, 200));
+        Vec3 tablePos(shell.bayX0 + shell.bayW * 0.65f, 0.f, b.position.y + b.size.y * 0.5f - 6.f);
+        addBandedBox(out, viewProj, windowSize, eye, tablePos, Vec3(20.f, 10.f, 14.f), sf::Color(110, 78, 46), lc, nullptr, 40.f, true);
+        addBillboard(out, viewProj, windowSize, billboardRight, tablePos + Vec3(10.f, 10.f, 7.f), 18.f, 12.f, pieTex, sf::Color::White);
+    }
+
+    // Roast Stand -- Oven family, tier-2. A meat roast on a spit
+    // (`roastTex`) right over the hearth's own fire instead of a table off
+    // to the side -- a roast stand's whole point is the open flame.
+    void addRoastStandBuilding(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
+        const WorldBuilding& b, const LightingContext& lc, float wallH, float roofRise, Vec3 billboardRight, const sf::Texture& glowTex,
+        const sf::Texture& stoneTex, const sf::Texture& shingleTex, const sf::Texture& flowerTex, const sf::Texture& roastTex) {
+        sf::Color plankWall(140, 100, 80), roofColor(90, 60, 40), signColor(180, 110, 60); // roaststand's own 2D accent (200,120,60)
+        auto shell = addOvenFamilyShell(out, viewProj, windowSize, eye, b, lc, wallH, roofRise, billboardRight, glowTex, stoneTex, shingleTex, flowerTex, plankWall, roofColor, signColor, sf::Color(255, 120, 40, 220));
+        Vec3 hearthCenter(shell.bayX0 + shell.bayW * 0.32f, 0.f, b.position.y + b.size.y * 0.5f - 9.f);
+        addBillboard(out, viewProj, windowSize, billboardRight, hearthCenter + Vec3(9.f, 13.f, 9.f), 22.f, 16.f, roastTex, sf::Color::White);
+    }
+
+    // Pickling House -- Oven family, tier-2. A pale steam instead of the
+    // usual firebox orange (pickling is brine, not an open flame), and a
+    // green-tinted `bottleRackTex` for pickle jars.
+    void addPicklingHouseBuilding(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
+        const WorldBuilding& b, const LightingContext& lc, float wallH, float roofRise, Vec3 billboardRight, const sf::Texture& glowTex,
+        const sf::Texture& stoneTex, const sf::Texture& shingleTex, const sf::Texture& flowerTex, const sf::Texture& bottleRackTex) {
+        sf::Color plankWall(130, 150, 110), roofColor(80, 100, 70), signColor(110, 140, 76); // picklinghouse's own 2D accent (140,170,90)
+        auto shell = addOvenFamilyShell(out, viewProj, windowSize, eye, b, lc, wallH, roofRise, billboardRight, glowTex, stoneTex, shingleTex, flowerTex, plankWall, roofColor, signColor, sf::Color(220, 230, 220, 130));
+        Vec3 tablePos(shell.bayX0 + shell.bayW * 0.65f, 0.f, b.position.y + b.size.y * 0.5f - 6.f);
+        addBandedBox(out, viewProj, windowSize, eye, tablePos, Vec3(20.f, 10.f, 14.f), sf::Color(110, 78, 46), lc, nullptr, 40.f, true);
+        addBillboard(out, viewProj, windowSize, billboardRight, tablePos + Vec3(10.f, 10.f, 7.f), 18.f, 14.f, bottleRackTex, sf::Color(150, 190, 110));
+    }
+
+    // Honey Refinery -- Oven family, tier-2. Gold-tinted `bottleRackTex`,
+    // same convention Meadery's own bottle rack uses.
+    void addHoneyRefineryBuilding(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
+        const WorldBuilding& b, const LightingContext& lc, float wallH, float roofRise, Vec3 billboardRight, const sf::Texture& glowTex,
+        const sf::Texture& stoneTex, const sf::Texture& shingleTex, const sf::Texture& flowerTex, const sf::Texture& bottleRackTex) {
+        sf::Color plankWall(150, 128, 92), roofColor(96, 74, 44), signColor(190, 142, 48); // honeyrefinery's own 2D accent (230,180,60)
+        auto shell = addOvenFamilyShell(out, viewProj, windowSize, eye, b, lc, wallH, roofRise, billboardRight, glowTex, stoneTex, shingleTex, flowerTex, plankWall, roofColor, signColor, sf::Color(255, 210, 100, 190));
+        Vec3 tablePos(shell.bayX0 + shell.bayW * 0.65f, 0.f, b.position.y + b.size.y * 0.5f - 6.f);
+        addBandedBox(out, viewProj, windowSize, eye, tablePos, Vec3(20.f, 10.f, 14.f), sf::Color(110, 78, 46), lc, nullptr, 40.f, true);
+        addBillboard(out, viewProj, windowSize, billboardRight, tablePos + Vec3(10.f, 10.f, 7.f), 18.f, 14.f, bottleRackTex, sf::Color(220, 168, 70));
+    }
+
+    // Cake Shop -- Oven family, tier-3. A mini layer cake (`cakeTex`) on
+    // the display table -- a pastel palette, distinct from the plainer
+    // Bakery down the road.
+    void addCakeShopBuilding(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
+        const WorldBuilding& b, const LightingContext& lc, float wallH, float roofRise, Vec3 billboardRight, const sf::Texture& glowTex,
+        const sf::Texture& stoneTex, const sf::Texture& shingleTex, const sf::Texture& flowerTex, const sf::Texture& cakeTex) {
+        sf::Color plankWall(200, 180, 190), roofColor(130, 100, 110), signColor(220, 170, 190); // cakeshop's own 2D accent (235,200,210)
+        auto shell = addOvenFamilyShell(out, viewProj, windowSize, eye, b, lc, wallH, roofRise, billboardRight, glowTex, stoneTex, shingleTex, flowerTex, plankWall, roofColor, signColor, sf::Color(255, 190, 210, 170));
+        Vec3 tablePos(shell.bayX0 + shell.bayW * 0.65f, 0.f, b.position.y + b.size.y * 0.5f - 6.f);
+        addBandedBox(out, viewProj, windowSize, eye, tablePos, Vec3(20.f, 10.f, 14.f), sf::Color(200, 180, 190), lc, nullptr, 40.f, true);
+        addBillboard(out, viewProj, windowSize, billboardRight, tablePos + Vec3(10.f, 10.f, 7.f), 16.f, 18.f, cakeTex, sf::Color::White);
+    }
+
+    // Artisan Bakery -- Oven family, tier-3. `breadTex` reused outright
+    // from Bakery -- a finer sibling of the same product, not a different
+    // one.
+    void addArtisanBakeryBuilding(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
+        const WorldBuilding& b, const LightingContext& lc, float wallH, float roofRise, Vec3 billboardRight, const sf::Texture& glowTex,
+        const sf::Texture& stoneTex, const sf::Texture& shingleTex, const sf::Texture& flowerTex, const sf::Texture& breadTex) {
+        sf::Color plankWall(150, 112, 68), roofColor(96, 60, 40), signColor(150, 110, 60); // artisanbakery's own 2D accent (200,150,90)
+        auto shell = addOvenFamilyShell(out, viewProj, windowSize, eye, b, lc, wallH, roofRise, billboardRight, glowTex, stoneTex, shingleTex, flowerTex, plankWall, roofColor, signColor, sf::Color(255, 150, 60, 200));
+        Vec3 tablePos(shell.bayX0 + shell.bayW * 0.65f, 0.f, b.position.y + b.size.y * 0.5f - 6.f);
+        addBandedBox(out, viewProj, windowSize, eye, tablePos, Vec3(20.f, 10.f, 14.f), sf::Color(110, 78, 46), lc, nullptr, 40.f, true);
+        addBillboard(out, viewProj, windowSize, billboardRight, tablePos + Vec3(10.f, 10.f, 7.f), 20.f, 14.f, breadTex, sf::Color::White);
+    }
+
+    // Popcorn Stand -- Stall family, tier-2. `popcornTex` on the counter.
+    void addPopcornStandBuilding(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
+        const WorldBuilding& b, const LightingContext& lc, Vec3 billboardRight, const sf::Texture& popcornTex) {
+        auto stall = addMarketStallShell(out, viewProj, windowSize, eye, b, lc, sf::Color(230, 210, 120), sf::Color(232, 228, 214)); // popcornstand's own 2D accent (230,210,120)
+        addBillboard(out, viewProj, windowSize, billboardRight, Vec3(stall.counterPos.x + stall.counterW * 0.5f, 18.f, stall.counterPos.z + stall.counterD * 0.5f), 18.f, 20.f, popcornTex, sf::Color::White);
+    }
+
+    // Juice Bar -- Stall family, tier-2. Red-tinted `bottleRackTex` for
+    // bottled juice -- fresh produce squeezed into glass, same "outlined
+    // near-white shape, tint per business" trick every Brewery-family
+    // bottle rack already uses.
+    void addJuiceBarBuilding(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
+        const WorldBuilding& b, const LightingContext& lc, Vec3 billboardRight, const sf::Texture& bottleRackTex) {
+        auto stall = addMarketStallShell(out, viewProj, windowSize, eye, b, lc, sf::Color(200, 60, 70), sf::Color(232, 228, 214)); // juicebar's own 2D accent (200,60,70)
+        addBillboard(out, viewProj, windowSize, billboardRight, Vec3(stall.counterPos.x + stall.counterW * 0.5f, 18.f, stall.counterPos.z + stall.counterD * 0.5f), 22.f, 16.f, bottleRackTex, sf::Color(230, 110, 70));
+    }
+
+    // ---- Zone 7: Fisher's Isle ----
+
+    // Cannery -- Dock family, tier-2. Stacked tin cans instead of crates,
+    // plus a fish net rack (`fishTex` reused from Fishing Dock).
+    void addCanneryBuilding(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
+        const WorldBuilding& b, const LightingContext& lc, Vec3 billboardRight, const sf::Texture& fishTex) {
+        auto dock = addDockShell(out, viewProj, windowSize, eye, b, lc);
+        sf::Color canColor(180, 182, 186);
+        for (const auto& cp : { sf::Vector2f(0.2f, 0.3f), sf::Vector2f(0.3f, 0.3f), sf::Vector2f(0.25f, 0.42f) }) {
+            Vec3 p(b.position.x + b.size.x * cp.x, 0.f, b.position.y + dock.deckD * cp.y);
+            addBox(out, viewProj, windowSize, eye, p, Vec3(8.f, 10.f, 8.f), canColor, lc);
+            addBox(out, viewProj, windowSize, eye, p + Vec3(0.f, 10.f, 0.f), Vec3(8.f, 1.f, 8.f), shade3d(canColor, -20), lc);
+        }
+        Vec3 basketPos(b.position.x + b.size.x * 0.6f, 0.f, b.position.y + dock.deckD * 0.4f);
+        addBandedBox(out, viewProj, windowSize, eye, basketPos, Vec3(14.f, 10.f, 14.f), sf::Color(150, 108, 62), lc, nullptr, 40.f, true);
+        addBillboard(out, viewProj, windowSize, billboardRight, basketPos + Vec3(7.f, 10.f, 7.f), 16.f, 12.f, fishTex, sf::Color::White);
+    }
+
+    // Smokehouse -- its own single-business family (isSmokehouseId). Same
+    // Workshop-family cabin, plus a smoking rack (fish hung to cure,
+    // `fishTex`) and a HEAVY grey smoke glow instead of the usual warm
+    // firebox orange -- a smokehouse's whole point is the smoke, not a
+    // flame you'd actually see.
+    void addSmokehouseBuilding(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
+        const WorldBuilding& b, const LightingContext& lc, float wallH, float roofRise, Vec3 billboardRight, const sf::Texture& glowTex,
+        const sf::Texture& stoneTex, const sf::Texture& shingleTex, const sf::Texture& flowerTex, const sf::Texture& fishTex) {
+        sf::Color plankWall(120, 108, 100), roofColor(72, 62, 56), signColor(120, 120, 120); // smokehouse's own 2D accent (140,140,140)
+        auto cab = addWorkshopCabin(out, viewProj, windowSize, eye, b, lc, wallH, roofRise, billboardRight, glowTex, stoneTex, shingleTex, flowerTex, plankWall, roofColor, signColor);
+        Vec3 basePos(b.position.x, 0.f, b.position.y);
+
+        float bayX0 = basePos.x + cab.enclosedW;
+        float bayW = b.size.x - cab.enclosedW;
+        float bayH = cab.wallTop * 0.68f;
+        sf::Color postColor(90, 62, 34);
+        for (float px : { bayX0 + 4.f, bayX0 + bayW - 4.f }) {
+            for (float pz : { basePos.z + 4.f, basePos.z + b.size.y - 4.f }) {
+                addBox(out, viewProj, windowSize, eye, Vec3(px, 0.f, pz), Vec3(4.f, bayH, 4.f), postColor, lc);
+            }
+        }
+        addBox(out, viewProj, windowSize, eye, Vec3(bayX0, bayH, basePos.z), Vec3(bayW, 3.f, b.size.y), shade3d(roofColor, -14), lc);
+
+        Vec3 rackMid(bayX0 + bayW * 0.5f, bayH - 4.f, basePos.z + b.size.y * 0.5f);
+        addBox(out, viewProj, windowSize, eye, rackMid - Vec3(bayW * 0.3f, 0.f, 2.f), Vec3(bayW * 0.6f, 2.f, 4.f), postColor, lc);
+        for (float t : { -0.25f, 0.f, 0.25f }) {
+            addBillboard(out, viewProj, windowSize, billboardRight, rackMid + Vec3(bayW * 0.3f * t, -10.f, 0.f), 14.f, 16.f, fishTex, sf::Color(150, 130, 110));
+        }
+        addGlowBillboard(out, viewProj, windowSize, billboardRight, rackMid + Vec3(0.f, 12.f, 0.f), 30.f, glowTex, sf::Color(140, 138, 134, 160));
+    }
+
+    // Deep Sea Fishing -- Dock family, tier-1. Diving/net gear on the
+    // deck and 1 big prize fish.
+    void addDeepSeaProps(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
+        const WorldBuilding& b, const LightingContext& lc, Vec3 billboardRight, const sf::Texture& fishTex) {
+        auto dock = addDockShell(out, viewProj, windowSize, eye, b, lc);
+        sf::Color coilColor(70, 90, 110);
+        Vec3 coilPos(b.position.x + b.size.x * 0.25f, 0.f, b.position.y + dock.deckD * 0.4f);
+        addBox(out, viewProj, windowSize, eye, coilPos, Vec3(16.f, 6.f, 16.f), coilColor, lc);
+        addBox(out, viewProj, windowSize, eye, coilPos + Vec3(3.f, 6.f, 3.f), Vec3(10.f, 5.f, 10.f), shade3d(coilColor, 16), lc);
+        addBillboard(out, viewProj, windowSize, billboardRight, Vec3(b.position.x + b.size.x * 0.62f, 0.f, b.position.y + dock.deckD * 0.5f), 34.f, 22.f, fishTex, sf::Color::White);
+    }
+
+    // Sushi Bar -- Stall family, tier-2. A plated fish (`fishTex`) on the
+    // counter instead of a bottle rack or basket.
+    void addSushiBarBuilding(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
+        const WorldBuilding& b, const LightingContext& lc, Vec3 billboardRight, const sf::Texture& fishTex) {
+        auto stall = addMarketStallShell(out, viewProj, windowSize, eye, b, lc, sf::Color(230, 100, 110), sf::Color(232, 228, 214)); // sushibar's own 2D accent (230,100,110)
+        addBox(out, viewProj, windowSize, eye, Vec3(stall.counterPos.x + stall.counterW * 0.5f - 10.f, 18.f, stall.counterPos.z + stall.counterD * 0.5f - 8.f), Vec3(20.f, 1.5f, 16.f), sf::Color(230, 230, 225), lc);
+        addBillboard(out, viewProj, windowSize, billboardRight, Vec3(stall.counterPos.x + stall.counterW * 0.5f, 20.f, stall.counterPos.z + stall.counterD * 0.5f), 20.f, 14.f, fishTex, sf::Color::White);
+    }
+
+    // Fisherman's Platter -- Dock family, tier-3, the multi-input recipe
+    // combining Cannery/Smokehouse's output with Harbor's salt (see
+    // buildZones()'s own comment). A big serving platter with a whole fish
+    // on the deck, standing in for the finished dish.
+    void addFishermanPlatterBuilding(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
+        const WorldBuilding& b, const LightingContext& lc, Vec3 billboardRight, const sf::Texture& fishTex) {
+        auto dock = addDockShell(out, viewProj, windowSize, eye, b, lc);
+        Vec3 tablePos(b.position.x + b.size.x * 0.3f, 0.f, b.position.y + dock.deckD * 0.35f);
+        addBandedBox(out, viewProj, windowSize, eye, tablePos, Vec3(26.f, 12.f, 18.f), sf::Color(110, 78, 46), lc, nullptr, 40.f, true);
+        addBox(out, viewProj, windowSize, eye, tablePos + Vec3(3.f, 12.f, 3.f), Vec3(20.f, 1.5f, 12.f), sf::Color(230, 230, 225), lc);
+        addBillboard(out, viewProj, windowSize, billboardRight, tablePos + Vec3(13.f, 14.f, 9.f), 24.f, 16.f, fishTex, sf::Color::White);
+    }
+
+    // Island Ferry -- not a real business (see buildZones()'s own comment
+    // -- a plain interactive world object), but still deserves better than
+    // the generic box+roof: a boat hull moored at the dock plus a small
+    // ticket booth.
+    void addIslandFerryProps(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
+        const WorldBuilding& b, const LightingContext& lc, Vec3 billboardRight, const sf::Texture& glowTex) {
+        auto dock = addDockShell(out, viewProj, windowSize, eye, b, lc);
+        sf::Color hullColor(210, 210, 215), trimColor(90, 160, 200);
+        Vec3 hullPos(b.position.x + b.size.x * 0.15f, 0.f, dock.waterZ0 - 6.f);
+        addBox(out, viewProj, windowSize, eye, hullPos, Vec3(b.size.x * 0.7f, 10.f, 22.f), hullColor, lc);
+        addBox(out, viewProj, windowSize, eye, hullPos + Vec3(4.f, 10.f, 4.f), Vec3(b.size.x * 0.7f - 8.f, 2.f, 14.f), trimColor, lc);
+        Vec3 cabinPos(hullPos.x + b.size.x * 0.7f * 0.3f, 12.f, hullPos.z + 4.f);
+        addBox(out, viewProj, windowSize, eye, cabinPos, Vec3(20.f, 12.f, 12.f), sf::Color(230, 230, 232), lc);
+
+        sf::Color boothColor(150, 118, 76);
+        Vec3 boothPos(b.position.x + b.size.x * 0.1f, 0.f, b.position.y + 8.f);
+        addBandedBox(out, viewProj, windowSize, eye, boothPos, Vec3(16.f, 24.f, 14.f), boothColor, lc, nullptr, 40.f, true);
+        addGlowBillboard(out, viewProj, windowSize, billboardRight, boothPos + Vec3(8.f, 16.f, 15.f), 12.f, glowTex, sf::Color(255, 214, 140, 130));
+    }
+
+    // Textile Mill -- from an eighteenth reference image, explicitly
+    // labeled "纺织厂" (Textile Mill) itself, no scope-check needed (this
+    // is the exact `textile` business the Sheep Farm round 2 rounds back
+    // deferred -- the reference's own barn building was confirmed then to
+    // belong here, not to `sheep`): a log-cabin shop with 2 chimneys next
+    // to an open weaving bay holding a loom, dye vats, a yarn-loaded
+    // wheelbarrow, and stacked folded fabric. Only `b.id == "textile"`
+    // uses this -- the 2nd Workshop-family processor building after
+    // Bakery.
+    void addTextileMillBuilding(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
+        const WorldBuilding& b, const LightingContext& lc, float wallH, float roofRise, Vec3 billboardRight, const sf::Texture& glowTex,
+        const sf::Texture& stoneTex, const sf::Texture& shingleTex, const sf::Texture& flowerTex,
+        const sf::Texture& loomTex, const sf::Texture& yarnTex) {
+        sf::Color stone(118, 114, 108);
+        sf::Color plankWall(150, 112, 68);
+        sf::Color beamColor(58, 40, 26);
+        sf::Color roofColor(96, 60, 40);
+        sf::Color windowColor(255, 214, 140);
+        sf::Color signColor(120, 84, 48);
+        sf::Color plantBoxColor(96, 68, 40);
+        sf::Color hayColor(198, 168, 78);
+        sf::Color hayCapColor(220, 196, 108);
+        sf::Color cartColor(118, 86, 52);
+        sf::Color wheelColor(60, 44, 28);
+
+        constexpr float kStoneUv = 20.f, kShingleUv = 15.f;
+
+        Vec3 basePos(b.position.x, 0.f, b.position.y);
+        float southZ = basePos.z + b.size.y + 1.5f;
+
+        float wallH2 = wallH;
+        float foundationH = wallH2 * 0.18f;
+        float upperH = wallH2 - foundationH;
+        float wallTop = wallH2;
+
+        // ---- Enclosed cabin (west 52%) -- same recipe Bakery's own
+        // cabin just established. ----
+        float enclosedW = b.size.x * 0.52f;
+        addBandedBox(out, viewProj, windowSize, eye, basePos, Vec3(enclosedW, foundationH, b.size.y), stone, lc, &stoneTex, kStoneUv);
+        addBandedBox(out, viewProj, windowSize, eye, Vec3(basePos.x, foundationH, basePos.z), Vec3(enclosedW, upperH, b.size.y), plankWall, lc, &shingleTex, kShingleUv);
+        addGableRoof(out, viewProj, windowSize, eye, basePos, Vec3(enclosedW, wallTop, b.size.y), wallTop, roofRise, roofColor, lc, &shingleTex, kShingleUv);
+
+        float doorW = enclosedW * 0.22f, doorH = foundationH + upperH * 0.55f;
+        Vec3 doorPos(basePos.x + enclosedW * 0.5f - doorW * 0.5f, 0.f, southZ);
+        addBox(out, viewProj, windowSize, eye, doorPos, Vec3(doorW, doorH, 3.f), beamColor, lc);
+        addBox(out, viewProj, windowSize, eye, Vec3(doorPos.x + doorW * 0.5f - 1.f, 0.f, southZ - 0.5f), Vec3(2.f, doorH, 2.f), shade3d(beamColor, -10), lc);
+
+        float winSize = enclosedW * 0.15f;
+        Vec3 winPos(basePos.x + enclosedW * 0.15f, foundationH + upperH * 0.4f, southZ);
+        addBox(out, viewProj, windowSize, eye, winPos, Vec3(winSize, winSize, 3.f), windowColor, lc);
+        addGlowBillboard(out, viewProj, windowSize, billboardRight, Vec3(winPos.x + winSize * 0.5f, winPos.y + winSize * 0.5f, southZ), winSize * 1.5f, glowTex, sf::Color(255, 214, 140, 130));
+        Vec3 boxPos(winPos.x - 2.f, winPos.y - 8.f, southZ - 3.f);
+        addBandedBox(out, viewProj, windowSize, eye, boxPos, Vec3(winSize + 4.f, 6.f, 6.f), plantBoxColor, lc, nullptr, 40.f, true);
+        addBillboard(out, viewProj, windowSize, billboardRight, Vec3(boxPos.x + (winSize + 4.f) * 0.5f, winPos.y - 2.f, southZ), winSize * 0.9f, 14.f, flowerTex, sf::Color::White);
+
+        float signW = enclosedW * 0.6f, signH = 16.f;
+        Vec3 signPos(basePos.x + enclosedW * 0.5f - signW * 0.5f, wallTop + roofRise * 0.35f, southZ - 2.f);
+        addBandedBox(out, viewProj, windowSize, eye, signPos, Vec3(signW, signH, 3.f), signColor, lc, nullptr, 40.f, true);
+
+        // 2 chimneys (hearth + dye-vat steam), matching the reference's
+        // own pair of tall stone stacks.
+        for (float cx : { 0.30f, 0.78f }) {
+            Vec3 chimneyPos(basePos.x + enclosedW * cx, wallTop * 0.3f, basePos.z + b.size.y * 0.5f);
+            addBox(out, viewProj, windowSize, eye, chimneyPos, Vec3(11.f, wallTop * 0.75f, 11.f), sf::Color(96, 90, 86), lc);
+            addGlowBillboard(out, viewProj, windowSize, billboardRight, chimneyPos + Vec3(5.5f, wallTop * 0.75f + 12.f, 5.5f), 16.f, glowTex, sf::Color(210, 210, 214, 90));
+        }
+
+        // ---- Open weaving bay (east 48%): 2 stone piers, a recessed back
+        // wall with the loom decal mounted on it, and a flat shed roof
+        // lower than the cabin's own ridge -- Sawmill's exact open-bay
+        // recipe, loom standing in for the saw blade. ----
+        float bayW = b.size.x - enclosedW;
+        float bayX0 = basePos.x + enclosedW;
+        float bayWallH = foundationH + upperH * 0.7f;
+        float pierW = bayW * 0.15f;
+        addBandedBox(out, viewProj, windowSize, eye, Vec3(bayX0, 0.f, basePos.z), Vec3(pierW, bayWallH, b.size.y), stone, lc, &stoneTex, kStoneUv);
+        addBandedBox(out, viewProj, windowSize, eye, Vec3(bayX0 + bayW - pierW, 0.f, basePos.z), Vec3(pierW, bayWallH, b.size.y), stone, lc, &stoneTex, kStoneUv);
+
+        float backDepth = 14.f;
+        float backWallH = foundationH + upperH * 0.55f;
+        addBandedBox(out, viewProj, windowSize, eye, Vec3(bayX0 + pierW, 0.f, basePos.z), Vec3(bayW - pierW * 2.f, backWallH, backDepth), plankWall, lc, &shingleTex, kShingleUv);
+        float backFaceZ = basePos.z + backDepth;
+
+        Vec3 loomBase(bayX0 + bayW * 0.5f, 0.f, backFaceZ);
+        addBillboard(out, viewProj, windowSize, billboardRight, loomBase, 30.f, 36.f, loomTex, sf::Color::White);
+
+        float bayRoofY = wallTop * 0.78f;
+        addBox(out, viewProj, windowSize, eye, Vec3(bayX0, bayRoofY, basePos.z), Vec3(bayW, 3.f, b.size.y), shade3d(roofColor, -10), lc);
+
+        // 3 dye vats on the open floor between the piers -- a box body +
+        // a darker rim band (Warehouse's own barrel technique) tinted
+        // 3 different dye colors, deliberately kept inboard of both piers
+        // (dx 65.12-94.16 clear span).
+        {
+            const std::pair<float, sf::Color> vats[] = {
+                { 66.f, sf::Color(60, 90, 130) },  // blue dye
+                { 76.f, sf::Color(120, 50, 55) },  // red dye
+                { 86.f, sf::Color(90, 62, 40) },   // brown dye
+            };
+            for (const auto& [vx, col] : vats) {
+                Vec3 vatPos(basePos.x + vx, 0.f, basePos.z + 36.f);
+                addBox(out, viewProj, windowSize, eye, vatPos, Vec3(8.f, 14.f, 8.f), col, lc);
+                addBox(out, viewProj, windowSize, eye, vatPos + Vec3(-0.6f, 12.f, -0.6f), Vec3(9.2f, 2.f, 9.2f), shade3d(col, -20), lc);
+            }
+        }
+
+        // Folded fabric stack, south of the vats -- Sawmill's own plank-
+        // stack layering, alternating bright dyed colors instead of one
+        // wood tone.
+        {
+            const sf::Color fabricColors[] = { sf::Color(140, 70, 130), sf::Color(60, 110, 130), sf::Color(196, 150, 40), sf::Color(150, 50, 60) };
+            Vec3 fabricBase(basePos.x + 68.f, 0.f, southZ + 4.f);
+            for (int i = 0; i < 4; ++i) {
+                addBox(out, viewProj, windowSize, eye, fabricBase + Vec3(0.f, static_cast<float>(i) * 3.2f, 0.f), Vec3(20.f, 3.f, 12.f), fabricColors[i], lc);
+            }
+        }
+
+        // Hay bales, north of the bay's own footprint.
+        Vec3 hayBase(bayX0 + 8.f, 0.f, basePos.z + 2.f);
+        for (int i = 0; i < 2; ++i) {
+            Vec3 hp = hayBase + Vec3(static_cast<float>(i) * 11.f, 0.f, 0.f);
+            addBox(out, viewProj, windowSize, eye, hp, Vec3(9.f, 8.f, 9.f), hayColor, lc);
+            addBox(out, viewProj, windowSize, eye, hp + Vec3(1.f, 8.f, 1.f), Vec3(7.f, 1.5f, 7.f), hayCapColor, lc);
+        }
+
+        // Yarn-loaded wheelbarrow, south of the gap between the cabin and
+        // the bay -- the same crude cart-plus-wheel convention every
+        // barrow in this file uses, topped with 2 yarn-spool decals
+        // instead of Sheep's own wool clumps.
+        Vec3 cartPos(basePos.x + enclosedW - 6.f, 0.f, southZ + 4.f);
+        addBox(out, viewProj, windowSize, eye, cartPos, Vec3(16.f, 8.f, 10.f), cartColor, lc);
+        addBox(out, viewProj, windowSize, eye, cartPos + Vec3(6.f, -4.f, 4.f), Vec3(4.f, 4.f, 4.f), wheelColor, lc);
+        addBillboard(out, viewProj, windowSize, billboardRight, cartPos + Vec3(5.f, 8.f, 5.f), 16.f, 13.f, yarnTex, sf::Color::White);
+        addBillboard(out, viewProj, windowSize, billboardRight, cartPos + Vec3(11.f, 8.f, 5.f), 14.f, 11.f, yarnTex, sf::Color::White);
+
+        // Lantern post, west of the wheelbarrow (clear of its own footprint,
+        // dx 51.2-67.2 -- an earlier position at dx 58 sat right inside it).
+        Vec3 lanternPos(basePos.x + 38.f, 0.f, southZ + 8.f);
+        addBox(out, viewProj, windowSize, eye, lanternPos, Vec3(3.f, 24.f, 3.f), beamColor, lc);
+        addGlowBillboard(out, viewProj, windowSize, billboardRight, lanternPos + Vec3(1.5f, 28.f, 1.5f), 16.f, glowTex, sf::Color(255, 200, 120, 160));
     }
 }
 
@@ -3900,7 +6199,7 @@ void GameWorld::draw3DZone(sf::RenderWindow& window) {
     // scene instead of a shallow day/night delta.
     lc.sunStrength = 1.f - 0.74f * night;
     lc.ambient = 0.36f - 0.21f * night;
-    float lightBoost = 0.14f + 1.05f * night; // lamps/windows: dim by day, brighter-than-before by night (0.88->1.05 ceiling)
+    float lightBoost = 0.14f + 1.3f * night; // lamps/windows: dim by day, brighter-than-before by night (0.88->1.05->1.3 ceiling, 2026-08-10 "夜晚的灯有点暗" follow-up)
     // Billboards keep their own baked-in pixel-art shading (see
     // addBillboard's comment) -- this is just a flat multiply so they still
     // read as part of the same darkened night scene instead of staying
@@ -3933,7 +6232,7 @@ void GameWorld::draw3DZone(sf::RenderWindow& window) {
         // cap comment).
         light.pos = Vec3(b.position.x + b.size.x * 0.5f, kBuildingHeight * 0.45f, b.position.y + b.size.y + 22.f);
         light.color = Vec3(1.f, 0.78f, 0.43f);
-        light.intensity = 40.f * lightBoost; // 30->40, 2026-08-10 lighting-strengthen pass
+        light.intensity = 48.f * lightBoost; // 30->40->48, 2026-08-10 "夜晚的灯有点暗" follow-up
         lc.lights.push_back(light);
     }
     for (const auto& d : z.decorations) {
@@ -3941,7 +6240,7 @@ void GameWorld::draw3DZone(sf::RenderWindow& window) {
         PointLight3D light;
         light.pos = Vec3(d.position.x, 34.f, d.position.y);
         light.color = Vec3(1.f, 0.75f, 0.43f);
-        light.intensity = 36.f * lightBoost; // 28->36, 2026-08-10 lighting-strengthen pass
+        light.intensity = 44.f * lightBoost; // 28->36->44, 2026-08-10 "夜晚的灯有点暗" follow-up
         lc.lights.push_back(light);
     }
 
@@ -3974,8 +6273,28 @@ void GameWorld::draw3DZone(sf::RenderWindow& window) {
     // 2D world's own drawGlow soft-circle render, cached once as a plain
     // white sprite so each light can retint/resize it via the billboard's
     // own color multiply instead of baking a separate texture per light.
-    const sf::Texture& glowTex = getBillboard3D("glow_dot", sf::Vector2u(96, 96),
-        [&](sf::RenderTexture& rt) { drawGlow(rt, sf::Vector2f(48.f, 48.f), 40.f, sf::Color::White); });
+    //
+    // 2026-08-10 bugfix ("每个屋子的前面都有一个四方形的光环" -- every
+    // building's own glow reads as a square, not a soft circle): drawGlow's
+    // own outermost ring is radius * 3.4 * sizeScale (sizeScale up to 1.2 at
+    // night -- see its own comment), which at the old radius=40 into a 96x96
+    // (48-half-width) canvas comes out to 40*3.4*1.2=163 -- more than 3x
+    // wider than the canvas can hold. The circle's own curve is so far
+    // outside the visible square that the small arc actually inside the
+    // canvas reads as almost flat, tinting the whole square a near-uniform
+    // faint color instead of fading to transparent toward the corners --
+    // exactly a "square halo," not a soft one. This was always slightly
+    // wrong, but only became visible once this file's earlier lighting-
+    // strengthen pass enlarged the on-screen billboard size that stretches
+    // this same texture (`addGlowBillboard`'s `glowSize`), making the
+    // clipped-square artifact big enough to actually notice. Fixed by
+    // baking at a canvas/radius ratio that keeps the outer ring safely
+    // inside the bounds even at the maximum night sizeScale (128x128 canvas,
+    // radius 14: 14*3.4*1.2=57.1, comfortably under the 64-unit half-width) --
+    // a real soft circular falloff now, at any billboard size it gets
+    // stretched to.
+    const sf::Texture& glowTex = getBillboard3D("glow_dot", sf::Vector2u(128, 128),
+        [&](sf::RenderTexture& rt) { drawGlow(rt, sf::Vector2f(64.f, 64.f), 14.f, sf::Color::White); });
     // Tileable material-grain textures (see bakeGrainPattern's own comment)
     // for opaque faces that opt into real texture instead of a flat/banded
     // color -- currently just Staff Office's hero building (see
@@ -4246,6 +6565,67 @@ void GameWorld::draw3DZone(sf::RenderWindow& window) {
         sack.setOutlineColor(sf::Color(30, 24, 16));
         rt.draw(sack);
         });
+    // Bakery's bread-basket decal (see addBakeryBuilding below) -- a
+    // basket with a few oblong loaves poking over the rim, mounted on the
+    // outdoor display tables the same way Market mounts its own produce
+    // crate.
+    const sf::Texture& breadTex = getBillboard3D("bread_basket", sf::Vector2u(32, 22), [&](sf::RenderTexture& rt) {
+        sf::RectangleShape basket(sf::Vector2f(30.f, 10.f));
+        basket.setPosition(sf::Vector2f(1.f, 12.f));
+        basket.setFillColor(sf::Color(150, 108, 62));
+        basket.setOutlineThickness(1.f);
+        basket.setOutlineColor(sf::Color(90, 62, 34));
+        rt.draw(basket);
+        const std::pair<sf::Vector2f, float> loaves[] = { { {2.f, 4.f}, 20.f }, { {12.f, 2.f}, 22.f }, { {22.f, 5.f}, 18.f } };
+        for (const auto& [p, w] : loaves) {
+            sf::RectangleShape loaf(sf::Vector2f(w * 0.4f, 8.f));
+            loaf.setPosition(p);
+            loaf.setFillColor(sf::Color(198, 148, 88));
+            loaf.setOutlineThickness(0.8f);
+            loaf.setOutlineColor(sf::Color(110, 74, 38));
+            rt.draw(loaf);
+        }
+        });
+    // Textile Mill's loom decal (see addTextileMillBuilding below) -- a
+    // wooden frame with vertical warp threads and one horizontal beam,
+    // the same "fake a mechanism as a flat sprite" convention Sawmill's
+    // own wheel/blade decals already use.
+    const sf::Texture& loomTex = getBillboard3D("loom", sf::Vector2u(30, 36), [&](sf::RenderTexture& rt) {
+        sf::RectangleShape frame(sf::Vector2f(30.f, 36.f));
+        frame.setFillColor(sf::Color::Transparent);
+        frame.setOutlineThickness(2.f);
+        frame.setOutlineColor(sf::Color(96, 66, 40));
+        rt.draw(frame);
+        for (float x = 4.f; x < 28.f; x += 3.5f) {
+            sf::RectangleShape thread(sf::Vector2f(1.f, 30.f));
+            thread.setPosition(sf::Vector2f(x, 3.f));
+            thread.setFillColor(sf::Color(224, 218, 200));
+            rt.draw(thread);
+        }
+        sf::RectangleShape beam(sf::Vector2f(26.f, 3.f));
+        beam.setPosition(sf::Vector2f(2.f, 17.f));
+        beam.setFillColor(sf::Color(110, 78, 46));
+        rt.draw(beam);
+        });
+    // A loose cluster of colored yarn spools -- same "no crate, sits
+    // directly on a surface" idea as Farm's own veggie cluster, just a
+    // brighter dyed-thread palette.
+    const sf::Texture& yarnTex = getBillboard3D("yarn_spools", sf::Vector2u(20, 16), [&](sf::RenderTexture& rt) {
+        const std::pair<sf::Vector2f, sf::Color> spools[] = {
+            { {2.f, 5.f}, sf::Color(60, 110, 130) },  // teal
+            { {8.f, 2.f}, sf::Color(150, 50, 60) },   // maroon
+            { {13.f, 6.f}, sf::Color(196, 150, 40) }, // mustard
+            { {6.f, 9.f}, sf::Color(110, 70, 140) },  // purple
+        };
+        for (const auto& [p, col] : spools) {
+            sf::CircleShape s(3.4f);
+            s.setPosition(p);
+            s.setFillColor(col);
+            s.setOutlineThickness(0.8f);
+            s.setOutlineColor(sf::Color(30, 24, 16));
+            rt.draw(s);
+        }
+        });
     // Clinic's medical-cross sign decal and flower-planter decal (see
     // addClinicBuilding below) -- the cross is another "fake it as a flat
     // sprite" case (a plaque background + a painted cross, no separate
@@ -4351,6 +6731,34 @@ void GameWorld::draw3DZone(sf::RenderWindow& window) {
             rt.draw(ear);
         }
         });
+    // Sheepdog decal (see addPastureProps below) -- same small hand-drawn
+    // sprite convention as the pig/chicken decals just above.
+    const sf::Texture& dogTex = getBillboard3D("farm_dog", sf::Vector2u(22, 20), [&](sf::RenderTexture& rt) {
+        sf::CircleShape body(7.f);
+        body.setPosition(sf::Vector2f(6.f, 6.f));
+        body.setFillColor(sf::Color(120, 96, 72));
+        body.setOutlineThickness(1.f);
+        body.setOutlineColor(sf::Color(70, 54, 40));
+        rt.draw(body);
+        sf::CircleShape head(4.5f);
+        head.setPosition(sf::Vector2f(0.f, 3.f));
+        head.setFillColor(sf::Color(140, 114, 86));
+        head.setOutlineThickness(0.8f);
+        head.setOutlineColor(sf::Color(70, 54, 40));
+        rt.draw(head);
+        sf::ConvexShape ear(3);
+        ear.setPoint(0, sf::Vector2f(1.f, 3.f));
+        ear.setPoint(1, sf::Vector2f(-1.f, -2.f));
+        ear.setPoint(2, sf::Vector2f(3.f, 1.f));
+        ear.setFillColor(sf::Color(90, 70, 52));
+        rt.draw(ear);
+        sf::ConvexShape tail(3);
+        tail.setPoint(0, sf::Vector2f(18.f, 8.f));
+        tail.setPoint(1, sf::Vector2f(21.f, 3.f));
+        tail.setPoint(2, sf::Vector2f(20.f, 10.f));
+        tail.setFillColor(sf::Color(120, 96, 72));
+        rt.draw(tail);
+        });
     // A loose cluster of mixed garden produce, no crate underneath (unlike
     // Market's own crate decal) -- meant to sit directly on a crop bed's
     // own ground fill, reused across several bed types (cabbage/carrot/
@@ -4410,15 +6818,634 @@ void GameWorld::draw3DZone(sf::RenderWindow& window) {
         head.setFillColor(sf::Color(60, 50, 45));
         rt.draw(head);
         });
-    const sf::Texture& fruitTreeTex = getBillboard3D("fruit_tree", sf::Vector2u(26, 34), [&](sf::RenderTexture& rt) {
-        sf::RectangleShape trunk(sf::Vector2f(4.f, 12.f));
-        trunk.setPosition(sf::Vector2f(11.f, 20.f));
-        trunk.setFillColor(sf::Color(96, 64, 32));
+    // 2026-08-11 batch (Zone 5's remaining Field-family businesses) -- 4
+    // new decals: a cow, a hanging pelt, a tea bush, and a flax flower.
+    // 2026-08-11 detail pass ("那个奶牛可以再细节一点吗" -- can the cow
+    // get more detail): the old version was just a body rectangle + 2
+    // perfectly round black dots + a head rectangle -- no legs, no face,
+    // no tail, patches too geometric to read as fur. Bigger canvas (was
+    // 26x22), 4 thin legs, small ears + horns + a pink snout on the head,
+    // a tail, and the patches redrawn as lopsided convex blobs (real cow
+    // markings are never perfect circles) instead of CircleShapes.
+    const sf::Texture& cowTex = getBillboard3D("cow", sf::Vector2u(32, 28), [&](sf::RenderTexture& rt) {
+        sf::Color coat(245, 245, 240), outline(40, 38, 36);
+        for (float lx : { 5.f, 10.f, 17.f, 22.f }) {
+            sf::RectangleShape leg(sf::Vector2f(3.f, 8.f));
+            leg.setPosition(sf::Vector2f(lx, 18.f));
+            leg.setFillColor(sf::Color(60, 56, 50));
+            rt.draw(leg);
+        }
+        sf::RectangleShape tail(sf::Vector2f(2.f, 9.f));
+        tail.setPosition(sf::Vector2f(25.f, 9.f));
+        tail.setRotation(sf::degrees(20.f));
+        tail.setFillColor(sf::Color(60, 56, 50));
+        rt.draw(tail);
+
+        sf::RectangleShape body(sf::Vector2f(22.f, 13.f));
+        body.setPosition(sf::Vector2f(4.f, 7.f));
+        body.setFillColor(coat);
+        body.setOutlineThickness(1.f);
+        body.setOutlineColor(outline);
+        rt.draw(body);
+
+        const sf::Vector2f patchPts[2][5] = {
+            { {5.f, 8.f}, {9.f, 7.f}, {10.f, 11.f}, {7.f, 13.f}, {4.f, 11.f} },
+            { {15.f, 10.f}, {20.f, 9.f}, {21.f, 13.f}, {17.f, 16.f}, {14.f, 13.f} },
+        };
+        for (const auto& pts : patchPts) {
+            sf::ConvexShape patch;
+            patch.setPointCount(5);
+            for (std::size_t i = 0; i < 5; ++i) patch.setPoint(i, pts[i]);
+            patch.setFillColor(sf::Color(50, 48, 46));
+            rt.draw(patch);
+        }
+
+        sf::RectangleShape head(sf::Vector2f(8.f, 8.f));
+        head.setPosition(sf::Vector2f(0.f, 3.f));
+        head.setFillColor(coat);
+        head.setOutlineThickness(1.f);
+        head.setOutlineColor(outline);
+        rt.draw(head);
+        sf::RectangleShape snout(sf::Vector2f(6.f, 3.5f));
+        snout.setPosition(sf::Vector2f(0.5f, 9.f));
+        snout.setFillColor(sf::Color(214, 160, 168));
+        rt.draw(snout);
+        for (float ex : { -1.5f, 7.f }) {
+            sf::CircleShape ear(2.2f);
+            ear.setPosition(sf::Vector2f(ex, 1.5f));
+            ear.setFillColor(coat);
+            ear.setOutlineThickness(0.6f);
+            ear.setOutlineColor(outline);
+            rt.draw(ear);
+        }
+        for (float hx : { 1.f, 6.f }) {
+            sf::RectangleShape horn(sf::Vector2f(1.4f, 3.f));
+            horn.setPosition(sf::Vector2f(hx, 0.f));
+            horn.setFillColor(sf::Color(214, 204, 180));
+            rt.draw(horn);
+        }
+        });
+    const sf::Texture& peltTex = getBillboard3D("pelt", sf::Vector2u(14, 20), [&](sf::RenderTexture& rt) {
+        sf::ConvexShape pelt;
+        pelt.setPointCount(6);
+        pelt.setPoint(0, sf::Vector2f(7.f, 0.f));
+        pelt.setPoint(1, sf::Vector2f(13.f, 5.f));
+        pelt.setPoint(2, sf::Vector2f(11.f, 14.f));
+        pelt.setPoint(3, sf::Vector2f(7.f, 19.f));
+        pelt.setPoint(4, sf::Vector2f(3.f, 14.f));
+        pelt.setPoint(5, sf::Vector2f(1.f, 5.f));
+        pelt.setFillColor(sf::Color(150, 110, 75));
+        pelt.setOutlineThickness(0.8f);
+        pelt.setOutlineColor(sf::Color(90, 64, 42));
+        rt.draw(pelt);
+        });
+    // 2026-08-11 detail pass ("茶田的话可以做茶叶的样子出来吗" -- can the
+    // Tea Field show actual tea leaves): the old version was just 2 plain
+    // green circles (a shadow blob + a highlight blob), no leaf shapes at
+    // all -- read as a generic round shrub, not tea. Now the base/
+    // highlight blobs stay (still the cheapest way to fake canopy volume)
+    // but get a scatter of individual pointed-oval leaf shapes on top (2
+    // green tones) plus a few pale "new growth" tips at the crown -- the
+    // lighter shoots real tea bushes are actually picked for -- so the
+    // silhouette reads as leaves, not a blob.
+    const sf::Texture& teaBushTex = getBillboard3D("tea_bush", sf::Vector2u(22, 18), [&](sf::RenderTexture& rt) {
+        sf::CircleShape base(10.f);
+        base.setPosition(sf::Vector2f(1.f, 4.f));
+        base.setFillColor(sf::Color(70, 116, 58));
+        rt.draw(base);
+        sf::CircleShape hi(7.f);
+        hi.setPosition(sf::Vector2f(4.f, 2.f));
+        hi.setFillColor(sf::Color(96, 146, 72));
+        rt.draw(hi);
+
+        auto leaf = [&](sf::Vector2f p, float rotDeg, sf::Color col) {
+            sf::ConvexShape lf;
+            lf.setPointCount(4);
+            lf.setPoint(0, sf::Vector2f(2.f, 0.f));
+            lf.setPoint(1, sf::Vector2f(4.f, 2.f));
+            lf.setPoint(2, sf::Vector2f(2.f, 4.f));
+            lf.setPoint(3, sf::Vector2f(0.f, 2.f));
+            lf.setOrigin(sf::Vector2f(2.f, 2.f));
+            lf.setPosition(p);
+            lf.setRotation(sf::degrees(rotDeg));
+            lf.setFillColor(col);
+            rt.draw(lf);
+        };
+        const std::pair<sf::Vector2f, float> leaves[] = {
+            { {5.f, 5.f}, 20.f }, { {10.f, 4.f}, -25.f }, { {14.f, 7.f}, 40.f },
+            { {7.f, 9.f}, -10.f }, { {12.f, 10.f}, 15.f }, { {3.f, 9.f}, -30.f },
+        };
+        for (const auto& [p, rot] : leaves) leaf(p, rot, sf::Color(58, 100, 48));
+
+        // Pale new-growth tips near the crown, the part actually picked.
+        for (const auto& p : { sf::Vector2f(6.f, 2.f), sf::Vector2f(11.f, 1.f) }) leaf(p, 0.f, sf::Color(150, 190, 110));
+        });
+    // 2026-08-11 detail pass (Flax Field's own rework above) -- was a flat
+    // lying-down "stem rectangle + 3 plain dots" sprite meant to BE the
+    // whole plant; now that a real 3D stem box carries the plant's own
+    // height, this only needs to be the flower cluster sitting on top of
+    // it -- 2 actual 5-petal flax flowers (real flax blooms are 5-petaled,
+    // pale blue, with a small yellow center) instead of solid dots.
+    const sf::Texture& flaxFlowerTex = getBillboard3D("flax_flower", sf::Vector2u(16, 14), [&](sf::RenderTexture& rt) {
+        auto bloom = [&](sf::Vector2f center) {
+            for (int i = 0; i < 5; ++i) {
+                float ang = static_cast<float>(i) * 6.2831853f / 5.f;
+                sf::CircleShape petal(1.8f);
+                petal.setPosition(center + sf::Vector2f(std::cos(ang) * 2.2f - 1.8f, std::sin(ang) * 2.2f - 1.8f));
+                petal.setFillColor(sf::Color(160, 180, 226));
+                rt.draw(petal);
+            }
+            sf::CircleShape core(1.f);
+            core.setPosition(center - sf::Vector2f(1.f, 1.f));
+            core.setFillColor(sf::Color(230, 200, 90));
+            rt.draw(core);
+        };
+        bloom(sf::Vector2f(5.f, 5.f));
+        bloom(sf::Vector2f(11.f, 8.f));
+        });
+    // Apple/Pear tree sprites (2026-08-11, replacing the old single
+    // "fruit_tree" flat red blob -- see addOrchardProps's own rework
+    // comment): a shared `paintFruitTree` lambda draws the trunk, a short
+    // angled branch stub, and a layered canopy (dark base blob + lighter
+    // highlight blob on top, the same shadow/highlight "fake volume"
+    // split every foliage sprite in this file already uses), then the
+    // caller scatters its own fruit-colored dots (each with a small
+    // corner highlight, the veggieTex/cabbageTex "fake sphere" trick)
+    // across the canopy -- only the fruit color/positions differ between
+    // the 2 trees, so the shared shape code stays in one place.
+    auto paintFruitTree = [&](sf::RenderTexture& rt) {
+        sf::RectangleShape trunk(sf::Vector2f(5.f, 14.f));
+        trunk.setPosition(sf::Vector2f(12.5f, 24.f));
+        trunk.setFillColor(sf::Color(90, 60, 34));
         rt.draw(trunk);
-        sf::CircleShape canopy(9.f);
-        canopy.setPosition(sf::Vector2f(4.f, 3.f));
-        canopy.setFillColor(sf::Color(200, 90, 70));
-        rt.draw(canopy);
+        sf::RectangleShape branch(sf::Vector2f(9.f, 3.f));
+        branch.setPosition(sf::Vector2f(8.f, 21.f));
+        branch.setRotation(sf::degrees(-20.f));
+        branch.setFillColor(sf::Color(90, 60, 34));
+        rt.draw(branch);
+        sf::CircleShape base(12.f);
+        base.setPosition(sf::Vector2f(3.f, 2.f));
+        base.setFillColor(sf::Color(64, 108, 50));
+        rt.draw(base);
+        sf::CircleShape hi(10.f);
+        hi.setPosition(sf::Vector2f(4.5f, 1.f));
+        hi.setFillColor(sf::Color(92, 140, 66));
+        rt.draw(hi);
+    };
+    const sf::Texture& appleTreeTex = getBillboard3D("apple_tree", sf::Vector2u(30, 40), [&](sf::RenderTexture& rt) {
+        paintFruitTree(rt);
+        const sf::Vector2f apples[] = { {6.f, 10.f}, {17.f, 6.f}, {22.f, 13.f}, {9.f, 18.f}, {19.f, 19.f}, {13.f, 3.5f} };
+        for (const auto& a : apples) {
+            sf::CircleShape fruit(2.6f);
+            fruit.setPosition(a);
+            fruit.setFillColor(sf::Color(198, 48, 44));
+            fruit.setOutlineThickness(0.6f);
+            fruit.setOutlineColor(sf::Color(90, 24, 20));
+            rt.draw(fruit);
+            sf::CircleShape shine(1.f);
+            shine.setPosition(a + sf::Vector2f(0.7f, 0.4f));
+            shine.setFillColor(sf::Color(232, 116, 96));
+            rt.draw(shine);
+        }
+        });
+    const sf::Texture& pearTreeTex = getBillboard3D("pear_tree", sf::Vector2u(30, 40), [&](sf::RenderTexture& rt) {
+        paintFruitTree(rt);
+        const sf::Vector2f pears[] = { {7.f, 9.f}, {18.f, 7.f}, {21.f, 14.f}, {8.f, 17.f}, {20.f, 20.f}, {12.f, 4.f} };
+        for (const auto& p : pears) {
+            sf::CircleShape fruit(2.3f);
+            fruit.setPosition(p);
+            fruit.setFillColor(sf::Color(196, 186, 66));
+            fruit.setOutlineThickness(0.6f);
+            fruit.setOutlineColor(sf::Color(96, 88, 24));
+            rt.draw(fruit);
+            sf::CircleShape shine(0.9f);
+            shine.setPosition(p + sf::Vector2f(0.6f, 0.3f));
+            shine.setFillColor(sf::Color(228, 224, 140));
+            rt.draw(shine);
+        }
+        });
+    // Fruit-crate decal (2026-08-11, addOrchardProps's own new gate
+    // crates) -- a mixed pile of apples and pears, same layered-circle
+    // "fake sphere" fruit this file's own veggieTex/appleTreeTex already
+    // established, just packed tighter into a crate-sized sprite.
+    const sf::Texture& fruitCrateTex = getBillboard3D("fruit_crate", sf::Vector2u(22, 16), [&](sf::RenderTexture& rt) {
+        const std::pair<sf::Vector2f, sf::Color> pile[] = {
+            { {3.f, 6.f}, sf::Color(198, 48, 44) },
+            { {9.f, 3.f}, sf::Color(196, 186, 66) },
+            { {15.f, 6.f}, sf::Color(198, 48, 44) },
+            { {6.f, 10.f}, sf::Color(196, 186, 66) },
+            { {13.f, 10.f}, sf::Color(198, 48, 44) },
+        };
+        for (const auto& [p, col] : pile) {
+            sf::CircleShape fruit(3.f);
+            fruit.setPosition(p);
+            fruit.setFillColor(col);
+            fruit.setOutlineThickness(0.7f);
+            fruit.setOutlineColor(sf::Color(40, 30, 16));
+            rt.draw(fruit);
+        }
+        });
+    // Jam-jar decal (2026-08-11, addPreserveBuilding's own display table)
+    // -- a row of 4 differently-colored jars (fill = the jam flavor, a
+    // pale lid band, and a small corner shine each), the same "outlined
+    // circle + shine" fake-volume trick veggieTex/fruitCrateTex above use.
+    const sf::Texture& jamJarsTex = getBillboard3D("jam_jars", sf::Vector2u(30, 20), [&](sf::RenderTexture& rt) {
+        const sf::Color jarColors[] = { sf::Color(190, 70, 70), sf::Color(200, 140, 40), sf::Color(96, 70, 150), sf::Color(90, 120, 60) };
+        for (int i = 0; i < 4; ++i) {
+            float x = 1.f + static_cast<float>(i) * 7.f;
+            sf::RectangleShape body(sf::Vector2f(5.5f, 10.f));
+            body.setPosition(sf::Vector2f(x, 8.f));
+            body.setFillColor(jarColors[i]);
+            body.setOutlineThickness(0.6f);
+            body.setOutlineColor(sf::Color(30, 24, 16));
+            rt.draw(body);
+            sf::RectangleShape lid(sf::Vector2f(6.5f, 2.5f));
+            lid.setPosition(sf::Vector2f(x - 0.5f, 6.f));
+            lid.setFillColor(sf::Color(184, 182, 176));
+            rt.draw(lid);
+            sf::CircleShape shine(1.1f);
+            shine.setPosition(sf::Vector2f(x + 0.8f, 10.f));
+            shine.setFillColor(sf::Color(255, 255, 255, 120));
+            rt.draw(shine);
+        }
+        });
+    // Fruit-press wheel decal (2026-08-11, addPreserveBuilding's own
+    // press annex) -- a small wooden cross-handle over a hub, mounted on
+    // top of the press post; a scaled-down cousin of `sawmill_wheel`
+    // above without the paddle ring (a hand-cranked fruit press has no
+    // waterwheel to pretend).
+    const sf::Texture& pressWheelTex = getBillboard3D("press_wheel", sf::Vector2u(22, 22), [&](sf::RenderTexture& rt) {
+        sf::RectangleShape barH(sf::Vector2f(20.f, 3.f));
+        barH.setPosition(sf::Vector2f(1.f, 9.5f));
+        barH.setFillColor(sf::Color(110, 78, 44));
+        rt.draw(barH);
+        sf::RectangleShape barV(sf::Vector2f(3.f, 20.f));
+        barV.setPosition(sf::Vector2f(9.5f, 1.f));
+        barV.setFillColor(sf::Color(110, 78, 44));
+        rt.draw(barV);
+        sf::CircleShape hub(4.f);
+        hub.setPosition(sf::Vector2f(7.f, 7.f));
+        hub.setFillColor(sf::Color(70, 48, 26));
+        rt.draw(hub);
+        });
+    // Gold-nugget decal (2026-08-11, addGoldMineProps's own ore
+    // cart/pile) -- the same "outlined circle + shine" fake-volume trick
+    // as fruitCrateTex/jamJarsTex above, just gold-tinted.
+    const sf::Texture& goldOreTex = getBillboard3D("gold_ore", sf::Vector2u(20, 14), [&](sf::RenderTexture& rt) {
+        const sf::Vector2f nuggets[] = { {2.f, 7.f}, {7.f, 3.f}, {12.f, 6.f}, {16.f, 8.f}, {5.f, 10.f}, {10.f, 10.f} };
+        for (const auto& n : nuggets) {
+            sf::CircleShape nug(2.2f);
+            nug.setPosition(n);
+            nug.setFillColor(sf::Color(224, 186, 60));
+            nug.setOutlineThickness(0.6f);
+            nug.setOutlineColor(sf::Color(120, 92, 24));
+            rt.draw(nug);
+            sf::CircleShape shine(0.8f);
+            shine.setPosition(n + sf::Vector2f(0.5f, 0.3f));
+            shine.setFillColor(sf::Color(255, 240, 180));
+            rt.draw(shine);
+        }
+        });
+    // Gold-bar decal (2026-08-11, addGoldsmithBuilding's own display
+    // counter) -- 3 stacked ingots, each a trapezoid-ish rectangle (wider
+    // base, narrower lighter top face standing in for the sloped ingot
+    // sides, same "fake volume with flat shapes" trick this file leans on
+    // everywhere it has no bevel primitive).
+    const sf::Texture& goldBarTex = getBillboard3D("gold_bar", sf::Vector2u(24, 16), [&](sf::RenderTexture& rt) {
+        for (int i = 0; i < 3; ++i) {
+            float x = 1.f + static_cast<float>(i) * 7.5f, y = 9.f - static_cast<float>(i % 2) * 1.5f;
+            sf::RectangleShape bar(sf::Vector2f(7.f, 5.f));
+            bar.setPosition(sf::Vector2f(x, y));
+            bar.setFillColor(sf::Color(198, 162, 54));
+            bar.setOutlineThickness(0.6f);
+            bar.setOutlineColor(sf::Color(110, 84, 20));
+            rt.draw(bar);
+            sf::RectangleShape top(sf::Vector2f(5.f, 1.6f));
+            top.setPosition(sf::Vector2f(x + 1.f, y + 0.6f));
+            top.setFillColor(sf::Color(232, 202, 108));
+            rt.draw(top);
+        }
+        });
+    // Gem-tray decal (2026-08-11, same display counter) -- a small tray of
+    // loose cut gems, same "outlined circle + shine" fake-volume trick as
+    // fruitCrateTex/jamJarsTex, just multi-colored per gem instead of one
+    // flavor.
+    const sf::Texture& gemTrayTex = getBillboard3D("gem_tray", sf::Vector2u(24, 16), [&](sf::RenderTexture& rt) {
+        const std::pair<sf::Vector2f, sf::Color> gems[] = {
+            { {2.f, 5.f}, sf::Color(200, 50, 60) },
+            { {8.f, 3.f}, sf::Color(60, 110, 200) },
+            { {14.f, 6.f}, sf::Color(140, 70, 190) },
+            { {19.f, 4.f}, sf::Color(70, 170, 120) },
+            { {6.f, 10.f}, sf::Color(60, 110, 200) },
+            { {16.f, 10.f}, sf::Color(200, 50, 60) },
+        };
+        for (const auto& [p, col] : gems) {
+            sf::CircleShape gem(2.f);
+            gem.setPosition(p);
+            gem.setFillColor(col);
+            gem.setOutlineThickness(0.5f);
+            gem.setOutlineColor(sf::Color(30, 24, 30));
+            rt.draw(gem);
+            sf::CircleShape shine(0.7f);
+            shine.setPosition(p + sf::Vector2f(0.5f, 0.3f));
+            shine.setFillColor(sf::Color(255, 255, 255, 170));
+            rt.draw(shine);
+        }
+        });
+    // 2026-08-11 batch (Zone 2: Mining District's own remaining 5
+    // businesses, after "有的话就试看每一间你自己设计" -- go ahead and
+    // design the rest yourself): 5 new bespoke decals, one per building,
+    // same fake-volume conventions this file already established.
+    //
+    // Iron-bar decal (Smelter's own ingot stack) -- goldBarTex's same
+    // "wide base + lighter top face" ingot shape, just steel-grey instead
+    // of gold, plain iron rather than a precious metal.
+    const sf::Texture& ironBarTex = getBillboard3D("iron_bar", sf::Vector2u(24, 16), [&](sf::RenderTexture& rt) {
+        for (int i = 0; i < 3; ++i) {
+            float x = 1.f + static_cast<float>(i) * 7.5f, y = 9.f - static_cast<float>(i % 2) * 1.5f;
+            sf::RectangleShape bar(sf::Vector2f(7.f, 5.f));
+            bar.setPosition(sf::Vector2f(x, y));
+            bar.setFillColor(sf::Color(140, 142, 146));
+            bar.setOutlineThickness(0.6f);
+            bar.setOutlineColor(sf::Color(70, 72, 76));
+            rt.draw(bar);
+            sf::RectangleShape top(sf::Vector2f(5.f, 1.6f));
+            top.setPosition(sf::Vector2f(x + 1.f, y + 0.6f));
+            top.setFillColor(sf::Color(178, 180, 184));
+            rt.draw(top);
+        }
+        });
+    // Weapon-rack decal (Blacksmith's own outdoor rack) -- a sword and an
+    // axe, each a plain blade rectangle + a darker hilt/haft, mounted flat
+    // against the rack's own crossbar.
+    const sf::Texture& weaponRackTex = getBillboard3D("weapon_rack", sf::Vector2u(24, 22), [&](sf::RenderTexture& rt) {
+        sf::RectangleShape swordBlade(sf::Vector2f(3.f, 16.f));
+        swordBlade.setPosition(sf::Vector2f(4.f, 1.f));
+        swordBlade.setFillColor(sf::Color(180, 184, 190));
+        swordBlade.setOutlineThickness(0.5f);
+        swordBlade.setOutlineColor(sf::Color(70, 72, 76));
+        rt.draw(swordBlade);
+        sf::RectangleShape swordHilt(sf::Vector2f(6.f, 3.f));
+        swordHilt.setPosition(sf::Vector2f(2.5f, 15.f));
+        swordHilt.setFillColor(sf::Color(90, 62, 34));
+        rt.draw(swordHilt);
+        sf::ConvexShape axeHead;
+        axeHead.setPointCount(4);
+        axeHead.setPoint(0, sf::Vector2f(15.f, 2.f));
+        axeHead.setPoint(1, sf::Vector2f(21.f, 5.f));
+        axeHead.setPoint(2, sf::Vector2f(19.f, 10.f));
+        axeHead.setPoint(3, sf::Vector2f(15.f, 8.f));
+        axeHead.setFillColor(sf::Color(160, 164, 170));
+        axeHead.setOutlineThickness(0.5f);
+        axeHead.setOutlineColor(sf::Color(70, 72, 76));
+        rt.draw(axeHead);
+        sf::RectangleShape axeHaft(sf::Vector2f(2.5f, 17.f));
+        axeHaft.setPosition(sf::Vector2f(14.f, 3.f));
+        axeHaft.setFillColor(sf::Color(90, 62, 34));
+        rt.draw(axeHaft);
+        });
+    // Grinding-wheel decal (Gemshop's own cutting wheel) -- a plain grey
+    // stone disc, the same "flat billboard standing in for a round shape"
+    // trick Sawmill's own waterwheel/blade already established.
+    const sf::Texture& grindWheelTex = getBillboard3D("grind_wheel", sf::Vector2u(22, 22), [&](sf::RenderTexture& rt) {
+        sf::CircleShape rim(10.f);
+        rim.setPosition(sf::Vector2f(1.f, 1.f));
+        rim.setFillColor(sf::Color(150, 148, 144));
+        rim.setOutlineThickness(1.2f);
+        rim.setOutlineColor(sf::Color(90, 88, 84));
+        rt.draw(rim);
+        sf::CircleShape hub(3.f);
+        hub.setPosition(sf::Vector2f(8.f, 8.f));
+        hub.setFillColor(sf::Color(70, 48, 26));
+        rt.draw(hub);
+        });
+    // Furniture decal (Carpenter's own workbench) -- a plain wooden stool
+    // (seat + 4 short legs), standing in for "finished goods" the same
+    // way veggieTex/goldBarTex stand in for their own business's output.
+    const sf::Texture& furnitureTex = getBillboard3D("furniture_stool", sf::Vector2u(22, 20), [&](sf::RenderTexture& rt) {
+        sf::RectangleShape seat(sf::Vector2f(16.f, 4.f));
+        seat.setPosition(sf::Vector2f(3.f, 2.f));
+        seat.setFillColor(sf::Color(150, 108, 62));
+        seat.setOutlineThickness(0.6f);
+        seat.setOutlineColor(sf::Color(80, 56, 30));
+        rt.draw(seat);
+        for (float lx : { 4.f, 14.f }) {
+            sf::RectangleShape leg(sf::Vector2f(2.5f, 13.f));
+            leg.setPosition(sf::Vector2f(lx, 6.f));
+            leg.setFillColor(sf::Color(120, 86, 50));
+            rt.draw(leg);
+        }
+        });
+    // Dress-form decal (Tailor's own boutique display) -- a torso
+    // silhouette (shoulders/waist/hips as 3 stacked shapes, standing in
+    // for a mannequin curve the same way this file fakes every other
+    // round/organic form as flat layered shapes) on a thin center stand.
+    const sf::Texture& dressFormTex = getBillboard3D("dress_form", sf::Vector2u(20, 34), [&](sf::RenderTexture& rt) {
+        sf::RectangleShape stand(sf::Vector2f(2.f, 20.f));
+        stand.setPosition(sf::Vector2f(9.f, 14.f));
+        stand.setFillColor(sf::Color(70, 48, 26));
+        rt.draw(stand);
+        sf::Color fabricColor(196, 172, 148);
+        sf::ConvexShape torso;
+        torso.setPointCount(6);
+        torso.setPoint(0, sf::Vector2f(4.f, 2.f));
+        torso.setPoint(1, sf::Vector2f(16.f, 2.f));
+        torso.setPoint(2, sf::Vector2f(13.f, 9.f));
+        torso.setPoint(3, sf::Vector2f(15.f, 16.f));
+        torso.setPoint(4, sf::Vector2f(5.f, 16.f));
+        torso.setPoint(5, sf::Vector2f(7.f, 9.f));
+        torso.setFillColor(fabricColor);
+        torso.setOutlineThickness(0.7f);
+        torso.setOutlineColor(sf::Color(120, 100, 80));
+        rt.draw(torso);
+        sf::CircleShape neck(2.2f);
+        neck.setPosition(sf::Vector2f(7.8f, -1.f));
+        neck.setFillColor(shade3d(fabricColor, -20));
+        rt.draw(neck);
+        });
+    // 2026-08-11 2nd batch (finishing out Zone 3): 2 more decals for
+    // Apothecary/Alchemist/Winery (Brewery family) and Jeweler (MasonGem
+    // family).
+    //
+    // Bottle-rack decal, shared by all 3 Brewery-family buildings this
+    // round -- drawn near-white/neutral (235,235,235) specifically so
+    // each caller's own `addBillboard` tint color (green for herbal
+    // tinctures, purple for potions, dark red for wine) recolors the SAME
+    // baked sprite instead of baking 3 near-identical bottle shapes, the
+    // same multiply-tint trick dayNightTint already relies on everywhere.
+    const sf::Texture& bottleRackTex = getBillboard3D("bottle_rack", sf::Vector2u(22, 18), [&](sf::RenderTexture& rt) {
+        for (int i = 0; i < 3; ++i) {
+            float x = 1.f + static_cast<float>(i) * 7.f;
+            sf::RectangleShape body(sf::Vector2f(5.f, 10.f));
+            body.setPosition(sf::Vector2f(x, 6.f));
+            body.setFillColor(sf::Color(235, 235, 235));
+            body.setOutlineThickness(0.6f);
+            body.setOutlineColor(sf::Color(80, 80, 80));
+            rt.draw(body);
+            sf::RectangleShape neck(sf::Vector2f(2.f, 4.f));
+            neck.setPosition(sf::Vector2f(x + 1.5f, 2.f));
+            neck.setFillColor(sf::Color(235, 235, 235));
+            rt.draw(neck);
+            sf::RectangleShape cork(sf::Vector2f(2.6f, 1.6f));
+            cork.setPosition(sf::Vector2f(x + 1.2f, 1.f));
+            cork.setFillColor(sf::Color(150, 108, 62));
+            rt.draw(cork);
+        }
+        });
+    // Jewelry-display decal (Jeweler's own counter) -- a ring (outlined
+    // circle, no fill) with a set gem, plus a beaded chain-and-pendant
+    // necklace, distinct from Goldsmith/Gemshop's own loose-gem/ingot
+    // decals since a jeweler sells FINISHED pieces, not raw material.
+    const sf::Texture& jewelryTex = getBillboard3D("jewelry_display", sf::Vector2u(24, 16), [&](sf::RenderTexture& rt) {
+        sf::CircleShape ring(4.f);
+        ring.setPosition(sf::Vector2f(2.f, 5.f));
+        ring.setFillColor(sf::Color::Transparent);
+        ring.setOutlineThickness(1.8f);
+        ring.setOutlineColor(sf::Color(220, 180, 60));
+        rt.draw(ring);
+        sf::CircleShape gem(1.6f);
+        gem.setPosition(sf::Vector2f(5.f, 7.f));
+        gem.setFillColor(sf::Color(200, 60, 90));
+        rt.draw(gem);
+        for (int i = 0; i < 4; ++i) {
+            sf::CircleShape link(1.f);
+            link.setPosition(sf::Vector2f(12.f + static_cast<float>(i) * 2.2f, 3.f + std::sin(static_cast<float>(i) * 0.8f) * 1.5f));
+            link.setFillColor(sf::Color(220, 180, 60));
+            rt.draw(link);
+        }
+        sf::CircleShape pendant(2.4f);
+        pendant.setPosition(sf::Vector2f(17.f, 9.f));
+        pendant.setFillColor(sf::Color(140, 70, 190));
+        pendant.setOutlineThickness(0.6f);
+        pendant.setOutlineColor(sf::Color(80, 40, 110));
+        rt.draw(pendant);
+        });
+    // Teapot decal (Teahouse's own counter) -- a round pot body, spout,
+    // lid, handle, and 2 cups beside it.
+    const sf::Texture& teapotTex = getBillboard3D("teapot", sf::Vector2u(28, 18), [&](sf::RenderTexture& rt) {
+        sf::CircleShape body(7.f);
+        body.setPosition(sf::Vector2f(2.f, 4.f));
+        body.setFillColor(sf::Color(200, 60, 70));
+        body.setOutlineThickness(0.8f);
+        body.setOutlineColor(sf::Color(90, 24, 30));
+        rt.draw(body);
+        sf::RectangleShape spout(sf::Vector2f(6.f, 2.5f));
+        spout.setPosition(sf::Vector2f(14.f, 7.f));
+        spout.setRotation(sf::degrees(-20.f));
+        spout.setFillColor(sf::Color(200, 60, 70));
+        rt.draw(spout);
+        sf::CircleShape lid(2.f);
+        lid.setPosition(sf::Vector2f(7.5f, 1.f));
+        lid.setFillColor(sf::Color(220, 90, 100));
+        rt.draw(lid);
+        sf::RectangleShape handle(sf::Vector2f(2.f, 6.f));
+        handle.setPosition(sf::Vector2f(0.f, 6.f));
+        handle.setFillColor(sf::Color(200, 60, 70));
+        rt.draw(handle);
+        for (float cx : { 20.f, 24.f }) {
+            sf::RectangleShape cup(sf::Vector2f(3.f, 3.5f));
+            cup.setPosition(sf::Vector2f(cx, 10.f));
+            cup.setFillColor(sf::Color(235, 230, 220));
+            cup.setOutlineThickness(0.5f);
+            cup.setOutlineColor(sf::Color(120, 110, 100));
+            rt.draw(cup);
+        }
+        });
+    // 2026-08-11 3rd batch ("剩下一次过都来吧" -- get the rest done in one
+    // go): Zone 4/6/7's remaining decals -- a fish, loose pearls, a pie, a
+    // roast, and a mini layer cake.
+    const sf::Texture& fishTex = getBillboard3D("fish", sf::Vector2u(22, 14), [&](sf::RenderTexture& rt) {
+        sf::ConvexShape body;
+        body.setPointCount(4);
+        body.setPoint(0, sf::Vector2f(2.f, 7.f));
+        body.setPoint(1, sf::Vector2f(14.f, 2.f));
+        body.setPoint(2, sf::Vector2f(16.f, 7.f));
+        body.setPoint(3, sf::Vector2f(14.f, 12.f));
+        body.setFillColor(sf::Color(120, 150, 180));
+        body.setOutlineThickness(0.8f);
+        body.setOutlineColor(sf::Color(50, 70, 90));
+        rt.draw(body);
+        sf::ConvexShape tail;
+        tail.setPointCount(3);
+        tail.setPoint(0, sf::Vector2f(2.f, 7.f));
+        tail.setPoint(1, sf::Vector2f(-4.f, 2.f));
+        tail.setPoint(2, sf::Vector2f(-4.f, 12.f));
+        tail.setFillColor(sf::Color(90, 120, 150));
+        rt.draw(tail);
+        sf::CircleShape eye(1.2f);
+        eye.setPosition(sf::Vector2f(12.f, 5.f));
+        eye.setFillColor(sf::Color(20, 20, 20));
+        rt.draw(eye);
+        });
+    const sf::Texture& pearlTex = getBillboard3D("pearls", sf::Vector2u(20, 14), [&](sf::RenderTexture& rt) {
+        const sf::Vector2f pearls[] = { {2.f, 6.f}, {8.f, 3.f}, {13.f, 6.f}, {17.f, 4.f}, {5.f, 9.f}, {11.f, 10.f} };
+        for (const auto& p : pearls) {
+            sf::CircleShape pearl(2.4f);
+            pearl.setPosition(p);
+            pearl.setFillColor(sf::Color(240, 236, 228));
+            pearl.setOutlineThickness(0.4f);
+            pearl.setOutlineColor(sf::Color(190, 186, 176));
+            rt.draw(pearl);
+            sf::CircleShape shine(0.8f);
+            shine.setPosition(p + sf::Vector2f(0.5f, 0.3f));
+            shine.setFillColor(sf::Color(255, 255, 255, 200));
+            rt.draw(shine);
+        }
+        });
+    const sf::Texture& pieTex = getBillboard3D("pie", sf::Vector2u(20, 14), [&](sf::RenderTexture& rt) {
+        sf::CircleShape crust(9.f);
+        crust.setPosition(sf::Vector2f(1.f, 1.f));
+        crust.setFillColor(sf::Color(200, 150, 90));
+        crust.setOutlineThickness(1.f);
+        crust.setOutlineColor(sf::Color(120, 84, 48));
+        rt.draw(crust);
+        sf::CircleShape filling(6.f);
+        filling.setPosition(sf::Vector2f(4.f, 4.f));
+        filling.setFillColor(sf::Color(178, 60, 54));
+        rt.draw(filling);
+        for (int i = 0; i < 4; ++i) {
+            float ang = static_cast<float>(i) * 0.7854f;
+            sf::RectangleShape lattice(sf::Vector2f(13.f, 1.4f));
+            lattice.setOrigin(sf::Vector2f(6.5f, 0.7f));
+            lattice.setPosition(sf::Vector2f(10.f, 10.f));
+            lattice.setRotation(sf::degrees(ang * 57.3f));
+            lattice.setFillColor(sf::Color(160, 112, 62));
+            rt.draw(lattice);
+        }
+        });
+    const sf::Texture& roastTex = getBillboard3D("roast", sf::Vector2u(22, 14), [&](sf::RenderTexture& rt) {
+        sf::RectangleShape skewer(sf::Vector2f(22.f, 1.6f));
+        skewer.setPosition(sf::Vector2f(0.f, 6.f));
+        skewer.setFillColor(sf::Color(90, 90, 90));
+        rt.draw(skewer);
+        sf::CircleShape meat(6.5f);
+        meat.setPosition(sf::Vector2f(5.f, 0.5f));
+        meat.setFillColor(sf::Color(160, 90, 50));
+        meat.setOutlineThickness(1.f);
+        meat.setOutlineColor(sf::Color(90, 46, 24));
+        rt.draw(meat);
+        sf::CircleShape shine(2.2f);
+        shine.setPosition(sf::Vector2f(8.f, 3.f));
+        shine.setFillColor(sf::Color(210, 150, 100));
+        rt.draw(shine);
+        });
+    const sf::Texture& cakeTex = getBillboard3D("cake", sf::Vector2u(18, 20), [&](sf::RenderTexture& rt) {
+        sf::RectangleShape tier1(sf::Vector2f(16.f, 7.f));
+        tier1.setPosition(sf::Vector2f(1.f, 11.f));
+        tier1.setFillColor(sf::Color(240, 220, 225));
+        tier1.setOutlineThickness(0.8f);
+        tier1.setOutlineColor(sf::Color(200, 160, 170));
+        rt.draw(tier1);
+        sf::RectangleShape tier2(sf::Vector2f(11.f, 6.f));
+        tier2.setPosition(sf::Vector2f(3.5f, 5.f));
+        tier2.setFillColor(sf::Color(250, 235, 238));
+        tier2.setOutlineThickness(0.8f);
+        tier2.setOutlineColor(sf::Color(200, 160, 170));
+        rt.draw(tier2);
+        sf::CircleShape cherry(1.6f);
+        cherry.setPosition(sf::Vector2f(8.f, 1.f));
+        cherry.setFillColor(sf::Color(190, 40, 60));
+        rt.draw(cherry);
         });
     const sf::Texture& herbTuftTex = getBillboard3D("herb_tuft", sf::Vector2u(14, 14), [&](sf::RenderTexture& rt) {
         sf::CircleShape tuft(5.f);
@@ -4426,11 +7453,58 @@ void GameWorld::draw3DZone(sf::RenderWindow& window) {
         tuft.setFillColor(sf::Color(110, 160, 80));
         rt.draw(tuft);
         });
-    const sf::Texture& grapeTex = getBillboard3D("grape_cluster", sf::Vector2u(10, 10), [&](sf::RenderTexture& rt) {
-        sf::CircleShape grape(3.5f);
-        grape.setPosition(sf::Vector2f(1.5f, 1.5f));
-        grape.setFillColor(sf::Color(110, 60, 130));
-        rt.draw(grape);
+    // Popcorn-bucket decal (Popcorn Stand's own counter).
+    const sf::Texture& popcornTex = getBillboard3D("popcorn", sf::Vector2u(18, 20), [&](sf::RenderTexture& rt) {
+        sf::ConvexShape bucket;
+        bucket.setPointCount(4);
+        bucket.setPoint(0, sf::Vector2f(3.f, 10.f));
+        bucket.setPoint(1, sf::Vector2f(15.f, 10.f));
+        bucket.setPoint(2, sf::Vector2f(13.f, 20.f));
+        bucket.setPoint(3, sf::Vector2f(5.f, 20.f));
+        bucket.setFillColor(sf::Color(220, 60, 60));
+        bucket.setOutlineThickness(0.8f);
+        bucket.setOutlineColor(sf::Color(140, 30, 30));
+        rt.draw(bucket);
+        const sf::Vector2f puffs[] = { {2.f, 4.f}, {7.f, 1.f}, {12.f, 3.f}, {16.f, 6.f}, {5.f, 8.f}, {10.f, 6.f} };
+        for (const auto& p : puffs) {
+            sf::CircleShape puff(2.6f);
+            puff.setPosition(p);
+            puff.setFillColor(sf::Color(250, 235, 200));
+            puff.setOutlineThickness(0.5f);
+            puff.setOutlineColor(sf::Color(210, 190, 150));
+            rt.draw(puff);
+        }
+        });
+    // 2026-08-11 rework (Vineyard's own trellis redo above) -- was a
+    // single flat purple dot; now an actual tapering grape-bunch
+    // silhouette (9 overlapping circles narrowing to a point, each with a
+    // small shine) under a small leaf, matching the bigger 14-unit display
+    // size the new hanging-cluster billboards use.
+    const sf::Texture& grapeTex = getBillboard3D("grape_cluster", sf::Vector2u(16, 20), [&](sf::RenderTexture& rt) {
+        sf::ConvexShape leaf;
+        leaf.setPointCount(4);
+        leaf.setPoint(0, sf::Vector2f(8.f, 0.f));
+        leaf.setPoint(1, sf::Vector2f(14.f, 3.f));
+        leaf.setPoint(2, sf::Vector2f(8.f, 6.f));
+        leaf.setPoint(3, sf::Vector2f(2.f, 3.f));
+        leaf.setFillColor(sf::Color(80, 120, 60));
+        rt.draw(leaf);
+        const sf::Vector2f grapes[] = {
+            {4.f, 5.f}, {9.f, 5.f}, {6.5f, 7.5f}, {2.5f, 9.f}, {7.f, 9.5f}, {11.f, 9.f},
+            {4.5f, 12.5f}, {9.f, 12.5f}, {6.5f, 15.f},
+        };
+        for (const auto& g : grapes) {
+            sf::CircleShape grape(2.6f);
+            grape.setPosition(g);
+            grape.setFillColor(sf::Color(110, 60, 130));
+            grape.setOutlineThickness(0.4f);
+            grape.setOutlineColor(sf::Color(60, 30, 74));
+            rt.draw(grape);
+            sf::CircleShape shine(0.8f);
+            shine.setPosition(g + sf::Vector2f(0.6f, 0.4f));
+            shine.setFillColor(sf::Color(170, 120, 190, 180));
+            rt.draw(shine);
+        }
         });
     auto personKey = [](sf::Color c) {
         return "person_" + std::to_string(c.r) + "_" + std::to_string(c.g) + "_" + std::to_string(c.b);
@@ -4503,14 +7577,19 @@ void GameWorld::draw3DZone(sf::RenderWindow& window) {
         // see dimForLock3d's own comment).
         if (!locked) {
             if (b.id == "farm") { addFarmProps(quads, viewProj, windowSize_, eye, b, lc, billboardRight, glowTex, chickenTex, pigTex, veggieTex, flowerTex, forageTex, cabbageTex, game_.farmCropId()); continue; }
-            if (b.id == "mine") { addMineProps(quads, viewProj, windowSize_, eye, b, lc, sf::Color(114, 106, 100)); continue; }
-            if (b.id == "goldmine") { addGoldMineProps(quads, viewProj, windowSize_, eye, b, lc, billboardRight, glowTex); continue; }
+            if (b.id == "mine") { addMineProps(quads, viewProj, windowSize_, eye, b, lc, billboardRight, glowTex, sf::Color(114, 106, 100)); continue; }
+            if (b.id == "goldmine") { addGoldMineProps(quads, viewProj, windowSize_, eye, b, lc, billboardRight, glowTex, goldOreTex); continue; }
             if (b.id == "lumber") { addLumberProps(quads, viewProj, windowSize_, eye, b, lc, billboardRight, glowTex); continue; }
             if (b.id == "quarry") { addQuarryProps(quads, viewProj, windowSize_, eye, b, lc, billboardRight, glowTex); continue; }
-            if (b.id == "sheep") { addPastureProps(quads, viewProj, windowSize_, eye, b, lc, billboardRight, sheepTex, billboardDayNight); continue; }
-            if (b.id == "orchard") { addOrchardProps(quads, viewProj, windowSize_, eye, b, lc, billboardRight, fruitTreeTex, billboardDayNight); continue; }
+            if (b.id == "sheep") { addPastureProps(quads, viewProj, windowSize_, eye, b, lc, billboardRight, glowTex, sheepTex, chickenTex, pigTex, dogTex, billboardDayNight); continue; }
+            if (b.id == "orchard") { addOrchardProps(quads, viewProj, windowSize_, eye, b, lc, billboardRight, appleTreeTex, pearTreeTex, fruitCrateTex, billboardDayNight); continue; }
             if (b.id == "herbgarden") { addHerbGardenProps(quads, viewProj, windowSize_, eye, b, lc, billboardRight, herbTuftTex, billboardDayNight); continue; }
             if (b.id == "vineyard") { addVineyardProps(quads, viewProj, windowSize_, eye, b, lc, billboardRight, grapeTex, billboardDayNight); continue; }
+            if (b.id == "dairyfarm") { addDairyFarmProps(quads, viewProj, windowSize_, eye, b, lc, billboardRight, cowTex, billboardDayNight); continue; }
+            if (b.id == "beehive") { addBeehiveProps(quads, viewProj, windowSize_, eye, b, lc, billboardRight, glowTex, flowerTex); continue; }
+            if (b.id == "trapper") { addTrapperProps(quads, viewProj, windowSize_, eye, b, lc, billboardRight, glowTex, peltTex); continue; }
+            if (b.id == "teafield") { addTeaFieldProps(quads, viewProj, windowSize_, eye, b, lc, billboardRight, teaBushTex, billboardDayNight); continue; }
+            if (b.id == "flaxfield") { addFlaxFieldProps(quads, viewProj, windowSize_, eye, b, lc, billboardRight, flaxFlowerTex, billboardDayNight); continue; }
             if (b.id == "doctor") { addClinicBuilding(quads, viewProj, windowSize_, eye, b, lc, kBuildingHeight, billboardRight, glowTex, stoneTex, shingleTex, archTex, crossTex, flowerTex); continue; }
             if (b.id == "staff") { addRecruitmentCenterBuilding(quads, viewProj, windowSize_, eye, b, lc, kBuildingHeight, kRoofRise, billboardRight, glowTex, stoneTex, plasterTex, shingleTex); continue; }
             if (b.id == "bank") { addBankBuilding(quads, viewProj, windowSize_, eye, b, lc, kBuildingHeight, kRoofRise, billboardRight, glowTex, stoneTex, plasterTex, shingleTex, vaultTex, cabinetTex); continue; }
@@ -4520,8 +7599,55 @@ void GameWorld::draw3DZone(sf::RenderWindow& window) {
             if (b.id == "market") { addMarketBuilding(quads, viewProj, windowSize_, eye, b, lc, billboardRight, crateTex); continue; }
             if (b.id == "warehouse") { addWarehouseBuilding(quads, viewProj, windowSize_, eye, b, lc, kBuildingHeight, kRoofRise, billboardRight, glowTex, stoneTex, plasterTex, shingleTex); continue; }
             if (b.id == "storefront") { addStorefrontBuilding(quads, viewProj, windowSize_, eye, b, lc, kBuildingHeight, kRoofRise, billboardRight, glowTex, stoneTex, shingleTex, flowerTex, goodsTex); continue; }
+            // 2026-08-11: re-enabled after a temporary diagnostic hide -- the
+            // "pale shapes" report near Sawmill turned out to be Mason's own
+            // stone cluster (see addMasonBuilding's own updated comment on
+            // why, and the real fix applied there) bleeding into view
+            // because Mason (`{370,480}`) shares its exact X with Sawmill
+            // (`{370,180}`), not anything about Sawmill's own model -- this
+            // hide served its diagnostic purpose and is reverted.
             if (b.id == "sawmill") { addSawmillBuilding(quads, viewProj, windowSize_, eye, b, lc, kBuildingHeight, kRoofRise, billboardRight, glowTex, stoneTex, shingleTex, flowerTex, wheelTex, sawBladeTex); continue; }
             if (b.id == "mason") { addMasonBuilding(quads, viewProj, windowSize_, eye, b, lc, kBuildingHeight, kRoofRise, billboardRight, glowTex, stoneTex, shingleTex, flowerTex, statueTex); continue; }
+            if (b.id == "bakery") { addBakeryBuilding(quads, viewProj, windowSize_, eye, b, lc, kBuildingHeight, kRoofRise, billboardRight, glowTex, stoneTex, shingleTex, flowerTex, archTex, breadTex); continue; }
+            if (b.id == "preserve") { addPreserveBuilding(quads, viewProj, windowSize_, eye, b, lc, kBuildingHeight, kRoofRise, billboardRight, glowTex, stoneTex, shingleTex, flowerTex, archTex, jamJarsTex, pressWheelTex, fruitCrateTex); continue; }
+            if (b.id == "goldsmith") { addGoldsmithBuilding(quads, viewProj, windowSize_, eye, b, lc, kBuildingHeight, kRoofRise, billboardRight, glowTex, stoneTex, shingleTex, flowerTex, archTex, goldBarTex, gemTrayTex, goldOreTex); continue; }
+            if (b.id == "textile") { addTextileMillBuilding(quads, viewProj, windowSize_, eye, b, lc, kBuildingHeight, kRoofRise, billboardRight, glowTex, stoneTex, shingleTex, flowerTex, loomTex, yarnTex); continue; }
+            if (b.id == "smelter") { addSmelterBuilding(quads, viewProj, windowSize_, eye, b, lc, kBuildingHeight, kRoofRise, billboardRight, glowTex, stoneTex, shingleTex, flowerTex, archTex, ironBarTex); continue; }
+            if (b.id == "blacksmith") { addBlacksmithBuilding(quads, viewProj, windowSize_, eye, b, lc, kBuildingHeight, kRoofRise, billboardRight, glowTex, stoneTex, shingleTex, flowerTex, archTex, weaponRackTex); continue; }
+            if (b.id == "gemshop") { addGemshopBuilding(quads, viewProj, windowSize_, eye, b, lc, kBuildingHeight, kRoofRise, billboardRight, glowTex, stoneTex, shingleTex, flowerTex, gemTrayTex, grindWheelTex); continue; }
+            if (b.id == "carpenter") { addCarpenterBuilding(quads, viewProj, windowSize_, eye, b, lc, kBuildingHeight, kRoofRise, billboardRight, glowTex, stoneTex, shingleTex, flowerTex, furnitureTex); continue; }
+            if (b.id == "tailor") { addTailorBuilding(quads, viewProj, windowSize_, eye, b, lc, kBuildingHeight, kRoofRise, billboardRight, glowTex, stoneTex, shingleTex, flowerTex, dressFormTex, yarnTex); continue; }
+            if (b.id == "apothecary") { addApothecaryBuilding(quads, viewProj, windowSize_, eye, b, lc, kBuildingHeight, kRoofRise, billboardRight, glowTex, stoneTex, shingleTex, flowerTex, archTex, herbTuftTex, bottleRackTex); continue; }
+            if (b.id == "alchemist") { addAlchemistBuilding(quads, viewProj, windowSize_, eye, b, lc, kBuildingHeight, kRoofRise, billboardRight, glowTex, stoneTex, shingleTex, flowerTex, bottleRackTex); continue; }
+            if (b.id == "winery") { addWineryBuilding(quads, viewProj, windowSize_, eye, b, lc, kBuildingHeight, kRoofRise, billboardRight, glowTex, stoneTex, shingleTex, flowerTex, pressWheelTex, bottleRackTex); continue; }
+            if (b.id == "jeweler") { addJewelerBuilding(quads, viewProj, windowSize_, eye, b, lc, kBuildingHeight, kRoofRise, billboardRight, glowTex, stoneTex, shingleTex, flowerTex, jewelryTex); continue; }
+            if (b.id == "creamery") { addCreameryBuilding(quads, viewProj, windowSize_, eye, b, lc, kBuildingHeight, kRoofRise, billboardRight, glowTex, stoneTex, shingleTex, flowerTex, pressWheelTex, bottleRackTex); continue; }
+            if (b.id == "meadery") { addMeaderyBuilding(quads, viewProj, windowSize_, eye, b, lc, kBuildingHeight, kRoofRise, billboardRight, glowTex, stoneTex, shingleTex, flowerTex, bottleRackTex); continue; }
+            if (b.id == "tannery") { addTanneryBuilding(quads, viewProj, windowSize_, eye, b, lc, kBuildingHeight, kRoofRise, billboardRight, glowTex, stoneTex, shingleTex, flowerTex, peltTex); continue; }
+            if (b.id == "linenmill") { addLinenMillBuilding(quads, viewProj, windowSize_, eye, b, lc, kBuildingHeight, kRoofRise, billboardRight, glowTex, stoneTex, shingleTex, flowerTex, pressWheelTex, yarnTex); continue; }
+            if (b.id == "teahouse") { addTeahouseBuilding(quads, viewProj, windowSize_, eye, b, lc, billboardRight, glowTex, teapotTex, teaBushTex); continue; }
+            if (b.id == "giftbasket") { addGiftBasketBuilding(quads, viewProj, windowSize_, eye, b, lc, billboardRight, bottleRackTex, teaBushTex); continue; }
+            if (b.id == "seasalt") { addSeaSaltProps(quads, viewProj, windowSize_, eye, b, lc); continue; }
+            if (b.id == "pearlfarm") { addPearlFarmProps(quads, viewProj, windowSize_, eye, b, lc, billboardRight, pearlTex); continue; }
+            if (b.id == "fishing") { addFishingProps(quads, viewProj, windowSize_, eye, b, lc, billboardRight, fishTex); continue; }
+            if (b.id == "shipyard") { addShipyardBuilding(quads, viewProj, windowSize_, eye, b, lc, billboardRight); continue; }
+            if (b.id == "port") { addPortBuilding(quads, viewProj, windowSize_, eye, b, lc, billboardRight); continue; }
+            if (b.id == "pearlatelier") { addPearlAtelierBuilding(quads, viewProj, windowSize_, eye, b, lc, kBuildingHeight, kRoofRise, billboardRight, glowTex, stoneTex, shingleTex, flowerTex, pearlTex); continue; }
+            if (b.id == "jamkitchen") { addJamKitchenBuilding(quads, viewProj, windowSize_, eye, b, lc, kBuildingHeight, kRoofRise, billboardRight, glowTex, stoneTex, shingleTex, flowerTex, jamJarsTex); continue; }
+            if (b.id == "pieshop") { addPieShopBuilding(quads, viewProj, windowSize_, eye, b, lc, kBuildingHeight, kRoofRise, billboardRight, glowTex, stoneTex, shingleTex, flowerTex, pieTex); continue; }
+            if (b.id == "roaststand") { addRoastStandBuilding(quads, viewProj, windowSize_, eye, b, lc, kBuildingHeight, kRoofRise, billboardRight, glowTex, stoneTex, shingleTex, flowerTex, roastTex); continue; }
+            if (b.id == "picklinghouse") { addPicklingHouseBuilding(quads, viewProj, windowSize_, eye, b, lc, kBuildingHeight, kRoofRise, billboardRight, glowTex, stoneTex, shingleTex, flowerTex, bottleRackTex); continue; }
+            if (b.id == "honeyrefinery") { addHoneyRefineryBuilding(quads, viewProj, windowSize_, eye, b, lc, kBuildingHeight, kRoofRise, billboardRight, glowTex, stoneTex, shingleTex, flowerTex, bottleRackTex); continue; }
+            if (b.id == "cakeshop") { addCakeShopBuilding(quads, viewProj, windowSize_, eye, b, lc, kBuildingHeight, kRoofRise, billboardRight, glowTex, stoneTex, shingleTex, flowerTex, cakeTex); continue; }
+            if (b.id == "artisanbakery") { addArtisanBakeryBuilding(quads, viewProj, windowSize_, eye, b, lc, kBuildingHeight, kRoofRise, billboardRight, glowTex, stoneTex, shingleTex, flowerTex, breadTex); continue; }
+            if (b.id == "popcornstand") { addPopcornStandBuilding(quads, viewProj, windowSize_, eye, b, lc, billboardRight, popcornTex); continue; }
+            if (b.id == "juicebar") { addJuiceBarBuilding(quads, viewProj, windowSize_, eye, b, lc, billboardRight, bottleRackTex); continue; }
+            if (b.id == "cannery") { addCanneryBuilding(quads, viewProj, windowSize_, eye, b, lc, billboardRight, fishTex); continue; }
+            if (b.id == "smokehouse") { addSmokehouseBuilding(quads, viewProj, windowSize_, eye, b, lc, kBuildingHeight, kRoofRise, billboardRight, glowTex, stoneTex, shingleTex, flowerTex, fishTex); continue; }
+            if (b.id == "deepsea") { addDeepSeaProps(quads, viewProj, windowSize_, eye, b, lc, billboardRight, fishTex); continue; }
+            if (b.id == "sushibar") { addSushiBarBuilding(quads, viewProj, windowSize_, eye, b, lc, billboardRight, fishTex); continue; }
+            if (b.id == "fishermanplatter") { addFishermanPlatterBuilding(quads, viewProj, windowSize_, eye, b, lc, billboardRight, fishTex); continue; }
+            if (b.id == "island_ferry") { addIslandFerryProps(quads, viewProj, windowSize_, eye, b, lc, billboardRight, glowTex); continue; }
         }
 
         sf::Color wallColor = shade3d(b.labelColor, -70);
@@ -4571,21 +7697,24 @@ void GameWorld::draw3DZone(sf::RenderWindow& window) {
     // the `< 0.02f` cutoff just avoids pushing a fully-transparent quad
     // (and its draw-call/batch-flush cost) for every light all day long.
     for (const auto& light : lc.lights) {
-        float strength = std::clamp(light.intensity / 38.f, 0.f, 1.f); // 38 ~= the un-boosted intensity both light sources above are scaled from (40/36)
+        float strength = std::clamp(light.intensity / 46.f, 0.f, 1.f); // 46 ~= the un-boosted intensity both light sources above are scaled from (48/44)
         if (strength < 0.02f) continue;
-        // 2026-08-10 lighting-strengthen pass: bloom alpha 150->195 and
-        // glow radius 34+46*s -> 40+62*s -- every lamp/window bloom halo in
-        // the game routes through this one loop, so this is the "all glows"
-        // lever without re-tuning each hero building's own decal-flanking
-        // glow calls (those were individually calibrated against specific
-        // decals across many earlier bugfix rounds -- see this file's own
-        // memory log -- and stay untouched here).
+        // 2026-08-10, 2nd lighting-strengthen follow-up ("夜晚的灯有点暗" --
+        // nighttime lights still read a bit dim): bloom alpha 195->225 and
+        // glow radius 40+62*s -> 46+70*s, on top of the earlier 150->195/
+        // 34+46*s pass -- same "every lamp/window bloom halo routes through
+        // this one loop" lever as before. Also now safe to push bigger than
+        // last time specifically because glowTex itself just got fixed
+        // (see its own bake-site comment) -- it used to clip into a visible
+        // square at any size much past its old baked proportions, so this
+        // round's bigger stretch would have made that worse; now it's a
+        // genuine soft circle at any size.
         sf::Color tint(
             clamp8_3d(static_cast<int>(light.color.x * 255.f)),
             clamp8_3d(static_cast<int>(light.color.y * 255.f)),
             clamp8_3d(static_cast<int>(light.color.z * 255.f)),
-            clamp8_3d(static_cast<int>(195.f * strength)));
-        float glowSize = 40.f + 62.f * strength;
+            clamp8_3d(static_cast<int>(225.f * strength)));
+        float glowSize = 46.f + 70.f * strength;
         addGlowBillboard(quads, viewProj, windowSize_, billboardRight, light.pos, glowSize, glowTex, tint);
     }
 
@@ -4645,13 +7774,19 @@ void GameWorld::draw3DZone(sf::RenderWindow& window) {
             if (ci.requiresConstruction) labelY = ci.inProgress ? (kBuildingHeight + kRoofRise + 20.f) : 34.f; // in-progress sites now have a real truss/wall (see addConstructionSiteProps) reaching wallH+roofRise -- clear of that instead of the old flat lot's low 34
             else if (!locked && (b.id == "mine" || b.id == "goldmine")) labelY = 74.f; // above the mound's own 62-high apex
             else if (!locked && (b.id == "farm" || b.id == "lumber" || b.id == "quarry" || b.id == "sheep" ||
-                b.id == "orchard" || b.id == "herbgarden" || b.id == "vineyard")) labelY = 44.f; // flat-plot archetypes -- above their tallest prop (fruit trees at 34), not a roofline that doesn't exist here
+                b.id == "orchard" || b.id == "herbgarden" || b.id == "vineyard" || b.id == "dairyfarm" ||
+                b.id == "beehive" || b.id == "trapper" || b.id == "teafield" || b.id == "flaxfield" ||
+                b.id == "seasalt" || b.id == "pearlfarm")) labelY = 48.f; // flat-plot archetypes -- above their tallest prop, not a roofline that doesn't exist here (44 -> 48 alongside Orchard's own 2026-08-11 tree-height bump, 42 -> 46). 2026-08-11 2nd/3rd follow-ups: added the Zone 5 and Zone 4 flat-plot businesses here too -- they'd have fallen through to the generic `kBuildingHeight + kRoofRise + 14` default otherwise, floating the label way above a lot with no actual building on it.
+            else if (!locked && (b.id == "fishing" || b.id == "shipyard" || b.id == "port" || b.id == "cannery" ||
+                b.id == "deepsea" || b.id == "fishermanplatter" || b.id == "island_ferry")) labelY = 54.f; // Dock family (addDockShell) -- no wall/roof, just a flat deck; 54 clears every Dock business's own tallest prop (Port's own signal mast, the tallest at ~48)
             else if (!locked && b.id == "staff") labelY = kBuildingHeight * 1.15f + kRoofRise * 1.5f + 16.f; // taller hero building -- see addRecruitmentCenterBuilding's own wallH2/gableRise math
             else if (!locked && b.id == "bank") labelY = kBuildingHeight * 1.05f + kRoofRise * 0.85f + 16.f; // see addBankBuilding's own wallH2/roofRise math
             else if (!locked && b.id == "sleep") labelY = kBuildingHeight * 1.12f + kRoofRise * 1.4f + 16.f; // see addInnBuilding's own wallH2/gableRise math
             else if (!locked && b.id == "eat") labelY = kBuildingHeight * 1.02f + kRoofRise * 1.35f + 16.f; // see addKitchenBuilding's own wallH2/gableRise math
             else if (!locked && b.id == "townhall") labelY = kBuildingHeight * 1.3f + kRoofRise * 1.3f + 20.f; // above the main gable's own peak (see addTownHallBuilding) -- not the much-taller clock tower/spire, which sits well off the footprint's horizontal center this label anchors to
             else if (!locked && b.id == "market") labelY = 74.f; // no wall/roof here at all -- above the canopy's own back-edge height (58, see addMarketBuilding) with clearance, same "flat-plot archetype" idea as the mine mound/farm rows above
+            else if (!locked && (b.id == "teahouse" || b.id == "giftbasket" || b.id == "popcornstand" ||
+                b.id == "juicebar" || b.id == "sushibar")) labelY = 74.f; // Stall family -- same addStripedAwning backH (58) as Market above, same clearance math
             else if (!locked && b.id == "doctor") labelY = kBuildingHeight * 1.15f + 30.f; // parapet top (14, see addClinicBuilding's wallH2 math) + label clearance (16) -- this renderer's first flat-roof hero building, no gable-rise term needed
             else if (!locked && b.id == "warehouse") labelY = kBuildingHeight * 1.05f + kRoofRise + 20.f; // above the ridge (see addWarehouseBuilding's own wallH2/roofRise math), plus the small vent box sitting right at that height -- retuned down from 1.35x/1.2x after "太高了" feedback
             else if (!locked && b.id == "storefront") labelY = kBuildingHeight * 1.1f + kRoofRise * 1.4f + 16.f; // see addStorefrontBuilding's own wallH2/gableRise math -- same family as Staff Office's front-gable label height

@@ -97,9 +97,25 @@ struct Zone {
 enum class OverlayKind {
     None, Businesses, Tree, Market, Staff, Sleep, Eat, Doctor, FastForward, Achievements, DeathNotice, Legacy, Dialogue,
     Bank, Warehouse, Contracts, HowToPlay, CropPicker, RecipeBook,
-    TimingMinigame, // fishing (Fishing Dock) or mining (Mine/Gold Mine) -- see minigameBusinessId_
+    // 2026-08-12 ("矿场和金矿这两个可以不用和渔场的一样吗,做一个别的
+    // 小游戏" -- give Mine/Gold Mine their own minigame instead of reusing
+    // Fishing Dock's): TimingMinigame used to be shared by fishing AND
+    // mining (see minigameFlavorFor's old mine/goldmine branch) -- same
+    // overlay, same single-shot indicator-catch test, only the title/button
+    // text differed. Fishing Dock only from here on; Mine/Gold Mine get
+    // their own MiningMinigame below.
+    TimingMinigame, // fishing (Fishing Dock) -- see minigameBusinessId_
+    MiningMinigame, // mine (Ore Mine) or goldmine (Gold Mine) -- see the mining combo state below
     Chopping,       // lumber (Lumber Camp) -- a different mash-to-target mechanic
-    Brewing,        // alchemist or winery -- memorize-then-repeat a color sequence
+    Brewing,        // winery -- memorize-then-repeat a color sequence (Alchemist moved to PowerMix, see below)
+    // 2026-08-12 batch (same request that split mining off Fishing's
+    // mechanic, "你看下其他的还有什么小游戏可以加" -- see what else could
+    // get its own minigame): 4 more mechanics, each its own distinct input
+    // shape -- see each one's own state comment further down in this file.
+    PowerMix,     // alchemist -- hold-to-charge, release inside a continuously wobbling zone
+    Herding,      // sheep/dairyfarm/beehive/trapper -- steer a cursor to track a wandering target over time
+    TileReveal,   // seasalt/pearlfarm/quarry -- pick-and-flip tiles, no timing/reflexes at all
+    RhythmTap,    // cannery/smokehouse/sushibar -- multiple scrolling beat markers, catch each at a fixed hit line
     Pause,          // opened by Escape from the walking-around world -- "save or keep playing", plus a way into Settings
     Settings,       // volume/resolution/fullscreen/key rebinding -- reached from Pause
     WelcomeBack,    // shown once at startup if Game::lastWelcomeBack() has anything to report -- see drawWelcomeBackOverlay
@@ -202,23 +218,49 @@ private:
     // clicking it reveals how long the player was away and what happened.
     bool welcomeBackExpanded_ = false;
 
-    // ---- Timing-bar minigames (see OverlayKind::TimingMinigame /
+    // ---- Timing-bar minigame (see OverlayKind::TimingMinigame /
     // drawTimingMinigameOverlay): an indicator sweeps back and forth over a
     // bar; catching it inside the highlighted target zone (Space, or the
-    // button) is a better result than missing. minigameBusinessId_ says
-    // which building's own output good is rewarded (see
-    // Game::tryMinigameBonus) -- "fishing" at the Fishing Dock, "mine"/
-    // "goldmine" at the Mine/Gold Mine, sharing this same mechanic and
-    // overlay, just reskinned by whichever id is active. Fishing and mining
-    // have separate cooldowns (so playing one doesn't lock out the other),
-    // each ticking down every frame regardless of overlay state so they
-    // keep counting even while some other menu is open. ----
+    // button) is a better result than missing. Fishing Dock only now (see
+    // OverlayKind::MiningMinigame's own comment for why Mine/Gold Mine
+    // moved off this shared mechanic) -- minigameBusinessId_ is always
+    // "fishing" here, kept as a field rather than hardcoded since
+    // Game::tryMinigameBonus still takes it as a plain businessId string.
+    // fishingCooldown_ ticks down every frame regardless of overlay state,
+    // so it keeps counting even while some other menu is open. ----
     std::string minigameBusinessId_;
     float fishingCooldown_ = 0.f;
-    float miningCooldown_ = 0.f;
     float minigameIndicatorPhase_ = 0.f;
     float minigameTargetCenter_ = 0.5f;   // 0..1 along the bar
     float minigameTargetHalfWidth_ = 0.08f;
+
+    // ---- Mining combo minigame (see OverlayKind::MiningMinigame): 2026-08-12
+    // ("矿场和金矿这两个可以不用和渔场的一样吗,做一个别的小游戏" -- give
+    // Mine/Gold Mine their own minigame instead of reusing Fishing Dock's).
+    // Reuses the same indicator-catch PHYSICS as the timing bar above (still
+    // the simplest fair reflex-timing primitive in the game) but wraps it in
+    // a 3-strike combo instead of Fishing's one-shot: a fresh random target
+    // zone each strike, and the indicator sweeps faster + the target zone
+    // narrows round to round (kMiningRoundSpeedMults/kMiningRoundHalfWidths),
+    // so it reads as "digging in progressively harder rock" rather than "the
+    // same cast, one more time". Each strike calls Game::tryMinigameBonus on
+    // its own hit/miss immediately (same reward/rare-roll formula as a
+    // single Fishing catch) rather than only paying out once for the whole
+    // combo, so landing 2 of 3 pays out for those 2 strikes instead of
+    // needing new all-or-nothing economy code in Game.cpp. Only one cooldown
+    // for the whole 3-strike combo (started once it ends, in resolveMiningRound),
+    // same "can't immediately re-trigger" pattern as every other minigame --
+    // Mine and Gold Mine still share ONE cooldown/combo (same as how they
+    // used to share the timing bar), just no longer share it with Fishing. ----
+    static constexpr int kMiningRounds = 3;
+    static constexpr float kMiningRoundSpeedMults[kMiningRounds] = { 1.0f, 1.4f, 1.9f }; // multiplies kMinigameIndicatorSpeed
+    static constexpr float kMiningRoundHalfWidths[kMiningRounds] = { 0.11f, 0.075f, 0.05f }; // narrower = harder, per strike
+    float miningCooldown_ = 0.f;
+    int miningRound_ = 0;                    // 0-based, which strike (0..kMiningRounds-1) is currently live
+    int miningHits_ = 0;                      // hits landed so far this combo, for the running streak display
+    std::vector<bool> miningRoundResults_;    // one entry per strike already resolved, true = hit -- drives the pip row in drawMiningMinigameOverlay
+    float miningIndicatorPhase_ = 0.f;
+    float miningTargetCenter_ = 0.5f;         // 0..1 along the bar, re-rolled each strike
 
     // ---- Lumber chopping minigame (see OverlayKind::Chopping): mash Space
     // (or click) to reach a click target before a short timer runs out --
@@ -239,19 +281,132 @@ private:
     static constexpr float kForageRespawnSeconds = 45.f;
 
     // ---- Brewing minigame (see OverlayKind::Brewing): memorize a short
-    // color sequence, then reproduce it by clicking -- a third minigame
-    // mechanic (Alchemist/Winery), reusing minigameBusinessId_ from the
-    // timing bar above since only one minigame overlay is ever open at once.
-    // Alchemist and Winery get separate cooldowns, same reasoning as
-    // fishing/mining having separate ones. ----
+    // color sequence, then reproduce it by clicking. Winery only now (see
+    // OverlayKind::PowerMix's comment for why Alchemist moved off this
+    // shared mechanic) -- minigameBusinessId_ is always "winery" here,
+    // reusing the same field the timing bar uses since only one minigame
+    // overlay is ever open at once. wineryCooldown_ still separate from
+    // every other minigame's own cooldown, same reasoning as fishing/mining
+    // having separate ones. ----
     static constexpr int kBrewSequenceLength = 4;
     static constexpr float kBrewShowSeconds = 3.f;
     std::vector<int> brewSequence_;      // each 0..3, one of 4 colors
     size_t brewStep_ = 0;                // how many correct clicks so far, during input phase
     float brewShowTimer_ = 0.f;
     bool brewShowingSequence_ = true;
-    float alchemistCooldown_ = 0.f;
     float wineryCooldown_ = 0.f;
+
+    // ---- Power-Mix minigame (see OverlayKind::PowerMix): 2026-08-12,
+    // Alchemist's replacement for the Brewing mechanic it used to share with
+    // Winery (still just "another distinct minigame idea" per the same
+    // request that produced the mining combo/herding/tile-reveal/rhythm-tap
+    // additions below). Hold Space to charge a power meter; the target zone
+    // wobbles back and forth continuously (powerMixTargetCenter_, recomputed
+    // every frame in updatePowerMix from powerMixElapsed_) instead of
+    // sitting still like every other minigame's target -- release (letting
+    // go of Space) checks the CURRENT power level against whichever spot the
+    // wobbling zone happens to be at that instant. That's a genuinely
+    // different input shape from every other minigame here: hold-then-
+    // release timed against two things moving at once, rather than a single
+    // tap against one static or single-axis-moving target. Keyboard (Space)
+    // only, deliberately -- there's no existing "mouse button held down"
+    // click-region concept in this codebase (every uiButton fires its
+    // onClick on press, not on release), and holding the real mouse button
+    // down anywhere on screen while this overlay is open would charge it
+    // even over the Close button, which reads as a bug rather than a
+    // feature. Charging all the way to 1.0 without releasing auto-resolves
+    // at that final position rather than leaving the player stuck.
+    // Alchemist alone (Winery kept the original Brewing mechanic), so this
+    // reuses alchemistCooldown_ from the old shared-with-Winery ternary
+    // rather than adding a new field. ----
+    static constexpr float kPowerMixFillRate = 0.62f;   // power gained per second while held
+    static constexpr float kPowerMixWobbleSpeed = 1.8f; // radians/sec the target zone oscillates at
+    static constexpr float kPowerMixHalfWidth = 0.09f;  // target zone half-width, same units as power (0..1)
+    float alchemistCooldown_ = 0.f;
+    float powerMixPower_ = 0.f;          // 0..1, current charge level
+    bool powerMixCharging_ = false;      // true once Space has been pressed this attempt -- lets updatePowerMix detect the release edge
+    float powerMixElapsed_ = 0.f;        // seconds since this attempt started, drives the wobble
+    float powerMixTargetCenter_ = 0.5f;  // 0..1, recomputed every frame while charging
+
+    // ---- Herding minigame (see OverlayKind::Herding): 2026-08-12, gives
+    // Sheep Farm/Dairy Farm/Apiary/Trapper's Camp -- the game's 4 animal-
+    // handling raw producers, previously the only remaining tier-1
+    // producers with no minigame at all besides Farm/Mine/Lumber/Fishing --
+    // their own mechanic instead of just bolting one of the existing 5 onto
+    // them. A target (the animal) wanders a small box via a fixed Lissajous
+    // curve (herdTargetPos, two out-of-phase sine waves -- reads as
+    // "wandering" without needing per-frame randomness that could jitter or
+    // run away); the player steers a cursor over it with the same movement
+    // keys used to walk around the world (free to reuse here since world
+    // movement itself is gated on currentOverlay_ == None, see the main
+    // update loop). Reward is based on cumulative TIME spent within catch
+    // radius of the target over a fixed window, not a single timed tap --
+    // continuous tracking is the whole point of this one, distinct from
+    // every tap/hold/click mechanic elsewhere in the game. Each of the 4
+    // businesses gets its own cooldown, same reasoning as every other
+    // multi-business minigame here. ----
+    static constexpr float kHerdTimeWindow = 6.f;       // seconds the whole attempt lasts
+    static constexpr float kHerdHitThreshold = 2.5f;    // cumulative caught-seconds needed for a hit
+    static constexpr float kHerdCatchRadius = 0.13f;    // cursor-to-target distance (0..1 box space) that counts as "caught"
+    static constexpr float kHerdCursorSpeed = 1.1f;     // cursor movement speed, box-space units/sec
+    sf::Vector2f herdCursorPos_{ 0.5f, 0.5f };  // 0..1 within the play box
+    float herdElapsed_ = 0.f;
+    float herdCaughtTime_ = 0.f;
+    float sheepCooldown_ = 0.f;
+    float dairyfarmCooldown_ = 0.f;
+    float beehiveCooldown_ = 0.f;
+    float trapperCooldown_ = 0.f;
+
+    // ---- Tile-reveal minigame (see OverlayKind::TileReveal): 2026-08-12,
+    // gives Salt Flats/Pearl Farm/Quarry a pure risk-free pick-and-see
+    // mechanic -- no timing or reflexes at all, unlike every other minigame
+    // here, so a player who wants a break from reflex challenges still has
+    // something to do at these 3 buildings. A grid of kTileRevealTileCount
+    // tiles is shuffled with kTileRevealBonusCount of them marked "bonus"
+    // (rest plain); the player picks any kTileRevealPicks of their choosing
+    // (tileRevealRevealed_ tracks which indices are already fliped) and each
+    // pick resolves its own Game::tryMinigameBonus call immediately (bonus
+    // tile = hit), same "pay out per event, not once for the whole session"
+    // reasoning as the mining combo. Each of the 3 businesses gets its own
+    // cooldown, same as every other multi-business minigame. ----
+    static constexpr int kTileRevealTileCount = 6;
+    static constexpr int kTileRevealBonusCount = 2;
+    static constexpr int kTileRevealPicks = 3;
+    std::vector<bool> tileRevealIsBonus_;   // kTileRevealTileCount entries, shuffled fresh each attempt
+    std::vector<bool> tileRevealRevealed_;  // parallel array, which tiles have been picked so far
+    int tileRevealPicksUsed_ = 0;
+    float seasaltCooldown_ = 0.f;
+    float pearlfarmCooldown_ = 0.f;
+    float quarryCooldown_ = 0.f;
+
+    // ---- Rhythm-tap minigame (see OverlayKind::RhythmTap): 2026-08-12,
+    // gives Cannery/Smokehouse/Sushi Bar (Fisher's Isle's fish-processing
+    // trio) a discrete multi-target reflex mechanic, distinct from the
+    // timing bar's single continuous back-and-forth sweep and the mining
+    // combo's sequential single-target strikes: kRhythmBeats markers spawn
+    // staggered kRhythmSpawnStagger seconds apart and travel toward a fixed
+    // hit line over kRhythmTravelSeconds each (rhythmMarkers_' `spawnTime`
+    // is seconds-since-attempt-start, current position is derived from that
+    // + rhythmElapsed_ rather than stored directly) -- multiple markers can
+    // be in flight at once, unlike every strike/round in the other
+    // minigames being strictly sequential. A marker not caught within
+    // kRhythmHitTolerance of the hit line auto-resolves as a miss once it
+    // passes. Unlike the mining combo's per-strike toast, results are
+    // batched into ONE summary message once all markers resolve (see
+    // finishRhythmTap) -- individual per-beat toasts would just flash by
+    // unreadably at this pace. Each of the 3 businesses gets its own
+    // cooldown, same as every other multi-business minigame. ----
+    static constexpr int kRhythmBeats = 4;
+    static constexpr float kRhythmSpawnStagger = 0.65f;   // seconds between each marker's spawn
+    static constexpr float kRhythmTravelSeconds = 1.5f;   // seconds a marker takes to reach the hit line from spawn
+    static constexpr float kRhythmHitTolerance = 0.10f;   // catch window, in the same 0..1 "progress" units as travel
+    struct RhythmMarker { float spawnTime; bool resolved; bool hit; };
+    std::vector<RhythmMarker> rhythmMarkers_;
+    float rhythmElapsed_ = 0.f;
+    int rhythmResolvedCount_ = 0;
+    float canneryCooldown_ = 0.f;
+    float smokehouseCooldown_ = 0.f;
+    float sushibarCooldown_ = 0.f;
 
     // ---- Day/night cycle + weather: purely visual (flat-color overlays,
     // matching the rest of the world's plain-shape look -- no gradients or
@@ -354,6 +509,38 @@ private:
     std::string overlayFeedback_;     // transient result text ("Upgraded!", "Not enough cash", ...)
     sf::Color overlayFeedbackColor_ = sf::Color::White;
     float overlayFeedbackTimer_ = 0.f;
+    // AutoSell overlay (see drawAutoSellOverlay). Went through two earlier
+    // designs before landing here -- 2026-08-11 ("当我点击了禁用后,下次点击
+    // 回来他会问我是否开回自动销售") added a yes/no confirm before
+    // RE-enabling a just-disabled good; a same-day follow-up ("我点击了那个
+    // 商品,但是我还没有点击要自动售卖并点击了退出那个界面,当我点回商铺我
+    // 可以看到他正在售卖") widened that confirm to cover a brand new
+    // selection too, since clicking a row to just look at a price still
+    // armed it immediately on the very first click. That version still
+    // didn't match how the player actually expects the panel to work
+    // ("我点回那个商品他又问我多一次是否开启" -- clicking back on the good
+    // already selling asked to enable it AGAIN instead of recognizing it was
+    // already live): a yes/no popup fired by the same row click used to
+    // select a good doesn't leave room to look at/adjust a good BEFORE
+    // committing, which is the actual flow requested -- "开启 调整售卖价格
+    // ----> 确认 ---> 自动售卖中 ---> 取消自动售卖" (pick -> adjust price ->
+    // confirm -> selling -> cancel).
+    //
+    // Clicking a row now only stages that good in the right-hand panel --
+    // never touches game_ state by itself, whether the good is brand new or
+    // already selling. `autoSellSelectedGoodId_` is that staged good (kept
+    // in sync with whatever's actually live when the overlay opens, see
+    // openOverlay); `autoSellStagedThreshold_` is its being-edited threshold
+    // while NOT yet live (once live, the +/-% buttons write straight through
+    // to Game and this field goes unused until the good is disabled again).
+    // A dedicated Start/Disable button is the only thing that ever actually
+    // calls Game::trySetStorefrontAutoSell -- a row click can never silently
+    // arm or disarm anything by itself anymore. Each list row also now shows
+    // which good (if any) is actually live, not just which one is staged,
+    // so "which good is currently auto-selling" is visible without opening
+    // the right-hand panel at all.
+    std::string autoSellSelectedGoodId_;
+    double autoSellStagedThreshold_ = 0.0;
     std::string deathNoticeMessage_;  // populated when a TickOutcome says the character died
     int deathNoticeGeneration_ = 0;
     std::string dialogueSpeaker_;     // Dialogue overlay: NPC name for the current line
@@ -682,6 +869,25 @@ private:
         std::function<void()> onClick, bool enabled = true);
     void uiText(sf::RenderWindow& window, sf::Vector2f pos, const std::string& text, unsigned int size,
         sf::Color color = sf::Color::White, bool bold = false);
+    // 2026-08-12 ("诊所的那个解释好像有超出框架了" -- the Doctor overlay's
+    // explanation text runs past the panel edge): every "*_desc_line*"-style
+    // string (Doctor/AutoSell/...) was hand-wrapped in English to roughly
+    // fit its panel, then translated into ONE long Chinese sentence with no
+    // line breaks of its own -- Chinese has no spaces to eyeball a wrap
+    // point at, and uiText draws a single sf::Text line with no wrapping at
+    // all, so a long enough translation just runs off the right edge of a
+    // narrower panel (Doctor's is only 600 wide -- see drawDoctorOverlay)
+    // instead of staying inside it the way the English original did.
+    // Measures actual glyph width via sf::Text (not a character-count
+    // guess, which would be wrong for CJK glyphs being wider than Latin
+    // ones at the same font size) and breaks at the last space in the
+    // current line when there is one (keeps English words whole), or
+    // hard-breaks mid-character when there isn't (the only option for a
+    // space-less CJK sentence). Returns the total height drawn (line count
+    // * lineH) so callers can advance their own layout past it instead of
+    // guessing how many lines a given string wrapped into.
+    float uiWrappedText(sf::RenderWindow& window, sf::Vector2f pos, const std::string& text, float maxWidth,
+        unsigned int size, sf::Color color = sf::Color::White, float lineH = 18.f, bool bold = false);
     // Hard-crops subsequent drawing to `region` (same logical windowSize_
     // coordinate space as every draw call in this file) by installing a view
     // whose viewport is the matching sub-rectangle of gameView_'s own
@@ -734,17 +940,38 @@ private:
     void drawHowToPlayOverlay(sf::RenderWindow& window);
     void drawCropPickerOverlay(sf::RenderWindow& window);
     void drawTimingMinigameOverlay(sf::RenderWindow& window);
+    void drawMiningMinigameOverlay(sf::RenderWindow& window);
     void drawChoppingOverlay(sf::RenderWindow& window);
+    void drawPowerMixOverlay(sf::RenderWindow& window);
+    void drawHerdingOverlay(sf::RenderWindow& window);
+    void drawTileRevealOverlay(sf::RenderWindow& window);
+    void drawRhythmTapOverlay(sf::RenderWindow& window);
 
-    // Attempts to start the timing-bar minigame for `businessId` ("fishing",
-    // "mine", or "goldmine") -- checks it's actually built and its own
-    // cooldown, and shows a toast instead of opening the overlay if not.
+    // Attempts to start the Fishing Dock's timing-bar minigame -- checks
+    // it's actually built and its own cooldown, and shows a toast instead
+    // of opening the overlay if not.
     void tryStartTimingMinigame(const std::string& businessId);
     // Reads the indicator's current position, resolves hit/miss via
-    // Game::tryMinigameBonus, closes the overlay, sets that business's
-    // cooldown, and shows the result via setFeedback. Shared by the
-    // Space-key and the "Catch!"/"Mine!" button.
+    // Game::tryMinigameBonus, closes the overlay, sets fishingCooldown_,
+    // and shows the result via setFeedback. Shared by the Space-key and the
+    // "Catch!" button.
     void resolveTimingMinigame();
+
+    // Attempts to start the Mine/Gold Mine's 3-strike combo minigame (see
+    // GameWorld.h's own comment on the mining combo state) -- same built/
+    // cooldown checks as tryStartTimingMinigame, shared miningCooldown_
+    // regardless of which of the two businesses triggered it.
+    void tryStartMiningMinigame(const std::string& businessId);
+    // Resolves the CURRENT strike (miningRound_) the same way
+    // resolveTimingMinigame resolves its one shot -- reads the indicator,
+    // calls Game::tryMinigameBonus, records the hit/miss in
+    // miningRoundResults_. If this was the last strike, closes the overlay
+    // and starts miningCooldown_ (same "close, then setFeedback so it shows
+    // as a toast" order every other minigame's resolve function uses);
+    // otherwise re-rolls the target and advances to the next, faster/
+    // narrower strike, leaving the overlay open. Shared by the Space-key
+    // and the "Mine!" button.
+    void resolveMiningRound();
 
     // Attempts to start the Lumber Camp's chopping minigame (same checks as
     // tryStartTimingMinigame, its own cooldown/mechanic).
@@ -755,9 +982,9 @@ private:
     void updateChopping(float dt);
     void resolveChopping();
 
-    // Attempts to start the Brewing minigame for `businessId` ("alchemist"
-    // or "winery") -- same built/cooldown checks as the other minigame
-    // starters.
+    // Attempts to start the Brewing minigame for `businessId` (always
+    // "winery" now, see OverlayKind::Brewing's own comment) -- same built/
+    // cooldown checks as the other minigame starters.
     void tryStartBrewing(const std::string& businessId);
     void drawBrewingOverlay(sf::RenderWindow& window);
     // Called every frame while OverlayKind::Brewing is open, during the
@@ -769,6 +996,73 @@ private:
     // hit once the whole sequence has been reproduced.
     void handleBrewClick(int colorIndex);
     void resolveBrewing(bool hit);
+
+    // Attempts to start Alchemist's Power-Mix minigame (see
+    // OverlayKind::PowerMix's own comment on the state) -- same built/
+    // cooldown checks as the other minigame starters. No businessId param,
+    // same "single business, no need to parameterize" pattern as
+    // tryStartChopping -- unlike Brewing this one was never shared.
+    void tryStartPowerMix();
+    // Called every frame while OverlayKind::PowerMix is open: advances
+    // powerMixElapsed_ (and therefore the wobbling powerMixTargetCenter_),
+    // and while Space is held grows powerMixPower_ -- auto-resolves at
+    // powerMixPower_ == 1.0, or the instant Space is released (detected via
+    // powerMixCharging_ going from true to "no longer held" between frames).
+    void updatePowerMix(float dt);
+    void resolvePowerMix();
+
+    // Attempts to start the Herding minigame for `businessId` ("sheep",
+    // "dairyfarm", "beehive", or "trapper") -- same built/cooldown checks as
+    // the other minigame starters.
+    void tryStartHerding(const std::string& businessId);
+    // Called every frame while OverlayKind::Herding is open: advances
+    // herdElapsed_ (which drives the wandering target's Lissajous position),
+    // moves herdCursorPos_ from whichever movement keys are currently held
+    // (see GameWorld.h's own comment on why reusing them here is safe),
+    // accumulates herdCaughtTime_ whenever the cursor is within
+    // kHerdCatchRadius of the target, and auto-resolves once herdElapsed_
+    // reaches kHerdTimeWindow.
+    void updateHerding(float dt);
+    void resolveHerding();
+
+    // Attempts to start the Tile-Reveal minigame for `businessId`
+    // ("seasalt", "pearlfarm", or "quarry") -- same built/cooldown checks as
+    // the other minigame starters; also shuffles a fresh
+    // tileRevealIsBonus_/tileRevealRevealed_ pair.
+    void tryStartTileReveal(const std::string& businessId);
+    // A tile click: flips tile `index` (must be unrevealed), resolves its
+    // own Game::tryMinigameBonus call immediately. Once
+    // tileRevealPicksUsed_ reaches kTileRevealPicks, closes the overlay and
+    // starts that business's cooldown (same "close, then setFeedback so it
+    // shows as a toast" order every other minigame's final resolve uses);
+    // otherwise leaves the overlay open for the next pick, same shape as
+    // resolveMiningRound's mid-combo case.
+    void revealTile(int index);
+
+    // Attempts to start the Rhythm-Tap minigame for `businessId`
+    // ("cannery", "smokehouse", or "sushibar") -- same built/cooldown
+    // checks as the other minigame starters; also rebuilds rhythmMarkers_
+    // with fresh staggered spawnTimes.
+    void tryStartRhythmTap(const std::string& businessId);
+    // Called every frame while OverlayKind::RhythmTap is open: advances
+    // rhythmElapsed_, and auto-resolves (as a miss) any marker whose
+    // position has drifted past the hit line by more than
+    // kRhythmHitTolerance without being caught. Calls finishRhythmTap once
+    // every marker is resolved.
+    void updateRhythmTap(float dt);
+    // A Space press (or the "Tap!" button): resolves the single unresolved
+    // marker closest to the hit line, if any is within kRhythmHitTolerance
+    // right now -- a press with no marker in range is simply ignored (no
+    // penalty), the same "only counts as a swing if there's something to
+    // swing at" leniency the mining combo doesn't need (that one always has
+    // exactly one live target).
+    void handleRhythmTap();
+    // Pays out every marker's own Game::tryMinigameBonus call (hit or
+    // resolved-miss alike), closes the overlay, starts that business's
+    // cooldown, and shows ONE combined summary toast -- see
+    // GameWorld.h's own comment on rhythmMarkers_ for why this batches
+    // instead of toasting per-beat like the mining combo does.
+    void finishRhythmTap();
 
     // Per-frame Highlands foraging upkeep: respawns collected spots whose
     // timer has elapsed. Collection itself happens inline in the E-key

@@ -243,7 +243,10 @@ bool Game::simulateElapsed(long long seconds, std::vector<std::string>& eventLog
     // upkeep, and the life clock all still run further down) is untouched.
     if (grantProduction) {
     for (auto& b : businessManager_.businesses()) {
-        if (b.level <= 0) continue;
+        // autoProcessPaused (see its own comment on Business.h and
+        // Game::trySetBusinessPaused) skips this business completely --
+        // same effect as level <= 0 for this tick, without touching level.
+        if (b.level <= 0 || b.autoProcessPaused) continue;
         const BusinessType* type = businessManager_.findType(b.typeId);
         if (!type || !type->inputGoodId.empty()) continue;
 
@@ -280,7 +283,7 @@ bool Game::simulateElapsed(long long seconds, std::vector<std::string>& eventLog
     // Pass 2: processors that consume another good (e.g. Gem Workshop needs ore).
     // Runs after pass 1 so goods produced this same tick are available to feed in.
     for (auto& b : businessManager_.businesses()) {
-        if (b.level <= 0) continue;
+        if (b.level <= 0 || b.autoProcessPaused) continue;
         const BusinessType* type = businessManager_.findType(b.typeId);
         if (!type || type->inputGoodId.empty()) continue;
 
@@ -301,6 +304,22 @@ bool Game::simulateElapsed(long long seconds, std::vector<std::string>& eventLog
         Good* output = type->outputGoodId.empty() ? nullptr : market_.find(type->outputGoodId);
 
         double desiredOutput = b.ratePerSecond(*type) * businessMult(b) * seasonProdMult * static_cast<double>(seconds);
+        // 2026-08-11 fix ("如果我的二级产品到上限了,那些一级产品还会一直
+        // 被扣去做成二级产品吗" -- if my tier-2 good is already at the
+        // warehouse cap, does the tier-1 good keep getting consumed to
+        // make more of it anyway): yes, it did -- `desiredOutput` used to
+        // be bottlenecked ONLY by input availability, so a business kept
+        // consuming its full input rate and just silently discarding the
+        // output past `maxStockPerGood()` (see the `std::min` on
+        // `output->stock` below), wasting the input for nothing collected.
+        // Also capping desiredOutput by the output good's own remaining
+        // warehouse room fixes that -- once output is full, desiredOutput
+        // (and therefore actualOutput and every input's consumption below)
+        // drops to 0, same as if the business were paused for that tick.
+        if (output) {
+            double room = std::max(0.0, maxStockPerGood() - output->stock);
+            desiredOutput = std::min(desiredOutput, room);
+        }
         double actualOutput = desiredOutput;
         for (const auto& r : reqs) {
             if (r.perOutput <= 0.0) continue;
@@ -1330,6 +1349,8 @@ std::vector<BusinessInfo> Game::businessInfos() const {
         info.locked = (b.level == 0 && businessManager_.isLocked(*t));
         info.workers = b.workers;
         info.workerCost = b.workers < kMaxWorkersPerBusiness ? workerNextCost(b.typeId) : 0.0;
+        info.outputStock = info.outputGoodId.empty() ? 0.0 : stockOf(info.outputGoodId);
+        info.paused = b.autoProcessPaused;
         if (b.typeId == "farm") {
             info.cropId = b.cropId;
             if (const CropType* crop = businessManager_.findCrop(b.cropId)) {
@@ -1475,6 +1496,18 @@ StorefrontAutoSellInfo Game::storefrontAutoSellInfo() const {
     info.threshold = b->autoSellThreshold;
     info.capacityPerDay = autoSellCapacityForLevel(b->level);
     return info;
+}
+
+ActionResult Game::trySetBusinessPaused(const std::string& businessId, bool paused) {
+    ActionResult result;
+    Business* b = businessManager_.find(businessId);
+    if (!b || b->level <= 0) {
+        result.messageKey = "business_not_built";
+        return result;
+    }
+    b->autoProcessPaused = paused;
+    result.success = true;
+    return result;
 }
 
 ActionResult Game::trySetStorefrontAutoSell(const std::string& goodId, double threshold) {
@@ -2225,6 +2258,9 @@ void Game::load() {
         // same no-migration-needed reasoning as construction_days_remaining above.
         b.autoSellGoodId = getS("business." + b.typeId + ".autosell_good", b.autoSellGoodId);
         b.autoSellThreshold = getD("business." + b.typeId + ".autosell_threshold", b.autoSellThreshold);
+        // Missing on older saves -> defaults to 0 (not paused), same
+        // no-migration-needed reasoning as the fields above.
+        b.autoProcessPaused = getI("business." + b.typeId + ".paused", b.autoProcessPaused ? 1 : 0) != 0;
     }
     for (auto& a : achievements_.achievements()) {
         a.unlocked = getI("achievement." + a.id + ".unlocked", a.unlocked ? 1 : 0) != 0;
@@ -2292,6 +2328,7 @@ void Game::save() const {
         out << "business." << b.typeId << ".construction_days_remaining=" << b.constructionDaysRemaining << "\n";
         out << "business." << b.typeId << ".autosell_good=" << b.autoSellGoodId << "\n";
         out << "business." << b.typeId << ".autosell_threshold=" << b.autoSellThreshold << "\n";
+        out << "business." << b.typeId << ".paused=" << (b.autoProcessPaused ? 1 : 0) << "\n";
     }
     for (const auto& a : achievements_.achievements()) {
         out << "achievement." << a.id << ".unlocked=" << (a.unlocked ? 1 : 0) << "\n";

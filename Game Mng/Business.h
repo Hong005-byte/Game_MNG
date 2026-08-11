@@ -82,6 +82,18 @@ struct Business {
     // straight from 0 to 1 via the plain cash purchase path. ----
     double constructionDaysRemaining = 0.0;
 
+    // 2026-08-11 ("我可以set like 不要生成了吗,可能like有些建筑需要一级
+    // 产品的东西,但是却一直被拿去做成二级产品" -- can I set it to stop
+    // producing, since some buildings need the tier-1 good for something
+    // else but it keeps getting taken to make tier-2 goods): a manual
+    // on/off switch, independent of level/workers -- see
+    // Game::trySetBusinessPaused and simulateElapsed's Pass 1/2, both of
+    // which skip a paused business entirely (no input consumed, no output
+    // produced) while everything else (upgrades, workers, construction)
+    // stays usable. Defaults to false so every existing save's businesses
+    // keep running exactly as before.
+    bool autoProcessPaused = false;
+
     double nextCost(const BusinessType& type) const;
     double ratePerSecond(const BusinessType& type) const;
 };
