@@ -19,10 +19,12 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstdint>
+#include <cctype>
 #include <iostream>
 #include <sstream>
 #include <iomanip>
 #include <algorithm>
+#include <utility>
 #include <optional>
 #include <unordered_map>
 #include <unordered_set>
@@ -32,19 +34,9 @@ namespace {
     constexpr float kInteractRadius = 55.f;
     constexpr float kMoveSpeed = 220.f;
     constexpr float kSprintMultiplier = 1.8f; // Shift held -> this much faster than the default walk speed
-    constexpr float kMinigameIndicatorSpeed = 2.5f; // radians/sec -- how fast the timing-bar marker sweeps
-    constexpr float kMinigameCooldownSeconds = 25.f; // shared by the fishing and mining timing-bar cooldowns
+    constexpr float kMinigameIndicatorSpeed = 2.5f; // radians/sec -- how fast a timing-bar marker sweeps at its base speed
+    constexpr float kMinigameCooldownSeconds = 25.f; // shared by fishing's timing bar and mining's combo cooldowns
     constexpr float kLumberCooldownSeconds = 25.f;
-
-    // Per-activity flavor for the shared timing-bar overlay: title/hint/
-    // button text and an accent color, keyed by which building triggered it.
-    struct MinigameFlavor { const char* titleKey; const char* buttonKey; sf::Color accent; };
-    MinigameFlavor minigameFlavorFor(const std::string& businessId) {
-        if (businessId == "mine" || businessId == "goldmine") {
-            return { "mining_title", "mining_catch_button", sf::Color(200, 170, 110) };
-        }
-        return { "fishing_title", "fishing_catch_button", sf::Color(90, 200, 230) };
-    }
     constexpr float kTreeRadius = 16.f;
     constexpr float kEdgeMargin = 24.f; // how far from the entry edge a player lands after a zone transition
 
@@ -107,6 +99,40 @@ namespace {
     // handed to SFML (window title, sf::Text) must go through this instead.
     sf::String toSfString(const std::string& utf8) {
         return sf::String::fromUtf8(utf8.begin(), utf8.end());
+    }
+
+    // 2026-08-10 bugfix ("很多商店的字都跑掉了" -- text looks broken/garbled
+    // across many of the shop/business menu overlays): every "menu_X_header"
+    // localization string (Market/Staff/Sleep/Eat/Doctor/FastForward/
+    // Achievements/Legacy/Bank/Warehouse/Contracts -- see Localization.cpp)
+    // is written for the CONSOLE UI, which is why it carries a leading AND
+    // trailing '\n' (blank-line spacing around the header in a terminal) and
+    // "-- X --" ASCII dash decoration. Every one of those GUI overlays feeds
+    // that same string straight into an sf::Text via uiText() -- sf::Text
+    // renders '\n' as a real line break, not whitespace to be collapsed, so
+    // the title actually became a 3-line block (blank / "-- X --" / blank)
+    // instead of one line, pushing the visible title down and eating into
+    // whatever's drawn right below it at the fixed offset every one of these
+    // overlays assumed a single-line header would need -- garbled-looking
+    // overlap in the worst cases (tight vertical gap below), just excess
+    // dead space in milder ones. Strips exactly that console formatting back
+    // off for GUI display -- the panel's own bold gold-colored title is
+    // already a clear enough "this is the header" cue, the same convention
+    // every OTHER overlay's title (e.g. drawBusinessesOverlay's plain
+    // Localization::t(info->id)) already uses with no dashes at all.
+    std::string guiMenuTitle(const std::string& key) {
+        std::string s = Localization::t(key);
+        auto isSpace = [](unsigned char c) { return std::isspace(c) != 0; };
+        size_t start = 0;
+        while (start < s.size() && isSpace(static_cast<unsigned char>(s[start]))) ++start;
+        size_t end = s.size();
+        while (end > start && isSpace(static_cast<unsigned char>(s[end - 1]))) --end;
+        s = s.substr(start, end - start);
+        const std::string prefix = "-- ", suffix = " --";
+        if (s.size() >= prefix.size() && s.compare(0, prefix.size(), prefix) == 0) s = s.substr(prefix.size());
+        if (s.size() >= suffix.size() && s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0)
+            s = s.substr(0, s.size() - suffix.size());
+        return s;
     }
 
     // Only still consulted by drawWorkshopShape's fallback path and
@@ -1059,11 +1085,50 @@ void GameWorld::buildZones() {
         // Row below) -- this zone was up to 14 buildings, more than double
         // every other zone's 6-10.
         addBuilding(z, "lumber",  { 130.f, 180.f }, kTier1, bSize);
-        addBuilding(z, "sawmill", { 370.f, 180.f }, kTier2, bSize);
+        // Sawmill and Mason swapped spots (2026-08-11, "把锯木厂和石匠铺换
+        // 位置" -- swap Sawmill and Mason's spots): Mason now sits here in
+        // row 1 (x:370, where Sawmill used to be) and Sawmill now sits down
+        // in row 2 alongside Quarry (x:305, where Mason used to be -- see
+        // its own addBuilding call below). Pure position swap, ids/tiers
+        // unchanged -- the two x-values (370 vs 305) still differ from each
+        // other after the swap, so the earlier "shared axis reads as behind
+        // Sawmill" bug a few rounds back (Mason's old comment here) can't
+        // reoccur; that bug was about the two buildings sharing ONE x, not
+        // about which building sits at which x.
+        addBuilding(z, "mason",   { 370.f, 180.f }, kTier2, bSize);
         addBuilding(z, "farm",    { 610.f, 180.f }, kTier1, bSize);
-        addBuilding(z, "bakery",  { 850.f, 180.f }, kTier2, bSize);
+        // Bakery's own 3D hero shape (cabin + boiler-room annex + oven
+        // mound, 3 volumes side by side -- see GameWorld3D.cpp's
+        // addBakeryBuilding) kept feeling cramped even after the last
+        // widen (2026-08-11 follow-up, "现在面包房看起来很挤" -- it looks
+        // crowded now): that round only grew the footprint to 170x80,
+        // which mostly fed the new boiler-room annex and left the cabin
+        // itself (still a fixed 40% fraction of the width) barely any
+        // wider than before. Widened again to 230x90 -- same "grow the
+        // WorldBuilding rect, not just rebalance fractions inside it" call
+        // as last time, but this time on both axes so the cabin's own
+        // share of the width (and the depth every prop south of the
+        // building has to fit in) both grow with it. Still position.x
+        // unchanged and clear of both the x:720-760 path spine to its west
+        // and the x:1260 east tree wall (right edge now 1080, 180 units of
+        // margin left).
+        addBuilding(z, "bakery",  { 850.f, 180.f }, kTier2, sf::Vector2f(230.f, 90.f));
         addBuilding(z, "quarry",  { 130.f, 480.f }, kTier1, bSize);
-        addBuilding(z, "mason",   { 370.f, 480.f }, kTier2, bSize);
+        // Re-centered (2026-08-11 follow-up, "把锯木厂的坐标往右边移动,确保
+        // 他是在采石场和牧羊场的中间" -- move Sawmill right so it's exactly
+        // between Quarry and Sheep Farm): x:305 -> x:370, the true midpoint
+        // of Quarry's east edge (240) and Sheep's west edge (610) --
+        // (240+610)/2 = 425 centerline, minus half of bSize's own 110
+        // width = 370, so Sawmill's 110-wide rect sits perfectly centered
+        // in that 370-unit gap. Note this puts Sawmill back on x:370,
+        // sharing Mason's own x (row 1, directly above it) -- the exact
+        // "shared axis reads as behind Sawmill" setup Mason's move to
+        // x:305 was originally fixing (see the swap comment above). Went
+        // with the explicit centering request over avoiding that anyway;
+        // if Mason starts reading as stacked behind Sawmill again from
+        // this angle, the fix belongs on Mason's own tall props (or
+        // Mason's own x), not back here.
+        addBuilding(z, "sawmill", { 370.f, 480.f }, kTier2, bSize);
         addBuilding(z, "sheep",   { 610.f, 480.f }, kTier1, bSize);
         addBuilding(z, "textile", { 850.f, 480.f }, kTier2, bSize);
 
@@ -1123,11 +1188,26 @@ void GameWorld::buildZones() {
         // it's moved to Fisher's Isle now (see Zone 7 below), where the rest
         // of the fish-processing chain actually lives.
         addBuilding(z, "mine",       { 280.f, 180.f }, kTier1, bSize);
+        // Smelter/Carpenter (column 2, x:600) stay at the plain 110-wide
+        // bSize, unlike the other 2026-08-11 hero-building rounds --
+        // column 2's own east edge (710) already sits only 10 units clear
+        // of the north-south path spine at x:720-760, no room to widen
+        // east without the building overlapping the path itself. Both
+        // designs (see addSmelterBuilding/addCarpenterBuilding in
+        // GameWorld3D.cpp) fit their own annex/bay into that width by
+        // filling the lot's remaining east span outright instead of
+        // leaving a side margin, the same un-widened convention Sawmill/
+        // Mason/Textile already used successfully before Bakery's own
+        // widen precedent.
         addBuilding(z, "smelter",    { 600.f, 180.f }, kTier2, bSize);
-        addBuilding(z, "gemshop",    { 920.f, 180.f }, kTier2, bSize);
-        addBuilding(z, "blacksmith", { 280.f, 480.f }, kTier3, bSize);
+        // Column 3 (x:920) has a wide-open 230-unit gap to the zone's own
+        // east tree wall (1260) -- widened east same as Goldsmith/Preserve.
+        addBuilding(z, "gemshop",    { 920.f, 180.f }, kTier2, sf::Vector2f(170.f, 80.f));
+        // Column 1 (x:280) has a 210-unit gap to column 2 (600) -- widened
+        // east same as Goldsmith/Preserve.
+        addBuilding(z, "blacksmith", { 280.f, 480.f }, kTier3, sf::Vector2f(190.f, 80.f));
         addBuilding(z, "carpenter",  { 600.f, 480.f }, kTier3, bSize);
-        addBuilding(z, "tailor",     { 920.f, 480.f }, kTier3, bSize);
+        addBuilding(z, "tailor",     { 920.f, 480.f }, kTier3, sf::Vector2f(170.f, 80.f));
 
         // x:720-760 threads the gap between the smelter/carpenter column
         // (600-710) and the gemshop/tailor column (920-1030) instead of
@@ -1172,14 +1252,44 @@ void GameWorld::buildZones() {
         z.east = 0; // -> Town Square
 
         addBuilding(z, "orchard",    { 130.f, 180.f }, kTier1, bSize);
-        addBuilding(z, "preserve",   { 370.f, 180.f }, kTier2, bSize);
+        // Widened east, position.x unchanged (2026-08-11, "现在到果酱坊" --
+        // giving Preserve its own real hero building, same "Workshop
+        // family" as Sawmill/Mason/Bakery/Textile): its own 3-volume
+        // layout (cabin + press annex + hearth, see addPreserveBuilding in
+        // GameWorld3D.cpp) doesn't fit the plain 110-wide `bSize`, same
+        // reason Bakery got widened first. 190 leaves 50 units clear of
+        // Herbgarden's own west edge (610) and a wide 130-unit gap to
+        // Orchard's east edge (240) on the other side -- depth left at
+        // the shared 80 (not grown, unlike Bakery's later re-widen) so
+        // south-yard props stay clear of npc_orchardist's own wander box
+        // at {400,330}.
+        addBuilding(z, "preserve",   { 370.f, 180.f }, kTier2, sf::Vector2f(190.f, 80.f));
         addBuilding(z, "herbgarden", { 610.f, 180.f }, kTier1, bSize);
-        addBuilding(z, "apothecary", { 850.f, 180.f }, kTier2, bSize);
+        // 2026-08-11 batch (finishing out Zone 3, after "其他的你可以开始
+        //设计了" -- go ahead and design the rest): Brewery family (see
+        // isBreweryId in this file), same as Winery/Alchemist below. 130
+        // units clear to Alchemist's own west edge (1090) -- widened east.
+        addBuilding(z, "apothecary", { 850.f, 180.f }, kTier2, sf::Vector2f(170.f, 80.f));
+        // Only 60 units clear to the zone's own east tree wall (1260) --
+        // un-widened, same "fill the lot's remaining width" convention
+        // Smelter/Carpenter used at column 2 in Zone 2.
         addBuilding(z, "alchemist",  { 1090.f, 180.f }, kTier3, bSize);
         addBuilding(z, "goldmine",   { 130.f, 480.f }, kTier1, bSize);
-        addBuilding(z, "goldsmith",  { 370.f, 480.f }, kTier2, bSize);
-        addBuilding(z, "jeweler",    { 610.f, 480.f }, kTier3, bSize);
+        // Widened east, position.x unchanged (2026-08-11, "现在到金匠铺" --
+        // same "Workshop family" hero-building treatment Preserve just got,
+        // see addGoldsmithBuilding in GameWorld3D.cpp): 190 leaves 50 units
+        // clear of Jeweler's own west edge (610), same margin Preserve's
+        // own widen left against Herbgarden. npc_prospector2 sits at
+        // {250,550}, west of Goldsmith's own left edge (370) -- clear of
+        // an east-only widen.
+        addBuilding(z, "goldsmith",  { 370.f, 480.f }, kTier2, sf::Vector2f(190.f, 80.f));
+        // MasonGem family, same as Gemshop/Mason. 130 units clear to
+        // Vineyard's own west edge (850) -- widened east (Goldsmith's own
+        // west edge at 560 doesn't constrain an east-only widen here).
+        addBuilding(z, "jeweler",    { 610.f, 480.f }, kTier3, sf::Vector2f(170.f, 80.f));
         addBuilding(z, "vineyard",   { 850.f, 480.f }, kTier1, bSize);
+        // Brewery family. Only 60 units clear to the zone's own east tree
+        // wall (1260) -- un-widened, same reasoning as Alchemist above.
         addBuilding(z, "winery",     { 1090.f, 480.f }, kTier2, bSize);
 
         addPath(z, { 0.f, 390.f }, { 1280.f, 40.f });
@@ -1291,14 +1401,21 @@ void GameWorld::buildZones() {
         z.south = 2; // -> Mining District
 
         addBuilding(z, "dairyfarm", { 130.f, 180.f }, kTier1, bSize);
-        addBuilding(z, "creamery",  { 370.f, 180.f }, kTier2, bSize);
+        // 2026-08-11 batch ("其他的屋子可以继续进行了" -- carry on with the
+        // rest): Brewery family (Creamery/Meadery) and Fiber family
+        // (Tannery), widened east same as every other hero building this
+        // round -- 240-unit column spacing here leaves 130 units of gap,
+        // 190 wide leaves 50 clear of each one's own east neighbor.
+        addBuilding(z, "creamery",  { 370.f, 180.f }, kTier2, sf::Vector2f(190.f, 80.f));
         addBuilding(z, "beehive",   { 610.f, 180.f }, kTier1, bSize);
-        addBuilding(z, "meadery",   { 850.f, 180.f }, kTier2, bSize);
+        addBuilding(z, "meadery",   { 850.f, 180.f }, kTier2, sf::Vector2f(190.f, 80.f));
         addBuilding(z, "trapper",   { 1090.f, 180.f }, kTier1, bSize);
-        addBuilding(z, "tannery",   { 130.f, 480.f }, kTier2, bSize);
+        addBuilding(z, "tannery",   { 130.f, 480.f }, kTier2, sf::Vector2f(190.f, 80.f));
         addBuilding(z, "teafield",  { 370.f, 480.f }, kTier1, bSize);
         addBuilding(z, "teahouse",  { 610.f, 480.f }, kTier2, bSize);
         addBuilding(z, "flaxfield", { 850.f, 480.f }, kTier1, bSize);
+        // Only 60 units clear to the zone's own east tree wall (1260) --
+        // un-widened, same reasoning as Alchemist/Winery in Zone 3.
         addBuilding(z, "linenmill", { 1090.f, 480.f }, kTier2, bSize);
         // Country Gift Basket: a multi-input recipe (see BusinessType::
         // extraInputs) sourced entirely from within this district (cheese +
@@ -1676,6 +1793,16 @@ void GameWorld::openOverlay(OverlayKind kind) {
     if (kind == OverlayKind::RecipeBook) recipeBookSelectedGoodId_.clear(); // always start at the grid, not wherever it was left last time
     if (kind == OverlayKind::WelcomeBack) welcomeBackExpanded_ = false; // always starts collapsed
     if (kind == OverlayKind::Eat) eatSelectedGoodId_ = "wheat"; // always start on wheat, not wherever it was left last time
+    // AutoSell overlay (see GameWorld.h's own comment on these two members):
+    // opening the panel starts staged on whatever's actually live right now
+    // (empty if nothing is), not wherever the list was scrolled/selected to
+    // last time, same "reflect real state, not stale UI state" reasoning as
+    // eatSelectedGoodId_ above.
+    if (kind == OverlayKind::AutoSell) {
+        StorefrontAutoSellInfo as = game_.storefrontAutoSellInfo();
+        autoSellSelectedGoodId_ = as.goodId;
+        autoSellStagedThreshold_ = as.threshold;
+    }
 }
 
 void GameWorld::closeOverlay() {
@@ -4566,6 +4693,53 @@ void GameWorld::uiText(sf::RenderWindow& window, sf::Vector2f pos, const std::st
     window.draw(t);
 }
 
+float GameWorld::uiWrappedText(sf::RenderWindow& window, sf::Vector2f pos, const std::string& text, float maxWidth,
+    unsigned int size, sf::Color color, float lineH, bool bold) {
+    if (!fontLoaded_) return lineH;
+    sf::String full = toSfString(text);
+    std::vector<sf::String> lines;
+    sf::String current;
+    std::size_t lastSpaceInCurrent = sf::String::InvalidPos; // index within `current`, if it has a space
+    for (std::size_t i = 0; i < full.getSize(); ++i) {
+        char32_t ch = full[i];
+        sf::String candidate = current + sf::String(ch);
+        sf::Text probe(font_, candidate, size);
+        if (probe.getLocalBounds().size.x > maxWidth && !current.isEmpty()) {
+            // Adding this character would overflow -- break before it.
+            // Prefer breaking at the last space already in `current` (keeps
+            // an English word whole); a CJK sentence has no spaces to find,
+            // so this falls back to a hard break right at the overflow
+            // point, which is still strictly better than not wrapping at
+            // all (the actual bug being fixed here).
+            if (lastSpaceInCurrent != sf::String::InvalidPos && lastSpaceInCurrent + 1 < current.getSize()) {
+                sf::String carry = current.substring(lastSpaceInCurrent + 1);
+                lines.push_back(current.substring(0, lastSpaceInCurrent));
+                current = carry + sf::String(ch);
+            } else {
+                lines.push_back(current);
+                current = sf::String(ch);
+            }
+            lastSpaceInCurrent = sf::String::InvalidPos;
+            for (std::size_t j = 0; j < current.getSize(); ++j) if (current[j] == U' ') lastSpaceInCurrent = j;
+        } else {
+            if (ch == U' ') lastSpaceInCurrent = current.getSize();
+            current += sf::String(ch);
+        }
+    }
+    if (!current.isEmpty()) lines.push_back(current);
+
+    float y = pos.y;
+    for (const auto& line : lines) {
+        sf::Text t(font_, line, size);
+        t.setPosition({ pos.x, y });
+        t.setFillColor(color);
+        if (bold) t.setStyle(sf::Text::Bold);
+        window.draw(t);
+        y += lineH;
+    }
+    return static_cast<float>(lines.size()) * lineH;
+}
+
 std::string GameWorld::applyKeyPlaceholders(const std::string& text) const {
     auto replaceAll = [](std::string s, const std::string& from, const std::string& to) {
         size_t pos = 0;
@@ -4712,8 +4886,13 @@ void GameWorld::drawOverlayRoot(sf::RenderWindow& window) {
         case OverlayKind::CropPicker:   drawCropPickerOverlay(window); break;
         case OverlayKind::RecipeBook:   drawRecipeBookOverlay(window); break;
         case OverlayKind::TimingMinigame: drawTimingMinigameOverlay(window); break;
+        case OverlayKind::MiningMinigame: drawMiningMinigameOverlay(window); break;
         case OverlayKind::Chopping:       drawChoppingOverlay(window); break;
         case OverlayKind::Brewing:        drawBrewingOverlay(window); break;
+        case OverlayKind::PowerMix:       drawPowerMixOverlay(window); break;
+        case OverlayKind::Herding:        drawHerdingOverlay(window); break;
+        case OverlayKind::TileReveal:     drawTileRevealOverlay(window); break;
+        case OverlayKind::RhythmTap:      drawRhythmTapOverlay(window); break;
         case OverlayKind::Contracts:    drawContractsOverlay(window); break;
         case OverlayKind::Pause:        drawPauseOverlay(window); break;
         case OverlayKind::Settings:     drawSettingsOverlay(window); break;
@@ -4764,6 +4943,19 @@ void GameWorld::drawBusinessesOverlay(sf::RenderWindow& window) {
     y += 20.f;
     uiText(window, { pos.x + 24.f, y }, Localization::t("rate_note"), 11, sf::Color(160, 160, 160));
     y += 24.f;
+
+    // Live warehouse stock of this business's OWN output good (2026-08-11,
+    // "在每个商店的右下角加一个显示当前数量" -- add a current-quantity
+    // display to each shop) -- empty for Storefront, whose output is cash
+    // rather than a market good, so nothing shows there.
+    if (info->level > 0 && !info->outputGoodId.empty()) {
+        uiText(window, { pos.x + 24.f, y }, Localization::t("output_stock_label") + formatNumber(info->outputStock) + " " + Localization::t(info->outputGoodId), 15, sf::Color(220, 210, 160));
+        y += 24.f;
+    }
+    if (info->paused) {
+        uiText(window, { pos.x + 24.f, y }, Localization::t("production_paused_label"), 13, sf::Color(230, 170, 100));
+        y += 22.f;
+    }
 
     // Live "need vs have" list (see BusinessInfo::inputs) -- primary input
     // first, then any BusinessType::extraInputs for a multi-input recipe
@@ -4879,6 +5071,7 @@ void GameWorld::drawBusinessesOverlay(sf::RenderWindow& window) {
         uiText(window, { pos.x + 24.f, y }, Localization::t("workers_label") + std::to_string(info->workers) +
             "/" + std::to_string(Game::kMaxWorkersPerBusiness), 15, sf::Color(200, 200, 200));
         y += 26.f;
+        float hireRowY = y; // see the pause-button fix below for why this is captured
         bool canHire = info->workers < Game::kMaxWorkersPerBusiness;
         std::string hireLabel = Localization::t("hire_worker_button");
         if (canHire) hireLabel += " ($" + formatNumber(info->workerCost) + ")";
@@ -4953,6 +5146,43 @@ void GameWorld::drawBusinessesOverlay(sf::RenderWindow& window) {
                 : Localization::t("autosell_summary_prefix") + Localization::t(as.goodId) +
                   " @ $" + formatNumber(as.threshold) + " (" + formatNumber(as.capacityPerDay) + Localization::t("autosell_per_day_suffix") + ")";
             uiText(window, { pos.x + 24.f, y }, summary, 14, sf::Color(232, 212, 120));
+            y += 30.f;
+        }
+
+        // Manual pause toggle (see Business::autoProcessPaused's own
+        // comment). 2026-08-12 ("我希望这个只会出现在二级产业以及三级产业"
+        // -- only show this on tier-2/tier-3 businesses): originally shown
+        // on every built business, including tier-1 raw producers (farm/
+        // mine/lumber/quarry/storefront/...). Those have no input good to
+        // protect -- pausing one only ever stops it collecting its own
+        // output, never saves an upstream good from being eaten the way
+        // pausing a processor does, which was the whole point this feature
+        // was added for in the first place. Gated on info->tier >= 2 so it
+        // only shows where that actually applies.
+        if (info->tier >= 2) {
+            // 2026-08-11 fix ("那个暂停生产和聘请工人在粘在一起了" -- Pause
+            // Production and Hire Worker are stuck together): for any
+            // business OTHER than farm/port/storefront, none of the 3
+            // branches above run -- `y` was never advanced past the
+            // hire-worker button's own row, so this button used to land
+            // directly on top of it (same `y`). Those 3 branches each leave
+            // `y` in a different, inconsistent state (farm/storefront
+            // advance it by differing amounts, port doesn't touch it at
+            // all) since they draw their own extra content beside/below the
+            // hire button -- `std::max` against the hire button's own row
+            // position (captured above, before any of them ran) guarantees
+            // this button always sits at least one full row below hire,
+            // however much further those branches already pushed it. Moot
+            // for farm/port/storefront now (all tier 1, so this whole block
+            // is skipped for them), kept as-is for the tier-2/3 businesses
+            // that still reach here.
+            y = std::max(y, hireRowY + 46.f);
+            uiButton(window, { pos.x + 24.f, y }, { 220.f, 38.f },
+                Localization::t(info->paused ? "resume_production_button" : "pause_production_button"),
+                [this, id = info->id, next = !info->paused]() {
+                    ActionResult r = game_.trySetBusinessPaused(id, next);
+                    if (!r.success) setFeedback(Localization::t(r.messageKey), false);
+                });
         }
     }
 
@@ -5014,7 +5244,7 @@ void GameWorld::drawTreeOverlay(sf::RenderWindow& window) {
 void GameWorld::drawMarketOverlay(sf::RenderWindow& window) {
     sf::Vector2f pos(100.f, 40.f), size(1080.f, 740.f);
     uiPanelBg(window, pos, size);
-    uiText(window, { pos.x + 24.f, pos.y + 16.f }, Localization::t("menu_market_header"), 20, sf::Color(232, 212, 120), true);
+    uiText(window, { pos.x + 24.f, pos.y + 16.f }, guiMenuTitle("menu_market_header"), 20, sf::Color(232, 212, 120), true);
     uiButton(window, { pos.x + size.x - 130.f, pos.y + 14.f }, { 110.f, 36.f }, Localization::t("close_button"), [this]() { closeOverlay(); });
     uiButton(window, { pos.x + size.x - 260.f, pos.y + 14.f }, { 120.f, 36.f }, Localization::t("contracts_button"), [this]() { openOverlay(OverlayKind::Contracts); });
 
@@ -5215,7 +5445,7 @@ void GameWorld::drawMarketOverlay(sf::RenderWindow& window) {
 void GameWorld::drawStaffOverlay(sf::RenderWindow& window) {
     sf::Vector2f pos(320.f, 170.f), size(640.f, 480.f);
     uiPanelBg(window, pos, size);
-    uiText(window, { pos.x + 24.f, pos.y + 16.f }, Localization::t("menu_staff_header"), 20, sf::Color(232, 212, 120), true);
+    uiText(window, { pos.x + 24.f, pos.y + 16.f }, guiMenuTitle("menu_staff_header"), 20, sf::Color(232, 212, 120), true);
     uiButton(window, { pos.x + size.x - 120.f, pos.y + 14.f }, { 100.f, 34.f }, Localization::t("close_button"), [this]() { closeOverlay(); });
 
     std::ostringstream info;
@@ -5305,7 +5535,7 @@ void GameWorld::drawSleepOverlay(sf::RenderWindow& window) {
     // which still lives at the bottom under its own divider.
     sf::Vector2f pos(320.f, 96.f), size(640.f, 664.f);
     uiPanelBg(window, pos, size);
-    uiText(window, { pos.x + 24.f, pos.y + 16.f }, Localization::t("menu_sleep_header"), 20, sf::Color(232, 212, 120), true);
+    uiText(window, { pos.x + 24.f, pos.y + 16.f }, guiMenuTitle("menu_sleep_header"), 20, sf::Color(232, 212, 120), true);
     uiButton(window, { pos.x + size.x - 120.f, pos.y + 14.f }, { 100.f, 34.f }, Localization::t("close_button"), [this]() { closeOverlay(); });
 
     uiText(window, { pos.x + 24.f, pos.y + 62.f }, Localization::t("sleep_desc_prefix"), 13);
@@ -5410,7 +5640,7 @@ void GameWorld::drawEatOverlay(sf::RenderWindow& window) {
     // needs a scrollable list + a selection instead of just one flat panel.
     sf::Vector2f pos(320.f, 130.f), size(640.f, 580.f);
     uiPanelBg(window, pos, size);
-    uiText(window, { pos.x + 24.f, pos.y + 16.f }, Localization::t("menu_eat_header"), 20, sf::Color(232, 212, 120), true);
+    uiText(window, { pos.x + 24.f, pos.y + 16.f }, guiMenuTitle("menu_eat_header"), 20, sf::Color(232, 212, 120), true);
     uiButton(window, { pos.x + size.x - 120.f, pos.y + 14.f }, { 100.f, 34.f }, Localization::t("close_button"), [this]() { closeOverlay(); });
 
     uiText(window, { pos.x + 24.f, pos.y + 56.f }, Localization::t("hunger_label") + std::to_string(static_cast<int>(game_.hunger())) + "/100", 16, sf::Color(232, 212, 120), true);
@@ -5479,28 +5709,46 @@ void GameWorld::drawDoctorOverlay(sf::RenderWindow& window) {
     // with no explanation of what illness even is, what it costs you while
     // it's active, or that it can kill you. Always shows the same 3-line
     // explainer regardless of sick/not-sick, then the sick-only status below.
-    sf::Vector2f pos(340.f, 190.f), size(600.f, 440.f);
+    // 2026-08-12 fix ("诊所的那个解释好像有超出框架了" -- the explainer text
+    // runs past the panel edge): these 3 lines were drawn as plain
+    // single-line uiText calls at fixed y offsets -- fine for the English
+    // original (hand-fitted to this panel's width when it was written), but
+    // the Chinese translation is one long space-less sentence per line, and
+    // line1 in particular measures wider than the panel's own text area at
+    // this font size (measured ~638px of text in a ~552px-wide panel).
+    // Panel grown taller (440 -> 460, line1 wrapping to 2 lines needs ~18px
+    // more than the fixed layout budgeted) and every fixed y below turned
+    // into a running `y` advanced by uiWrappedText's actual returned
+    // height, so this can't quietly start overlapping the sick-status
+    // block beneath it again the next time any of this text changes length.
+    sf::Vector2f pos(340.f, 190.f), size(600.f, 460.f);
     uiPanelBg(window, pos, size);
-    uiText(window, { pos.x + 24.f, pos.y + 16.f }, Localization::t("menu_doctor_header"), 20, sf::Color(232, 212, 120), true);
+    uiText(window, { pos.x + 24.f, pos.y + 16.f }, guiMenuTitle("menu_doctor_header"), 20, sf::Color(232, 212, 120), true);
     uiButton(window, { pos.x + size.x - 120.f, pos.y + 14.f }, { 100.f, 34.f }, Localization::t("close_button"), [this]() { closeOverlay(); });
 
-    uiText(window, { pos.x + 24.f, pos.y + 56.f }, Localization::t("doctor_desc_line1"), 13, sf::Color(210, 210, 210));
-    uiText(window, { pos.x + 24.f, pos.y + 78.f }, Localization::t("doctor_desc_line2"), 13, sf::Color(210, 210, 210));
-    uiText(window, { pos.x + 24.f, pos.y + 100.f }, Localization::t("doctor_desc_line3"), 13, sf::Color(210, 210, 210));
+    float descW = size.x - 48.f;
+    float y = pos.y + 56.f;
+    y += uiWrappedText(window, { pos.x + 24.f, y }, Localization::t("doctor_desc_line1"), descW, 13, sf::Color(210, 210, 210), 18.f);
+    y += uiWrappedText(window, { pos.x + 24.f, y }, Localization::t("doctor_desc_line2"), descW, 13, sf::Color(210, 210, 210), 18.f);
+    y += uiWrappedText(window, { pos.x + 24.f, y }, Localization::t("doctor_desc_line3"), descW, 13, sf::Color(210, 210, 210), 18.f);
+    y += 16.f;
 
     if (!game_.isSick()) {
-        uiText(window, { pos.x + 24.f, pos.y + 150.f }, Localization::t("not_sick"), 15, sf::Color(150, 220, 150));
+        uiText(window, { pos.x + 24.f, y }, Localization::t("not_sick"), 15, sf::Color(150, 220, 150));
         return;
     }
 
     std::ostringstream info;
     info << Localization::t("sick_for_prefix") << std::fixed << std::setprecision(1) << game_.sickDays()
         << Localization::t("sick_for_suffix") << game_.sicknessDeathDays();
-    uiText(window, { pos.x + 24.f, pos.y + 150.f }, info.str(), 14, sf::Color(230, 170, 100));
-    uiText(window, { pos.x + 24.f, pos.y + 176.f }, Localization::t("sick_penalty_note"), 13, sf::Color(220, 140, 140));
-    uiText(window, { pos.x + 24.f, pos.y + 208.f }, Localization::t("treatment_cost_prefix") + formatNumber(game_.doctorTreatmentCost()), 15);
+    uiText(window, { pos.x + 24.f, y }, info.str(), 14, sf::Color(230, 170, 100));
+    y += 26.f;
+    y += uiWrappedText(window, { pos.x + 24.f, y }, Localization::t("sick_penalty_note"), descW, 13, sf::Color(220, 140, 140), 18.f);
+    y += 8.f;
+    uiText(window, { pos.x + 24.f, y }, Localization::t("treatment_cost_prefix") + formatNumber(game_.doctorTreatmentCost()), 15);
+    y += 52.f;
 
-    uiButton(window, { pos.x + 24.f, pos.y + 260.f }, { 200.f, 44.f }, Localization::t("treat_button"), [this]() {
+    uiButton(window, { pos.x + 24.f, y }, { 200.f, 44.f }, Localization::t("treat_button"), [this]() {
         ActionResult r = game_.tryVisitDoctor();
         if (r.success) setFeedback(Localization::t("all_better"), true);
         else setFeedback(Localization::t(r.messageKey), false);
@@ -5514,7 +5762,7 @@ void GameWorld::drawDoctorOverlay(sf::RenderWindow& window) {
 void GameWorld::drawFastForwardOverlay(sf::RenderWindow& window) {
     sf::Vector2f pos(300.f, 260.f), size(680.f, 300.f);
     uiPanelBg(window, pos, size);
-    uiText(window, { pos.x + 24.f, pos.y + 16.f }, Localization::t("menu_fastforward_header"), 20, sf::Color(232, 212, 120), true);
+    uiText(window, { pos.x + 24.f, pos.y + 16.f }, guiMenuTitle("menu_fastforward_header"), 20, sf::Color(232, 212, 120), true);
     uiButton(window, { pos.x + size.x - 120.f, pos.y + 14.f }, { 100.f, 34.f }, Localization::t("close_button"), [this]() { closeOverlay(); });
 
     struct Preset { const char* key; double minutes; };
@@ -5540,7 +5788,7 @@ void GameWorld::drawFastForwardOverlay(sf::RenderWindow& window) {
 void GameWorld::drawAchievementsOverlay(sf::RenderWindow& window) {
     sf::Vector2f pos(180.f, 40.f), size(920.f, 740.f);
     uiPanelBg(window, pos, size);
-    uiText(window, { pos.x + 24.f, pos.y + 16.f }, Localization::t("menu_achievements_header"), 20, sf::Color(232, 212, 120), true);
+    uiText(window, { pos.x + 24.f, pos.y + 16.f }, guiMenuTitle("menu_achievements_header"), 20, sf::Color(232, 212, 120), true);
     uiButton(window, { pos.x + size.x - 130.f, pos.y + 14.f }, { 110.f, 36.f }, Localization::t("close_button"), [this]() { closeOverlay(); });
 
     // 20+ achievements now (started at 12, grown several times this
@@ -5871,29 +6119,45 @@ void GameWorld::drawAutoSellOverlay(sf::RenderWindow& window) {
     for (size_t i = 0; i < goods.size(); ++i) {
         if (rowY < listTop - rowH || rowY > listBottom) { rowY += rowH; continue; }
         const auto& g = goods[i];
-        bool selected = g.id == as.goodId;
+        // `live` (actually selling right now, per Game) and `staged` (just
+        // being looked at/configured in the right panel, see GameWorld.h's
+        // comment on autoSellSelectedGoodId_) are tracked separately -- a
+        // row click only ever changes which good is staged, never arms or
+        // disarms anything by itself, so simply browsing this list can't
+        // silently start or stop a sale.
+        bool live = g.id == as.goodId;
+        bool staged = g.id == autoSellSelectedGoodId_;
         sf::RectangleShape rowBg(sf::Vector2f(listW - 12.f, rowH - 4.f));
         rowBg.setPosition(sf::Vector2f(pos.x + 24.f, rowY));
-        rowBg.setFillColor(selected ? sf::Color(90, 76, 130) : sf::Color(50, 52, 62));
+        rowBg.setFillColor(live ? sf::Color(60, 100, 64) : staged ? sf::Color(90, 76, 130) : sf::Color(50, 52, 62));
         window.draw(rowBg);
 
         float clickTop = std::max(rowY, listTop), clickBottom = std::min(rowY + (rowH - 4.f), listBottom);
         if (clickBottom > clickTop) {
             std::string goodId = g.id;
-            double currentPrice = g.price;
+            double price = g.price;
             overlayClickRegions_.push_back(ClickRegion{
                 sf::FloatRect(sf::Vector2f(pos.x + 24.f, clickTop), sf::Vector2f(listW - 12.f, clickBottom - clickTop)),
-                [this, goodId, currentPrice]() {
-                    // Selecting a good defaults its threshold to the price it's
-                    // at right now -- a starting point the player then nudges
-                    // with the +/-% buttons below, not a suggestion that this
-                    // particular number is "good".
-                    ActionResult r = game_.trySetStorefrontAutoSell(goodId, currentPrice);
-                    if (!r.success) setFeedback(Localization::t(r.messageKey), false);
+                [this, goodId, price]() {
+                    // Stage this good for the right-hand panel -- see
+                    // GameWorld.h's comment on autoSellSelectedGoodId_ for
+                    // why this never touches Game state directly. Defaults
+                    // the staged threshold to whatever's already live for
+                    // this good, or to its current price if it isn't live.
+                    autoSellSelectedGoodId_ = goodId;
+                    StorefrontAutoSellInfo cur = game_.storefrontAutoSellInfo();
+                    autoSellStagedThreshold_ = (cur.goodId == goodId) ? cur.threshold : price;
                 } });
         }
 
         uiText(window, { pos.x + 32.f, rowY + 6.f }, Localization::t(g.id), 14, sf::Color::White);
+        if (live) {
+            // The one visible-from-the-list answer to "which good is
+            // actually auto-selling right now" -- the right panel (further
+            // below) can only show one good at a time and requires opening
+            // it, so this is the at-a-glance version.
+            uiText(window, { pos.x + 24.f + listW - 250.f, rowY + 6.f }, Localization::t("autosell_row_selling_tag"), 12, sf::Color(150, 230, 150), true);
+        }
         uiText(window, { pos.x + 24.f + listW - 120.f, rowY + 6.f }, "$" + formatNumber(g.price), 14, sf::Color(200, 220, 200));
         rowY += rowH;
     }
@@ -5902,34 +6166,54 @@ void GameWorld::drawAutoSellOverlay(sf::RenderWindow& window) {
         uiText(window, { pos.x + 24.f, listTop - 24.f + 200.f }, Localization::t("scroll_hint"), 12, sf::Color(160, 160, 160));
     }
 
-    // ---- Right: current selection + threshold controls ----
+    // ---- Right: staged selection + threshold controls ----
     float rx = pos.x + 24.f + listW + 24.f, ry = listTop;
     float rw = pos.x + size.x - 24.f - rx;
 
-    if (as.goodId.empty()) {
+    if (autoSellSelectedGoodId_.empty()) {
         uiText(window, { rx, ry }, Localization::t("autosell_disabled_label"), 16, sf::Color(200, 200, 200), true);
     } else {
+        bool isLive = as.goodId == autoSellSelectedGoodId_;
         double currentPrice = 0.0;
-        for (const auto& g : goods) if (g.id == as.goodId) { currentPrice = g.price; break; }
+        for (const auto& g : goods) if (g.id == autoSellSelectedGoodId_) { currentPrice = g.price; break; }
+        // While live, the threshold shown/adjusted is the real one from
+        // Game (kept in sync automatically); while only staged, it's the
+        // not-yet-committed local value the +/-% buttons below edit freely
+        // without affecting anything until Start is actually pressed.
+        double threshold = isLive ? as.threshold : autoSellStagedThreshold_;
 
-        uiText(window, { rx, ry }, Localization::t("autosell_selected_prefix") + Localization::t(as.goodId), 16, sf::Color(232, 212, 120), true);
+        uiText(window, { rx, ry }, Localization::t("autosell_selected_prefix") + Localization::t(autoSellSelectedGoodId_), 16, sf::Color(232, 212, 120), true);
         ry += 30.f;
         uiText(window, { rx, ry }, Localization::t("autosell_current_price_prefix") + "$" + formatNumber(currentPrice), 14, sf::Color(200, 220, 200));
         ry += 24.f;
-        bool armed = currentPrice >= as.threshold;
-        uiText(window, { rx, ry }, Localization::t("autosell_threshold_prefix") + "$" + formatNumber(as.threshold), 16,
+        bool armed = currentPrice >= threshold;
+        uiText(window, { rx, ry }, Localization::t("autosell_threshold_prefix") + "$" + formatNumber(threshold), 16,
             armed ? sf::Color(150, 220, 150) : sf::Color(230, 170, 100), true);
         ry += 22.f;
-        uiText(window, { rx, ry }, Localization::t(armed ? "autosell_status_armed" : "autosell_status_waiting"), 12,
-            armed ? sf::Color(150, 220, 150) : sf::Color(180, 180, 180));
+        if (isLive) {
+            uiText(window, { rx, ry }, Localization::t(armed ? "autosell_status_armed" : "autosell_status_waiting"), 12,
+                armed ? sf::Color(150, 220, 150) : sf::Color(180, 180, 180));
+        } else {
+            // Not selling yet -- makes the still-pending Start step explicit
+            // instead of leaving the threshold controls looking already-live.
+            uiText(window, { rx, ry }, Localization::t("autosell_status_not_started"), 12, sf::Color(200, 180, 120));
+        }
         ry += 34.f;
 
         auto adjustBtn = [&](float x, float w, const std::string& label, double factorOrDelta, bool isPercent) {
-            uiButton(window, { x, ry }, { w, 36.f }, label, [this, factorOrDelta, isPercent]() {
-                StorefrontAutoSellInfo cur = game_.storefrontAutoSellInfo();
-                if (cur.goodId.empty()) return;
-                double next = isPercent ? cur.threshold * (1.0 + factorOrDelta) : cur.threshold + factorOrDelta;
-                game_.trySetStorefrontAutoSell(cur.goodId, std::max(0.0, next));
+            uiButton(window, { x, ry }, { w, 36.f }, label, [this, factorOrDelta, isPercent, isLive]() {
+                if (isLive) {
+                    // Already selling -- these write straight through to
+                    // Game, same as before (adjusting a live sale is
+                    // immediate; it's only the initial arm that needs Start).
+                    StorefrontAutoSellInfo cur = game_.storefrontAutoSellInfo();
+                    if (cur.goodId.empty()) return;
+                    double next = isPercent ? cur.threshold * (1.0 + factorOrDelta) : cur.threshold + factorOrDelta;
+                    game_.trySetStorefrontAutoSell(cur.goodId, std::max(0.0, next));
+                } else {
+                    double next = isPercent ? autoSellStagedThreshold_ * (1.0 + factorOrDelta) : autoSellStagedThreshold_ + factorOrDelta;
+                    autoSellStagedThreshold_ = std::max(0.0, next);
+                }
             });
         };
         float bw = (rw - 3.f * 8.f) / 4.f;
@@ -5940,15 +6224,38 @@ void GameWorld::drawAutoSellOverlay(sf::RenderWindow& window) {
         ry += 46.f;
 
         uiButton(window, { rx, ry }, { rw, 38.f }, Localization::t("autosell_set_to_current_button"),
-            [this, currentPrice]() {
-                StorefrontAutoSellInfo cur = game_.storefrontAutoSellInfo();
-                if (cur.goodId.empty()) return;
-                game_.trySetStorefrontAutoSell(cur.goodId, currentPrice);
+            [this, currentPrice, isLive]() {
+                if (isLive) {
+                    StorefrontAutoSellInfo cur = game_.storefrontAutoSellInfo();
+                    if (cur.goodId.empty()) return;
+                    game_.trySetStorefrontAutoSell(cur.goodId, currentPrice);
+                } else {
+                    autoSellStagedThreshold_ = currentPrice;
+                }
             });
         ry += 54.f;
 
-        uiButton(window, { rx, ry }, { rw, 40.f }, Localization::t("autosell_disable_button"),
-            [this]() { game_.trySetStorefrontAutoSell("", 0.0); });
+        if (isLive) {
+            uiButton(window, { rx, ry }, { rw, 40.f }, Localization::t("autosell_disable_button"),
+                [this]() {
+                    // Keep the just-disabled threshold staged (not reset to
+                    // 0) so pressing Start right back keeps the same value
+                    // instead of snapping to the current price again.
+                    StorefrontAutoSellInfo cur = game_.storefrontAutoSellInfo();
+                    autoSellStagedThreshold_ = cur.threshold;
+                    game_.trySetStorefrontAutoSell("", 0.0);
+                });
+        } else {
+            // The one and only place that actually arms auto-sell -- see
+            // GameWorld.h's comment on autoSellSelectedGoodId_. Everything
+            // above this button (row click, +/-% adjust, set-to-current) is
+            // purely local UI state until this is pressed.
+            uiButton(window, { rx, ry }, { rw, 40.f }, Localization::t("autosell_start_button"),
+                [this, goodId = autoSellSelectedGoodId_, threshold]() {
+                    ActionResult r = game_.trySetStorefrontAutoSell(goodId, threshold);
+                    if (!r.success) setFeedback(Localization::t(r.messageKey), false);
+                });
+        }
     }
 
     if (!overlayFeedback_.empty()) {
@@ -6148,10 +6455,14 @@ void GameWorld::drawRecipeBookOverlay(sf::RenderWindow& window) {
 }
 
 void GameWorld::drawTimingMinigameOverlay(sf::RenderWindow& window) {
-    MinigameFlavor flavor = minigameFlavorFor(minigameBusinessId_);
+    // 2026-08-12: was a shared draw for fishing AND mining, picking its
+    // title/button text/accent color off `minigameFlavorFor(minigameBusinessId_)`
+    // -- fishing-only now that mining has its own combo minigame (see
+    // drawMiningMinigameOverlay), so that indirection is gone; hardcoded to
+    // the fishing strings/color it always actually showed for fishing.
     sf::Vector2f pos(440.f, 280.f), size(400.f, 240.f);
     uiPanelBg(window, pos, size);
-    uiText(window, { pos.x + 24.f, pos.y + 14.f }, Localization::t(flavor.titleKey), 18, sf::Color(232, 212, 120), true);
+    uiText(window, { pos.x + 24.f, pos.y + 14.f }, Localization::t("fishing_title"), 18, sf::Color(232, 212, 120), true);
     uiButton(window, { pos.x + size.x - 110.f, pos.y + 12.f }, { 90.f, 32.f }, Localization::t("close_button"), [this]() { closeOverlay(); });
 
     uiText(window, { pos.x + 24.f, pos.y + 52.f }, Localization::t("fishing_hint"), 12, sf::Color(200, 200, 200));
@@ -6175,10 +6486,10 @@ void GameWorld::drawTimingMinigameOverlay(sf::RenderWindow& window) {
     float indicatorX = barX + indicatorPos * barW;
     sf::RectangleShape indicator(sf::Vector2f(4.f, barH + 10.f));
     indicator.setPosition(sf::Vector2f(indicatorX - 2.f, barY - 5.f));
-    indicator.setFillColor(flavor.accent);
+    indicator.setFillColor(sf::Color(90, 200, 230));
     window.draw(indicator);
 
-    uiButton(window, { pos.x + 24.f, barY + 50.f }, { size.x - 48.f, 44.f }, Localization::t(flavor.buttonKey),
+    uiButton(window, { pos.x + 24.f, barY + 50.f }, { size.x - 48.f, 44.f }, Localization::t("fishing_catch_button"),
         [this]() { resolveTimingMinigame(); });
 
     if (!overlayFeedback_.empty()) {
@@ -6186,17 +6497,96 @@ void GameWorld::drawTimingMinigameOverlay(sf::RenderWindow& window) {
     }
 }
 
+void GameWorld::drawMiningMinigameOverlay(sf::RenderWindow& window) {
+    sf::Vector2f pos(440.f, 260.f), size(400.f, 300.f);
+    uiPanelBg(window, pos, size);
+    uiText(window, { pos.x + 24.f, pos.y + 14.f }, Localization::t("mining_title"), 18, sf::Color(232, 212, 120), true);
+    uiButton(window, { pos.x + size.x - 110.f, pos.y + 12.f }, { 90.f, 32.f }, Localization::t("close_button"), [this]() { closeOverlay(); });
+
+    // Wrapped (see uiWrappedText's own comment, same overflow class as the
+    // Doctor overlay's -- 400 is this game's narrowest overlay panel, and
+    // the Chinese hint text measures well past its ~352px text area at this
+    // font size) rather than a single uiText line.
+    float descW = size.x - 48.f;
+    float y = pos.y + 52.f;
+    y += uiWrappedText(window, { pos.x + 24.f, y }, Localization::t("mining_hint"), descW, 12, sf::Color(200, 200, 200), 16.f);
+    y += 12.f;
+
+    std::ostringstream roundOss;
+    roundOss << Localization::t("mining_round_prefix") << (miningRound_ + 1) << Localization::t("mining_round_suffix")
+        << "   " << Localization::t("mining_hits_prefix") << miningHits_ << "/" << kMiningRounds;
+    uiText(window, { pos.x + 24.f, y }, roundOss.str(), 15, sf::Color(220, 200, 160), true);
+    y += 32.f;
+
+    float barX = pos.x + 24.f, barY = y, barW = descW, barH = 26.f;
+    sf::RectangleShape barBg(sf::Vector2f(barW, barH));
+    barBg.setPosition(sf::Vector2f(barX, barY));
+    barBg.setFillColor(sf::Color(40, 40, 50));
+    barBg.setOutlineThickness(2.f);
+    barBg.setOutlineColor(sf::Color(25, 20, 15));
+    window.draw(barBg);
+
+    // Narrower with each strike (kMiningRoundHalfWidths) -- the "digging
+    // into progressively harder rock" escalation this whole minigame is
+    // built around, see the state comment in GameWorld.h.
+    float halfWidth = kMiningRoundHalfWidths[miningRound_];
+    float targetX = barX + (miningTargetCenter_ - halfWidth) * barW;
+    float targetW = halfWidth * 2.f * barW;
+    sf::RectangleShape targetZone(sf::Vector2f(targetW, barH));
+    targetZone.setPosition(sf::Vector2f(targetX, barY));
+    targetZone.setFillColor(sf::Color(200, 150, 90, 190));
+    window.draw(targetZone);
+
+    // Faster with each strike (kMiningRoundSpeedMults), same escalation.
+    float speed = kMinigameIndicatorSpeed * kMiningRoundSpeedMults[miningRound_];
+    float indicatorPos = 0.5f + 0.5f * std::sin(miningIndicatorPhase_ * speed);
+    float indicatorX = barX + indicatorPos * barW;
+    sf::RectangleShape indicator(sf::Vector2f(4.f, barH + 10.f));
+    indicator.setPosition(sf::Vector2f(indicatorX - 2.f, barY - 5.f));
+    indicator.setFillColor(sf::Color(200, 170, 110));
+    window.draw(indicator);
+
+    // Strike pips: one per round, filled green/red once resolved, gold
+    // outline-ish fill for whichever strike is live, dim gray for the ones
+    // still ahead -- this is the "which of the 3 hits actually landed" read
+    // Chopping's single fill bar can't give (that one only tracks a running
+    // count, not per-attempt results), see the state comment in GameWorld.h.
+    float pipY = barY + barH + 16.f;
+    for (int i = 0; i < kMiningRounds; ++i) {
+        sf::CircleShape pip(7.f);
+        pip.setPosition(sf::Vector2f(barX + static_cast<float>(i) * 26.f, pipY));
+        if (i < static_cast<int>(miningRoundResults_.size())) {
+            pip.setFillColor(miningRoundResults_[i] ? sf::Color(120, 200, 120) : sf::Color(200, 100, 90));
+        } else if (i == miningRound_) {
+            pip.setFillColor(sf::Color(232, 212, 120));
+        } else {
+            pip.setFillColor(sf::Color(70, 70, 80));
+        }
+        window.draw(pip);
+    }
+
+    uiButton(window, { pos.x + 24.f, pipY + 32.f }, { size.x - 48.f, 44.f }, Localization::t("mining_catch_button"),
+        [this]() { resolveMiningRound(); });
+
+    if (!overlayFeedback_.empty()) {
+        uiText(window, { pos.x + 24.f, pos.y + size.y - 28.f }, overlayFeedback_, 13, overlayFeedbackColor_);
+    }
+}
+
 void GameWorld::tryStartTimingMinigame(const std::string& businessId) {
+    // businessId is always "fishing" now -- see OverlayKind::TimingMinigame's
+    // own comment for why mining moved off this shared mechanic. Kept as a
+    // parameter (rather than hardcoding the string inside) since
+    // Game::tryMinigameBonus still takes a plain businessId either way.
     bool built = false;
     for (const auto& info : game_.businessInfos()) {
         if (info.id == businessId) { built = info.level > 0; break; }
     }
-    float& cooldown = (businessId == "fishing") ? fishingCooldown_ : miningCooldown_;
     if (!built) {
         setFeedback(Localization::t("minigame_needs_building"), false);
-    } else if (cooldown > 0.f) {
+    } else if (fishingCooldown_ > 0.f) {
         std::ostringstream oss;
-        oss << Localization::t("fishing_cooldown_prefix") << static_cast<int>(std::ceil(cooldown))
+        oss << Localization::t("fishing_cooldown_prefix") << static_cast<int>(std::ceil(fishingCooldown_))
             << Localization::t("fishing_cooldown_suffix");
         setFeedback(oss.str(), false);
     } else {
@@ -6212,8 +6602,7 @@ void GameWorld::resolveTimingMinigame() {
     bool hit = std::abs(indicatorPos - minigameTargetCenter_) <= minigameTargetHalfWidth_;
     ActionResult r = game_.tryMinigameBonus(minigameBusinessId_, hit);
     closeOverlay();
-    float& cooldown = (minigameBusinessId_ == "fishing") ? fishingCooldown_ : miningCooldown_;
-    cooldown = kMinigameCooldownSeconds;
+    fishingCooldown_ = kMinigameCooldownSeconds;
     if (r.success) {
         if (hit && upgradeSound_) upgradeSound_->play();
         std::string msg = Localization::t(r.rare ? "minigame_rare_prefix" : (hit ? "fishing_hit_prefix" : "fishing_miss_prefix"))
@@ -6221,6 +6610,72 @@ void GameWorld::resolveTimingMinigame() {
         setFeedback(msg, hit);
     } else {
         setFeedback(Localization::t(r.messageKey), false);
+    }
+}
+
+void GameWorld::tryStartMiningMinigame(const std::string& businessId) {
+    // businessId is "mine" or "goldmine" -- both share ONE combo/cooldown
+    // (miningCooldown_), same as they used to share fishing's cooldown
+    // ternary before this got its own mechanic.
+    bool built = false;
+    for (const auto& info : game_.businessInfos()) {
+        if (info.id == businessId) { built = info.level > 0; break; }
+    }
+    if (!built) {
+        setFeedback(Localization::t("minigame_needs_building"), false);
+    } else if (miningCooldown_ > 0.f) {
+        std::ostringstream oss;
+        oss << Localization::t("fishing_cooldown_prefix") << static_cast<int>(std::ceil(miningCooldown_))
+            << Localization::t("fishing_cooldown_suffix");
+        setFeedback(oss.str(), false);
+    } else {
+        minigameBusinessId_ = businessId;
+        miningRound_ = 0;
+        miningHits_ = 0;
+        miningRoundResults_.clear();
+        miningIndicatorPhase_ = 0.f;
+        miningTargetCenter_ = randRange(0.2f, 0.8f);
+        openOverlay(OverlayKind::MiningMinigame);
+    }
+}
+
+void GameWorld::resolveMiningRound() {
+    float speed = kMinigameIndicatorSpeed * kMiningRoundSpeedMults[miningRound_];
+    float indicatorPos = 0.5f + 0.5f * std::sin(miningIndicatorPhase_ * speed);
+    bool hit = std::abs(indicatorPos - miningTargetCenter_) <= kMiningRoundHalfWidths[miningRound_];
+    if (hit) miningHits_++;
+    miningRoundResults_.push_back(hit);
+
+    ActionResult r = game_.tryMinigameBonus(minigameBusinessId_, hit);
+    bool comboFinished = (miningRound_ + 1 >= kMiningRounds);
+    // Same "close first, then setFeedback" order every other minigame's
+    // resolve function uses -- closeOverlay() clears overlayFeedback_, so
+    // setFeedback() has to run after it for the message to survive as the
+    // main-HUD toast (see drawOverlayRoot's early-return + the toast draw
+    // for currentOverlay_ == None). Only done once the WHOLE combo is over
+    // -- a mid-combo strike's result is shown inside the still-open overlay
+    // instead (same uiText block at the bottom of drawMiningMinigameOverlay
+    // every other minigame overlay has).
+    if (comboFinished) closeOverlay();
+
+    if (r.success) {
+        if (hit && upgradeSound_) upgradeSound_->play();
+        std::string msg = Localization::t(r.rare ? "minigame_rare_prefix" : (hit ? "fishing_hit_prefix" : "fishing_miss_prefix"))
+            + formatNumber(r.amount) + " " + Localization::t(r.goodId) + Localization::t("minigame_result_suffix");
+        setFeedback(msg, hit);
+    } else {
+        setFeedback(Localization::t(r.messageKey), false);
+    }
+
+    if (comboFinished) {
+        miningCooldown_ = kMinigameCooldownSeconds;
+    } else {
+        // Next strike: fresh target, phase reset so the next (faster) speed
+        // sweeps from the same starting point rather than picking up
+        // wherever this round's slower phase happened to leave off.
+        miningRound_++;
+        miningIndicatorPhase_ = 0.f;
+        miningTargetCenter_ = randRange(0.2f, 0.8f);
     }
 }
 
@@ -6310,16 +6765,19 @@ void GameWorld::drawChoppingOverlay(sf::RenderWindow& window) {
 }
 
 void GameWorld::tryStartBrewing(const std::string& businessId) {
+    // businessId is always "winery" now -- 2026-08-12 gave Alchemist its own
+    // Power-Mix minigame (see OverlayKind::PowerMix's comment) instead of
+    // sharing this one. Kept as a parameter (rather than hardcoded) since
+    // Game::tryMinigameBonus still takes a plain businessId either way.
     bool built = false;
     for (const auto& info : game_.businessInfos()) {
         if (info.id == businessId) { built = info.level > 0; break; }
     }
-    float& cooldown = (businessId == "alchemist") ? alchemistCooldown_ : wineryCooldown_;
     if (!built) {
         setFeedback(Localization::t("minigame_needs_building"), false);
-    } else if (cooldown > 0.f) {
+    } else if (wineryCooldown_ > 0.f) {
         std::ostringstream oss;
-        oss << Localization::t("fishing_cooldown_prefix") << static_cast<int>(std::ceil(cooldown))
+        oss << Localization::t("fishing_cooldown_prefix") << static_cast<int>(std::ceil(wineryCooldown_))
             << Localization::t("fishing_cooldown_suffix");
         setFeedback(oss.str(), false);
     } else {
@@ -6355,8 +6813,7 @@ void GameWorld::handleBrewClick(int colorIndex) {
 void GameWorld::resolveBrewing(bool hit) {
     ActionResult r = game_.tryMinigameBonus(minigameBusinessId_, hit);
     closeOverlay();
-    float& cooldown = (minigameBusinessId_ == "alchemist") ? alchemistCooldown_ : wineryCooldown_;
-    cooldown = kMinigameCooldownSeconds;
+    wineryCooldown_ = kMinigameCooldownSeconds;
     if (r.success) {
         if (hit && upgradeSound_) upgradeSound_->play();
         std::string msg = Localization::t(hit ? "fishing_hit_prefix" : "fishing_miss_prefix")
@@ -6419,6 +6876,500 @@ void GameWorld::drawBrewingOverlay(sf::RenderWindow& window) {
     }
 }
 
+void GameWorld::tryStartPowerMix() {
+    bool built = false;
+    for (const auto& info : game_.businessInfos()) {
+        if (info.id == "alchemist") { built = info.level > 0; break; }
+    }
+    if (!built) {
+        setFeedback(Localization::t("minigame_needs_building"), false);
+    } else if (alchemistCooldown_ > 0.f) {
+        std::ostringstream oss;
+        oss << Localization::t("fishing_cooldown_prefix") << static_cast<int>(std::ceil(alchemistCooldown_))
+            << Localization::t("fishing_cooldown_suffix");
+        setFeedback(oss.str(), false);
+    } else {
+        powerMixPower_ = 0.f;
+        powerMixCharging_ = false;
+        powerMixElapsed_ = 0.f;
+        powerMixTargetCenter_ = 0.5f;
+        openOverlay(OverlayKind::PowerMix);
+    }
+}
+
+void GameWorld::updatePowerMix(float dt) {
+    powerMixElapsed_ += dt;
+    powerMixTargetCenter_ = 0.5f + 0.3f * std::sin(powerMixElapsed_ * kPowerMixWobbleSpeed);
+    bool held = sf::Keyboard::isKeyPressed(sf::Keyboard::Key::Space);
+    if (held) {
+        powerMixCharging_ = true;
+        powerMixPower_ = std::min(1.f, powerMixPower_ + kPowerMixFillRate * dt);
+        if (powerMixPower_ >= 1.f) { resolvePowerMix(); return; }
+    } else if (powerMixCharging_) {
+        // Was charging as of last frame and Space isn't held anymore --
+        // that's the release edge, resolve right now against wherever
+        // powerMixPower_/powerMixTargetCenter_ happen to be this instant.
+        resolvePowerMix();
+    }
+}
+
+void GameWorld::resolvePowerMix() {
+    bool hit = std::abs(powerMixPower_ - powerMixTargetCenter_) <= kPowerMixHalfWidth;
+    ActionResult r = game_.tryMinigameBonus("alchemist", hit);
+    closeOverlay();
+    alchemistCooldown_ = kMinigameCooldownSeconds;
+    if (r.success) {
+        if (hit && upgradeSound_) upgradeSound_->play();
+        std::string msg = Localization::t(r.rare ? "minigame_rare_prefix" : (hit ? "fishing_hit_prefix" : "fishing_miss_prefix"))
+            + formatNumber(r.amount) + " " + Localization::t(r.goodId) + Localization::t("minigame_result_suffix");
+        setFeedback(msg, hit);
+    } else {
+        setFeedback(Localization::t(r.messageKey), false);
+    }
+}
+
+void GameWorld::drawPowerMixOverlay(sf::RenderWindow& window) {
+    sf::Vector2f pos(440.f, 260.f), size(400.f, 300.f);
+    uiPanelBg(window, pos, size);
+    uiText(window, { pos.x + 24.f, pos.y + 14.f }, Localization::t("powermix_title"), 18, sf::Color(232, 212, 120), true);
+    uiButton(window, { pos.x + size.x - 110.f, pos.y + 12.f }, { 90.f, 32.f }, Localization::t("close_button"), [this]() { closeOverlay(); });
+
+    float descW = size.x - 48.f;
+    float y = pos.y + 52.f;
+    y += uiWrappedText(window, { pos.x + 24.f, y }, Localization::t("powermix_hint"), descW, 12, sf::Color(200, 200, 200), 16.f);
+    y += 20.f;
+
+    // Vertical bar -- deliberately different orientation from every other
+    // minigame's horizontal one here, reinforcing "this is a different kind
+    // of bar" (charge level rising, not a position sweeping left-right).
+    float barX = pos.x + 24.f, barY = y, barW = descW, barH = 96.f;
+    sf::RectangleShape barBg(sf::Vector2f(barW, barH));
+    barBg.setPosition(sf::Vector2f(barX, barY));
+    barBg.setFillColor(sf::Color(40, 40, 50));
+    barBg.setOutlineThickness(2.f);
+    barBg.setOutlineColor(sf::Color(25, 20, 15));
+    window.draw(barBg);
+
+    // Target zone: wobbles continuously (powerMixTargetCenter_ is
+    // recomputed every frame in updatePowerMix), drawn as a horizontal band
+    // across the vertical bar at its current position.
+    float targetCenterY = barY + barH * (1.f - powerMixTargetCenter_);
+    float targetBandH = kPowerMixHalfWidth * 2.f * barH;
+    sf::RectangleShape targetZone(sf::Vector2f(barW, targetBandH));
+    targetZone.setPosition(sf::Vector2f(barX, targetCenterY - targetBandH / 2.f));
+    targetZone.setFillColor(sf::Color(180, 120, 210, 190));
+    window.draw(targetZone);
+
+    // Fill, bottom-up.
+    float fillH = powerMixPower_ * barH;
+    sf::RectangleShape fill(sf::Vector2f(barW, fillH));
+    fill.setPosition(sf::Vector2f(barX, barY + barH - fillH));
+    fill.setFillColor(sf::Color(150, 200, 230));
+    window.draw(fill);
+
+    y = barY + barH + 16.f;
+    uiText(window, { pos.x + 24.f, y },
+        Localization::t(powerMixCharging_ ? "powermix_status_charging" : "powermix_status_idle"), 13,
+        powerMixCharging_ ? sf::Color(150, 220, 150) : sf::Color(180, 180, 180));
+
+    if (!overlayFeedback_.empty()) {
+        uiText(window, { pos.x + 24.f, pos.y + size.y - 28.f }, overlayFeedback_, 13, overlayFeedbackColor_);
+    }
+}
+
+void GameWorld::tryStartHerding(const std::string& businessId) {
+    float& cooldown = businessId == "sheep" ? sheepCooldown_
+        : businessId == "dairyfarm" ? dairyfarmCooldown_
+        : businessId == "beehive" ? beehiveCooldown_
+        : trapperCooldown_;
+    bool built = false;
+    for (const auto& info : game_.businessInfos()) {
+        if (info.id == businessId) { built = info.level > 0; break; }
+    }
+    if (!built) {
+        setFeedback(Localization::t("minigame_needs_building"), false);
+    } else if (cooldown > 0.f) {
+        std::ostringstream oss;
+        oss << Localization::t("fishing_cooldown_prefix") << static_cast<int>(std::ceil(cooldown))
+            << Localization::t("fishing_cooldown_suffix");
+        setFeedback(oss.str(), false);
+    } else {
+        minigameBusinessId_ = businessId;
+        herdCursorPos_ = { 0.5f, 0.5f };
+        herdElapsed_ = 0.f;
+        herdCaughtTime_ = 0.f;
+        openOverlay(OverlayKind::Herding);
+    }
+}
+
+void GameWorld::updateHerding(float dt) {
+    herdElapsed_ += dt;
+
+    // Reuses the world's own movement keys -- safe since world movement
+    // itself is gated on currentOverlay_ == None (see the main update
+    // loop), so these are otherwise idle while this overlay is open.
+    sf::Vector2f move(0.f, 0.f);
+    if (sf::Keyboard::isKeyPressed(settings_.keys.moveUp) || sf::Keyboard::isKeyPressed(sf::Keyboard::Key::Up))       move.y -= 1.f;
+    if (sf::Keyboard::isKeyPressed(settings_.keys.moveDown) || sf::Keyboard::isKeyPressed(sf::Keyboard::Key::Down))   move.y += 1.f;
+    if (sf::Keyboard::isKeyPressed(settings_.keys.moveLeft) || sf::Keyboard::isKeyPressed(sf::Keyboard::Key::Left))   move.x -= 1.f;
+    if (sf::Keyboard::isKeyPressed(settings_.keys.moveRight) || sf::Keyboard::isKeyPressed(sf::Keyboard::Key::Right)) move.x += 1.f;
+    if (move.x != 0.f || move.y != 0.f) {
+        float len = std::sqrt(move.x * move.x + move.y * move.y);
+        herdCursorPos_.x = std::clamp(herdCursorPos_.x + (move.x / len) * kHerdCursorSpeed * dt, 0.f, 1.f);
+        herdCursorPos_.y = std::clamp(herdCursorPos_.y + (move.y / len) * kHerdCursorSpeed * dt, 0.f, 1.f);
+    }
+
+    // Fixed Lissajous wander -- reads as "erratic" without per-frame
+    // randomness that could jitter or run the target off toward an edge.
+    sf::Vector2f targetPos(0.5f + 0.4f * std::sin(herdElapsed_ * 1.3f), 0.5f + 0.35f * std::sin(herdElapsed_ * 0.7f + 1.7f));
+    float dx = herdCursorPos_.x - targetPos.x, dy = herdCursorPos_.y - targetPos.y;
+    if (std::sqrt(dx * dx + dy * dy) <= kHerdCatchRadius) herdCaughtTime_ += dt;
+
+    if (herdElapsed_ >= kHerdTimeWindow) resolveHerding();
+}
+
+void GameWorld::resolveHerding() {
+    bool hit = herdCaughtTime_ >= kHerdHitThreshold;
+    ActionResult r = game_.tryMinigameBonus(minigameBusinessId_, hit);
+    closeOverlay();
+    float& cooldown = minigameBusinessId_ == "sheep" ? sheepCooldown_
+        : minigameBusinessId_ == "dairyfarm" ? dairyfarmCooldown_
+        : minigameBusinessId_ == "beehive" ? beehiveCooldown_
+        : trapperCooldown_;
+    cooldown = kMinigameCooldownSeconds;
+    if (r.success) {
+        if (hit && upgradeSound_) upgradeSound_->play();
+        std::string msg = Localization::t(r.rare ? "minigame_rare_prefix" : (hit ? "fishing_hit_prefix" : "fishing_miss_prefix"))
+            + formatNumber(r.amount) + " " + Localization::t(r.goodId) + Localization::t("minigame_result_suffix");
+        setFeedback(msg, hit);
+    } else {
+        setFeedback(Localization::t(r.messageKey), false);
+    }
+}
+
+void GameWorld::drawHerdingOverlay(sf::RenderWindow& window) {
+    // Tall enough for the hint to wrap to 2 lines (the English original
+    // measures ~764px in a ~392px-wide text area -- see uiWrappedText's own
+    // comment on why every hint here goes through it now) without crowding
+    // the catch box/timer bar/feedback line below it.
+    sf::Vector2f pos(420.f, 250.f), size(440.f, 360.f);
+    uiPanelBg(window, pos, size);
+    uiText(window, { pos.x + 24.f, pos.y + 14.f }, Localization::t("herding_title"), 18, sf::Color(232, 212, 120), true);
+    uiButton(window, { pos.x + size.x - 110.f, pos.y + 12.f }, { 90.f, 32.f }, Localization::t("close_button"), [this]() { closeOverlay(); });
+
+    float descW = size.x - 48.f;
+    float y = pos.y + 52.f;
+    y += uiWrappedText(window, { pos.x + 24.f, y }, applyKeyPlaceholders(Localization::t("herding_hint")), descW, 12, sf::Color(200, 200, 200), 16.f);
+    y += 12.f;
+
+    std::ostringstream progressOss;
+    progressOss << Localization::t("herding_caught_prefix") << std::fixed << std::setprecision(1) << herdCaughtTime_
+        << "/" << kHerdHitThreshold << Localization::t("herding_caught_suffix");
+    uiText(window, { pos.x + 24.f, y }, progressOss.str(), 14, sf::Color(220, 200, 160), true);
+    y += 24.f;
+
+    float boxX = pos.x + 24.f, boxY = y, boxW = descW, boxH = 150.f;
+    sf::RectangleShape box(sf::Vector2f(boxW, boxH));
+    box.setPosition(sf::Vector2f(boxX, boxY));
+    box.setFillColor(sf::Color(40, 46, 40));
+    box.setOutlineThickness(2.f);
+    box.setOutlineColor(sf::Color(25, 20, 15));
+    window.draw(box);
+
+    sf::Vector2f targetPos(0.5f + 0.4f * std::sin(herdElapsed_ * 1.3f), 0.5f + 0.35f * std::sin(herdElapsed_ * 0.7f + 1.7f));
+    sf::CircleShape targetDot(10.f);
+    targetDot.setOrigin(sf::Vector2f(10.f, 10.f));
+    targetDot.setPosition(sf::Vector2f(boxX + targetPos.x * boxW, boxY + targetPos.y * boxH));
+    targetDot.setFillColor(sf::Color(230, 200, 140));
+    window.draw(targetDot);
+
+    float dx = herdCursorPos_.x - targetPos.x, dy = herdCursorPos_.y - targetPos.y;
+    bool caughtNow = std::sqrt(dx * dx + dy * dy) <= kHerdCatchRadius;
+    sf::CircleShape cursorRing(14.f);
+    cursorRing.setOrigin(sf::Vector2f(14.f, 14.f));
+    cursorRing.setPosition(sf::Vector2f(boxX + herdCursorPos_.x * boxW, boxY + herdCursorPos_.y * boxH));
+    cursorRing.setFillColor(sf::Color::Transparent);
+    cursorRing.setOutlineThickness(3.f);
+    cursorRing.setOutlineColor(caughtNow ? sf::Color(140, 220, 140) : sf::Color(200, 200, 220));
+    window.draw(cursorRing);
+
+    y = boxY + boxH + 12.f;
+    float timeFrac = std::clamp(1.f - herdElapsed_ / kHerdTimeWindow, 0.f, 1.f);
+    sf::RectangleShape timeBg(sf::Vector2f(descW, 10.f));
+    timeBg.setPosition(sf::Vector2f(pos.x + 24.f, y));
+    timeBg.setFillColor(sf::Color(40, 40, 50));
+    window.draw(timeBg);
+    sf::RectangleShape timeFill(sf::Vector2f(descW * timeFrac, 10.f));
+    timeFill.setPosition(sf::Vector2f(pos.x + 24.f, y));
+    timeFill.setFillColor(sf::Color(200, 90, 80));
+    window.draw(timeFill);
+
+    if (!overlayFeedback_.empty()) {
+        uiText(window, { pos.x + 24.f, pos.y + size.y - 28.f }, overlayFeedback_, 13, overlayFeedbackColor_);
+    }
+}
+
+void GameWorld::tryStartTileReveal(const std::string& businessId) {
+    float& cooldown = businessId == "seasalt" ? seasaltCooldown_
+        : businessId == "pearlfarm" ? pearlfarmCooldown_
+        : quarryCooldown_;
+    bool built = false;
+    for (const auto& info : game_.businessInfos()) {
+        if (info.id == businessId) { built = info.level > 0; break; }
+    }
+    if (!built) {
+        setFeedback(Localization::t("minigame_needs_building"), false);
+    } else if (cooldown > 0.f) {
+        std::ostringstream oss;
+        oss << Localization::t("fishing_cooldown_prefix") << static_cast<int>(std::ceil(cooldown))
+            << Localization::t("fishing_cooldown_suffix");
+        setFeedback(oss.str(), false);
+    } else {
+        minigameBusinessId_ = businessId;
+        tileRevealIsBonus_.assign(kTileRevealTileCount, false);
+        for (int i = 0; i < kTileRevealBonusCount; ++i) tileRevealIsBonus_[static_cast<size_t>(i)] = true;
+        // Fisher-Yates shuffle -- std::shuffle needs a URBG, std::rand() is
+        // fine here (same source every other minigame's randomness already
+        // uses, e.g. mining's target center). std::swap doesn't work on
+        // std::vector<bool>'s packed-bit proxy references (MSVC's STL
+        // fails to deduce a matching overload for them -- confirmed by an
+        // actual build, not just a style guess), so this swaps through a
+        // plain bool temporary instead.
+        for (int i = kTileRevealTileCount - 1; i > 0; --i) {
+            int j = std::rand() % (i + 1);
+            bool tmp = tileRevealIsBonus_[static_cast<size_t>(i)];
+            tileRevealIsBonus_[static_cast<size_t>(i)] = tileRevealIsBonus_[static_cast<size_t>(j)];
+            tileRevealIsBonus_[static_cast<size_t>(j)] = tmp;
+        }
+        tileRevealRevealed_.assign(kTileRevealTileCount, false);
+        tileRevealPicksUsed_ = 0;
+        openOverlay(OverlayKind::TileReveal);
+    }
+}
+
+void GameWorld::revealTile(int index) {
+    if (index < 0 || index >= kTileRevealTileCount) return;
+    if (tileRevealRevealed_[static_cast<size_t>(index)]) return;
+    tileRevealRevealed_[static_cast<size_t>(index)] = true;
+    tileRevealPicksUsed_++;
+    bool hit = tileRevealIsBonus_[static_cast<size_t>(index)];
+
+    ActionResult r = game_.tryMinigameBonus(minigameBusinessId_, hit);
+    bool picksFinished = tileRevealPicksUsed_ >= kTileRevealPicks;
+    if (picksFinished) closeOverlay();
+
+    if (r.success) {
+        if (hit && upgradeSound_) upgradeSound_->play();
+        std::string msg = Localization::t(r.rare ? "minigame_rare_prefix" : (hit ? "fishing_hit_prefix" : "fishing_miss_prefix"))
+            + formatNumber(r.amount) + " " + Localization::t(r.goodId) + Localization::t("minigame_result_suffix");
+        setFeedback(msg, hit);
+    } else {
+        setFeedback(Localization::t(r.messageKey), false);
+    }
+
+    if (picksFinished) {
+        float& cooldown = minigameBusinessId_ == "seasalt" ? seasaltCooldown_
+            : minigameBusinessId_ == "pearlfarm" ? pearlfarmCooldown_
+            : quarryCooldown_;
+        cooldown = kMinigameCooldownSeconds;
+    }
+}
+
+void GameWorld::drawTileRevealOverlay(sf::RenderWindow& window) {
+    sf::Vector2f pos(420.f, 250.f), size(440.f, 340.f);
+    uiPanelBg(window, pos, size);
+    uiText(window, { pos.x + 24.f, pos.y + 14.f }, Localization::t("tilereveal_title"), 18, sf::Color(232, 212, 120), true);
+    uiButton(window, { pos.x + size.x - 110.f, pos.y + 12.f }, { 90.f, 32.f }, Localization::t("close_button"), [this]() { closeOverlay(); });
+
+    float descW = size.x - 48.f;
+    float y = pos.y + 52.f;
+    y += uiWrappedText(window, { pos.x + 24.f, y }, Localization::t("tilereveal_hint"), descW, 12, sf::Color(200, 200, 200), 16.f);
+    y += 12.f;
+
+    std::ostringstream picksOss;
+    picksOss << Localization::t("tilereveal_picks_prefix") << (kTileRevealPicks - tileRevealPicksUsed_);
+    uiText(window, { pos.x + 24.f, y }, picksOss.str(), 14, sf::Color(220, 200, 160), true);
+    y += 30.f;
+
+    // Fixed tile size (not stretched to fill descW) -- stretching to a
+    // ~130px tile at only 2 rows would push the grid past this panel's own
+    // bottom edge, the same overflow class as the hint text's, just on the
+    // vertical axis instead of horizontal. Centered in the available width.
+    constexpr int kCols = 3;
+    constexpr float tileSize = 70.f, gap = 14.f;
+    float gridW = static_cast<float>(kCols) * tileSize + static_cast<float>(kCols - 1) * gap;
+    float gridX = pos.x + 24.f + (descW - gridW) / 2.f;
+    for (int i = 0; i < kTileRevealTileCount; ++i) {
+        int col = i % kCols, row = i / kCols;
+        sf::Vector2f tp(gridX + static_cast<float>(col) * (tileSize + gap), y + static_cast<float>(row) * (tileSize + gap));
+        sf::RectangleShape tile(sf::Vector2f(tileSize, tileSize));
+        tile.setPosition(tp);
+        bool revealed = tileRevealRevealed_[static_cast<size_t>(i)];
+        if (revealed) {
+            tile.setFillColor(tileRevealIsBonus_[static_cast<size_t>(i)] ? sf::Color(120, 200, 120) : sf::Color(90, 90, 100));
+        } else {
+            tile.setFillColor(sf::Color(60, 56, 70));
+        }
+        tile.setOutlineThickness(2.f);
+        tile.setOutlineColor(sf::Color(25, 20, 15));
+        window.draw(tile);
+
+        if (revealed) {
+            uiText(window, { tp.x + tileSize / 2.f - 8.f, tp.y + tileSize / 2.f - 10.f },
+                tileRevealIsBonus_[static_cast<size_t>(i)] ? Localization::t("tilereveal_bonus_mark") : Localization::t("tilereveal_empty_mark"),
+                18, sf::Color::White, true);
+        } else if (tileRevealPicksUsed_ < kTileRevealPicks) {
+            int idx = i;
+            overlayClickRegions_.push_back(ClickRegion{ sf::FloatRect(tp, sf::Vector2f(tileSize, tileSize)),
+                [this, idx]() { revealTile(idx); } });
+        }
+    }
+
+    if (!overlayFeedback_.empty()) {
+        uiText(window, { pos.x + 24.f, pos.y + size.y - 28.f }, overlayFeedback_, 13, overlayFeedbackColor_);
+    }
+}
+
+void GameWorld::tryStartRhythmTap(const std::string& businessId) {
+    float& cooldown = businessId == "cannery" ? canneryCooldown_
+        : businessId == "smokehouse" ? smokehouseCooldown_
+        : sushibarCooldown_;
+    bool built = false;
+    for (const auto& info : game_.businessInfos()) {
+        if (info.id == businessId) { built = info.level > 0; break; }
+    }
+    if (!built) {
+        setFeedback(Localization::t("minigame_needs_building"), false);
+    } else if (cooldown > 0.f) {
+        std::ostringstream oss;
+        oss << Localization::t("fishing_cooldown_prefix") << static_cast<int>(std::ceil(cooldown))
+            << Localization::t("fishing_cooldown_suffix");
+        setFeedback(oss.str(), false);
+    } else {
+        minigameBusinessId_ = businessId;
+        rhythmMarkers_.clear();
+        for (int i = 0; i < kRhythmBeats; ++i) {
+            rhythmMarkers_.push_back(RhythmMarker{ static_cast<float>(i) * kRhythmSpawnStagger, false, false });
+        }
+        rhythmElapsed_ = 0.f;
+        rhythmResolvedCount_ = 0;
+        openOverlay(OverlayKind::RhythmTap);
+    }
+}
+
+void GameWorld::updateRhythmTap(float dt) {
+    rhythmElapsed_ += dt;
+    for (auto& m : rhythmMarkers_) {
+        if (m.resolved || m.spawnTime > rhythmElapsed_) continue;
+        float progress = (rhythmElapsed_ - m.spawnTime) / kRhythmTravelSeconds;
+        if (progress > 1.f + kRhythmHitTolerance) {
+            m.resolved = true;
+            m.hit = false;
+            rhythmResolvedCount_++;
+        }
+    }
+    if (rhythmResolvedCount_ >= kRhythmBeats) finishRhythmTap();
+}
+
+void GameWorld::handleRhythmTap() {
+    RhythmMarker* best = nullptr;
+    float bestDist = 1e9f;
+    for (auto& m : rhythmMarkers_) {
+        if (m.resolved || m.spawnTime > rhythmElapsed_) continue;
+        float progress = (rhythmElapsed_ - m.spawnTime) / kRhythmTravelSeconds;
+        float dist = std::abs(progress - 1.f);
+        if (dist <= kRhythmHitTolerance && dist < bestDist) { bestDist = dist; best = &m; }
+    }
+    if (!best) return; // no marker currently in range -- ignored, no penalty
+    best->resolved = true;
+    best->hit = true;
+    rhythmResolvedCount_++;
+    if (upgradeSound_) upgradeSound_->play(); // immediate per-hit feedback, unlike the batched toast finishRhythmTap shows at the end
+    if (rhythmResolvedCount_ >= kRhythmBeats) finishRhythmTap();
+}
+
+void GameWorld::finishRhythmTap() {
+    int hits = 0;
+    double totalAmount = 0.0;
+    bool anyRare = false;
+    std::string goodId;
+    for (const auto& m : rhythmMarkers_) {
+        ActionResult r = game_.tryMinigameBonus(minigameBusinessId_, m.hit);
+        if (!r.success) continue;
+        if (m.hit) hits++;
+        totalAmount += r.amount;
+        anyRare = anyRare || r.rare;
+        goodId = r.goodId;
+    }
+    closeOverlay();
+    float& cooldown = minigameBusinessId_ == "cannery" ? canneryCooldown_
+        : minigameBusinessId_ == "smokehouse" ? smokehouseCooldown_
+        : sushibarCooldown_;
+    cooldown = kMinigameCooldownSeconds;
+
+    if (!goodId.empty()) {
+        std::ostringstream oss;
+        oss << Localization::t(anyRare ? "minigame_rare_prefix" : "rhythm_result_hits_prefix") << hits << "/" << kRhythmBeats
+            << Localization::t("rhythm_result_earned_prefix") << formatNumber(totalAmount) << " " << Localization::t(goodId)
+            << Localization::t("minigame_result_suffix");
+        setFeedback(oss.str(), hits > 0);
+    } else {
+        setFeedback(Localization::t("invalid_business_number"), false);
+    }
+}
+
+void GameWorld::drawRhythmTapOverlay(sf::RenderWindow& window) {
+    sf::Vector2f pos(400.f, 260.f), size(480.f, 280.f);
+    uiPanelBg(window, pos, size);
+    uiText(window, { pos.x + 24.f, pos.y + 14.f }, Localization::t("rhythmtap_title"), 18, sf::Color(232, 212, 120), true);
+    uiButton(window, { pos.x + size.x - 110.f, pos.y + 12.f }, { 90.f, 32.f }, Localization::t("close_button"), [this]() { closeOverlay(); });
+
+    float descW = size.x - 48.f;
+    float y = pos.y + 52.f;
+    y += uiWrappedText(window, { pos.x + 24.f, y }, Localization::t("rhythmtap_hint"), descW, 12, sf::Color(200, 200, 200), 16.f);
+    y += 12.f;
+
+    std::ostringstream hitsOss;
+    int hitsSoFar = 0;
+    for (const auto& m : rhythmMarkers_) if (m.resolved && m.hit) hitsSoFar++;
+    hitsOss << Localization::t("mining_hits_prefix") << hitsSoFar << "/" << kRhythmBeats;
+    uiText(window, { pos.x + 24.f, y }, hitsOss.str(), 15, sf::Color(220, 200, 160), true);
+    y += 30.f;
+
+    float laneX = pos.x + 24.f, laneY = y, laneW = descW, laneH = 40.f;
+    sf::RectangleShape laneBg(sf::Vector2f(laneW, laneH));
+    laneBg.setPosition(sf::Vector2f(laneX, laneY));
+    laneBg.setFillColor(sf::Color(40, 40, 50));
+    laneBg.setOutlineThickness(2.f);
+    laneBg.setOutlineColor(sf::Color(25, 20, 15));
+    window.draw(laneBg);
+
+    float hitLineX = laneX + laneW - 20.f;
+    sf::RectangleShape hitLine(sf::Vector2f(4.f, laneH + 10.f));
+    hitLine.setPosition(sf::Vector2f(hitLineX - 2.f, laneY - 5.f));
+    hitLine.setFillColor(sf::Color(232, 212, 120));
+    window.draw(hitLine);
+
+    for (const auto& m : rhythmMarkers_) {
+        if (m.resolved || m.spawnTime > rhythmElapsed_) continue;
+        float progress = std::clamp((rhythmElapsed_ - m.spawnTime) / kRhythmTravelSeconds, 0.f, 1.f + kRhythmHitTolerance);
+        float markerX = laneX + progress * (hitLineX - laneX);
+        sf::CircleShape marker(11.f);
+        marker.setOrigin(sf::Vector2f(11.f, 11.f));
+        marker.setPosition(sf::Vector2f(markerX, laneY + laneH / 2.f));
+        marker.setFillColor(sf::Color(120, 190, 220));
+        window.draw(marker);
+    }
+
+    y = laneY + laneH + 20.f;
+    uiButton(window, { pos.x + 24.f, y }, { descW, 44.f }, Localization::t("rhythmtap_button"),
+        [this]() { handleRhythmTap(); });
+
+    if (!overlayFeedback_.empty()) {
+        uiText(window, { pos.x + 24.f, pos.y + size.y - 28.f }, overlayFeedback_, 13, overlayFeedbackColor_);
+    }
+}
+
 void GameWorld::drawDeathNoticeOverlay(sf::RenderWindow& window) {
     sf::Vector2f pos(320.f, 210.f), size(640.f, 360.f);
     uiPanelBg(window, pos, size);
@@ -6447,7 +7398,7 @@ void GameWorld::drawDeathNoticeOverlay(sf::RenderWindow& window) {
 void GameWorld::drawLegacyOverlay(sf::RenderWindow& window) {
     sf::Vector2f pos(260.f, 90.f), size(760.f, 680.f);
     uiPanelBg(window, pos, size);
-    uiText(window, { pos.x + 24.f, pos.y + 16.f }, Localization::t("menu_legacy_header"), 20, sf::Color(232, 212, 120), true);
+    uiText(window, { pos.x + 24.f, pos.y + 16.f }, guiMenuTitle("menu_legacy_header"), 20, sf::Color(232, 212, 120), true);
     uiButton(window, { pos.x + size.x - 120.f, pos.y + 14.f }, { 100.f, 34.f }, Localization::t("close_button"), [this]() { closeOverlay(); });
 
     uiText(window, { pos.x + 24.f, pos.y + 70.f }, Localization::t("legacy_points_label") + std::to_string(game_.legacyPoints()), 17, sf::Color(232, 212, 120), true);
@@ -6621,7 +7572,7 @@ void GameWorld::drawDialogueOverlay(sf::RenderWindow& window) {
 void GameWorld::drawBankOverlay(sf::RenderWindow& window) {
     sf::Vector2f pos(360.f, 220.f), size(560.f, 360.f);
     uiPanelBg(window, pos, size);
-    uiText(window, { pos.x + 24.f, pos.y + 16.f }, Localization::t("menu_bank_header"), 20, sf::Color(232, 212, 120), true);
+    uiText(window, { pos.x + 24.f, pos.y + 16.f }, guiMenuTitle("menu_bank_header"), 20, sf::Color(232, 212, 120), true);
     uiButton(window, { pos.x + size.x - 120.f, pos.y + 14.f }, { 100.f, 34.f }, Localization::t("close_button"), [this]() { closeOverlay(); });
 
     uiText(window, { pos.x + 24.f, pos.y + 70.f }, Localization::t("bank_cash_label") + formatNumber(game_.money()), 15);
@@ -6668,7 +7619,7 @@ void GameWorld::drawWarehouseOverlay(sf::RenderWindow& window) {
     // reading order is "see what you have, then decide whether to expand".
     sf::Vector2f pos(360.f, 110.f), size(560.f, 600.f);
     uiPanelBg(window, pos, size);
-    uiText(window, { pos.x + 24.f, pos.y + 16.f }, Localization::t("menu_warehouse_header"), 20, sf::Color(232, 212, 120), true);
+    uiText(window, { pos.x + 24.f, pos.y + 16.f }, guiMenuTitle("menu_warehouse_header"), 20, sf::Color(232, 212, 120), true);
     uiButton(window, { pos.x + size.x - 120.f, pos.y + 14.f }, { 100.f, 34.f }, Localization::t("close_button"), [this]() { closeOverlay(); });
 
     std::ostringstream info;
@@ -6727,7 +7678,7 @@ void GameWorld::drawWarehouseOverlay(sf::RenderWindow& window) {
 void GameWorld::drawContractsOverlay(sf::RenderWindow& window) {
     sf::Vector2f pos(360.f, 190.f), size(600.f, 440.f);
     uiPanelBg(window, pos, size);
-    uiText(window, { pos.x + 24.f, pos.y + 16.f }, Localization::t("menu_contracts_header"), 20, sf::Color(232, 212, 120), true);
+    uiText(window, { pos.x + 24.f, pos.y + 16.f }, guiMenuTitle("menu_contracts_header"), 20, sf::Color(232, 212, 120), true);
     uiButton(window, { pos.x + size.x - 120.f, pos.y + 14.f }, { 100.f, 34.f }, Localization::t("close_button"), [this]() { closeOverlay(); });
 
     auto list = game_.contracts();
@@ -6902,21 +7853,44 @@ void GameWorld::run() {
                     }
                 } else if (keyPressed->code == settings_.keys.minigame && currentOverlay_ == OverlayKind::None) {
                     // Minigames: only meaningful right next to the matching
-                    // built business. Fishing Dock and Mine/Gold Mine share
-                    // the timing-bar mechanic; Lumber Camp has its own.
+                    // built business. Fishing Dock has the timing-bar
+                    // mechanic; Mine/Gold Mine have their own 3-strike combo
+                    // instead of sharing Fishing's (2026-08-12, "矿场和金矿
+                    // 这两个可以不用和渔场的一样吗,做一个别的小游戏");
+                    // Lumber Camp has its own mash-to-target mechanic; Winery
+                    // keeps the memorize-a-sequence Brewing mechanic while
+                    // Alchemist moved to its own Power-Mix one; and a same-
+                    // day follow-up ("你看下其他的还有什么小游戏可以加")
+                    // gave the remaining 10 minigame-less businesses 3 more
+                    // mechanics -- see each business group below and their
+                    // own state comments in GameWorld.h.
                     if (const WorldBuilding* b = findNearbyBuilding(kInteractRadius)) {
-                        if (b->id == "fishing" || b->id == "mine" || b->id == "goldmine") {
+                        if (b->id == "fishing") {
                             tryStartTimingMinigame(b->id);
+                        } else if (b->id == "mine" || b->id == "goldmine") {
+                            tryStartMiningMinigame(b->id);
                         } else if (b->id == "lumber") {
                             tryStartChopping();
-                        } else if (b->id == "alchemist" || b->id == "winery") {
+                        } else if (b->id == "winery") {
                             tryStartBrewing(b->id);
+                        } else if (b->id == "alchemist") {
+                            tryStartPowerMix();
+                        } else if (b->id == "sheep" || b->id == "dairyfarm" || b->id == "beehive" || b->id == "trapper") {
+                            tryStartHerding(b->id);
+                        } else if (b->id == "seasalt" || b->id == "pearlfarm" || b->id == "quarry") {
+                            tryStartTileReveal(b->id);
+                        } else if (b->id == "cannery" || b->id == "smokehouse" || b->id == "sushibar") {
+                            tryStartRhythmTap(b->id);
                         }
                     }
                 } else if (keyPressed->code == sf::Keyboard::Key::Space && currentOverlay_ == OverlayKind::TimingMinigame) {
                     resolveTimingMinigame();
+                } else if (keyPressed->code == sf::Keyboard::Key::Space && currentOverlay_ == OverlayKind::MiningMinigame) {
+                    resolveMiningRound();
                 } else if (keyPressed->code == sf::Keyboard::Key::Space && currentOverlay_ == OverlayKind::Chopping) {
                     choppingClicks_++;
+                } else if (keyPressed->code == sf::Keyboard::Key::Space && currentOverlay_ == OverlayKind::RhythmTap) {
+                    handleRhythmTap();
                 }
             } else if (const auto* mousePressed = event->getIf<sf::Event::MouseButtonPressed>()) {
                 if (mousePressed->button == sf::Mouse::Button::Left) {
@@ -7000,9 +7974,23 @@ void GameWorld::run() {
         if (lumberCooldown_ > 0.f) lumberCooldown_ -= dt;
         if (alchemistCooldown_ > 0.f) alchemistCooldown_ -= dt;
         if (wineryCooldown_ > 0.f) wineryCooldown_ -= dt;
+        if (sheepCooldown_ > 0.f) sheepCooldown_ -= dt;
+        if (dairyfarmCooldown_ > 0.f) dairyfarmCooldown_ -= dt;
+        if (beehiveCooldown_ > 0.f) beehiveCooldown_ -= dt;
+        if (trapperCooldown_ > 0.f) trapperCooldown_ -= dt;
+        if (seasaltCooldown_ > 0.f) seasaltCooldown_ -= dt;
+        if (pearlfarmCooldown_ > 0.f) pearlfarmCooldown_ -= dt;
+        if (quarryCooldown_ > 0.f) quarryCooldown_ -= dt;
+        if (canneryCooldown_ > 0.f) canneryCooldown_ -= dt;
+        if (smokehouseCooldown_ > 0.f) smokehouseCooldown_ -= dt;
+        if (sushibarCooldown_ > 0.f) sushibarCooldown_ -= dt;
         if (currentOverlay_ == OverlayKind::TimingMinigame) minigameIndicatorPhase_ += dt;
+        if (currentOverlay_ == OverlayKind::MiningMinigame) miningIndicatorPhase_ += dt;
         if (currentOverlay_ == OverlayKind::Chopping) updateChopping(dt);
         if (currentOverlay_ == OverlayKind::Brewing) updateBrewing(dt);
+        if (currentOverlay_ == OverlayKind::PowerMix) updatePowerMix(dt);
+        if (currentOverlay_ == OverlayKind::Herding) updateHerding(dt);
+        if (currentOverlay_ == OverlayKind::RhythmTap) updateRhythmTap(dt);
         updateForaging(dt);
 
         // Movement, zone transitions, and the world tick are all paused while

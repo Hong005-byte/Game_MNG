@@ -75,9 +75,14 @@ namespace {
               "Press {U} near a building to instantly upgrade it one level.\n"
               "Press {M} to show/hide the minimap.\n"
               "Walk off the edge of the screen to travel between areas.\n\n"
-              "Press {F} next to a built Fishing Dock or Mine/Gold Mine for a quick timing-bar\n"
-              "minigame, a Lumber Camp for a mash-to-target one, or an Alchemist/Winery for a\n"
-              "memorize-the-sequence one -- all give a bonus catch (short cooldown per activity).\n"
+              "Press {F} next to a built Fishing Dock for a quick timing-bar minigame, a Mine/Gold\n"
+              "Mine for a 3-strike combo (faster and narrower each strike), a Lumber Camp for a\n"
+              "mash-to-target one, a Winery for a memorize-the-sequence one, or an Alchemist for a\n"
+              "hold-and-release Power-Mix one -- all give a bonus catch (short cooldown per\n"
+              "activity). The Sheep Farm/Dairy Farm/Apiary/Trapper's Camp instead have a Herding\n"
+              "minigame (track a wandering target over time), the Salt Flats/Pearl Farm/Quarry a\n"
+              "no-reflexes Tile Reveal (pick tiles, see what's underneath), and the Cannery/\n"
+              "Smokehouse/Sushi Bar a Rhythm Tap (catch several beats at a fixed line).\n"
               "Fishing/mining hauls run bigger in Summer (and have a better chance at a rare\n"
               "double haul) and leaner in Winter -- Spring/Autumn stay at the usual rate.\n"
               "In the Highlands, walk up to a berry patch and press {E} to forage a small random\n"
@@ -115,9 +120,13 @@ namespace {
               "在建筑附近按 {U} 键可以直接升级一级。\n"
               "按 {M} 键可以显示/隐藏小地图。\n"
               "走到屏幕边缘可以前往其他区域。\n\n"
-              "在建好的渔港、矿场/金矿附近按 {F} 键可以玩计时小游戏,伐木场是狂按目标次数的\n"
-              "挑战,炼金坊/酒庄则是记顺序的小游戏——都能拿到额外收获(每种活动各自有短暂\n"
-              "冷却时间)。钓鱼/挖矿在夏天收获会更多(而且更容易触发稀有的双倍大丰收),\n"
+              "在建好的渔港附近按 {F} 键可以玩计时小游戏,矿场/金矿则是连续三下的组合挑战\n"
+              "(一下比一下快、一下比一下窄),伐木场是狂按目标次数的挑战,酒庄是记顺序的\n"
+              "小游戏,炼金术士则是按住蓄力再松手的挑战——都能拿到额外收获(每种活动各自\n"
+              "有短暂冷却时间)。牧羊场/奶牛场/养蜂场/猎人小屋是追踪安抚小游戏(持续贴住\n"
+              "到处乱飘的目标);盐田/珍珠场/采石场是不考验手速的翻牌寻宝;罐头厂/烟熏屋/\n"
+              "寿司吧则是节拍打击(在固定的线上连续接住几个节拍)。钓鱼/挖矿\n"
+              "在夏天收获会更多(而且更容易触发稀有的双倍大丰收),\n"
               "冬天则会少一些——春秋两季维持正常水平。在高地区,走到浆果丛旁按 {E} 可以\n"
               "采集一点随机的小奖励(采过之后过一阵会重新长出来)。市镇广场的行商偶尔会有\n"
               "打折的特惠——按 {E} 跟他聊聊看看。\n\n"
@@ -202,12 +211,31 @@ namespace {
         { "autosell_threshold_prefix",    { "Sell threshold: ", "售卖门槛: " } },
         { "autosell_status_armed",        { "Price has reached the threshold -- selling now.", "价格已达到门槛,正在自动售卖。" } },
         { "autosell_status_waiting",      { "Waiting for the price to reach the threshold.", "等待价格达到门槛中。" } },
+        // 2026-08-12 ("我点回那个商品他又问我多一次是否开启" -- after
+        // starting auto-sell, clicking back on that same good asked to
+        // enable it AGAIN instead of recognizing it was already selling):
+        // shown for a good that's staged (selected in the right panel, see
+        // GameWorld.h's autoSellSelectedGoodId_) but not yet actually live
+        // -- makes clear the Start button below still needs pressing,
+        // distinct from autosell_status_armed/waiting which only apply
+        // once a good really is selling.
+        { "autosell_status_not_started",  { "Not selling yet -- press Start to begin.", "尚未开始售卖——点击下方开始按钮。" } },
         { "autosell_minus10pct",          { "-10%", "-10%" } },
         { "autosell_minus1pct",           { "-1%", "-1%" } },
         { "autosell_plus1pct",            { "+1%", "+1%" } },
         { "autosell_plus10pct",           { "+10%", "+10%" } },
         { "autosell_set_to_current_button", { "Set Threshold = Current Price", "门槛设为当前价格" } },
         { "autosell_disable_button",      { "Disable Auto-Sell", "禁用自动售卖" } },
+        // The only button that actually calls Game::trySetStorefrontAutoSell
+        // for a good that isn't live yet -- see drawAutoSellOverlay's
+        // "Right: staged selection" block and GameWorld.h's comment on
+        // autoSellSelectedGoodId_/autoSellStagedThreshold_.
+        { "autosell_start_button",        { "Start Auto-Sell", "开始自动售卖" } },
+        // Tag drawn on whichever row is the good actually selling right now
+        // (as opposed to merely staged/selected in the right panel) -- lets
+        // "which good is auto-selling" be read straight off the list
+        // without opening the right panel at all.
+        { "autosell_row_selling_tag",     { "SELLING", "售卖中" } },
         { "bakery",      { "Bakery", "面包坊" } },
         { "smelter",     { "Smelter", "冶炼厂" } },
         { "sawmill",     { "Sawmill", "锯木厂" } },
@@ -499,6 +527,15 @@ namespace {
         { "workers_maxed",           { "Already at the max number of workers.\n", "工人数量已达上限。\n" } },
         { "workers_label",           { "Workers: ", "工人: " } },
         { "hire_worker_button",      { "Hire Worker", "雇佣工人" } },
+        // 2026-08-11 (Business::autoProcessPaused / Game::trySetBusinessPaused
+        // -- "我可以set like 不要生成了吗" -- can I set it to stop producing):
+        // the pause toggle + its status line + the output-stock readout,
+        // all shown in drawBusinessesOverlay.
+        { "business_not_built",      { "Build this business first.", "请先建造该产业。" } },
+        { "pause_production_button", { "Pause Production", "暂停生产" } },
+        { "resume_production_button",{ "Resume Production", "恢复生产" } },
+        { "production_paused_label", { "Production paused -- not consuming input or producing output.", "生产已暂停——不消耗原料,也不产出。" } },
+        { "output_stock_label",      { "In warehouse: ", "仓库现有: " } },
         { "farm_action_prompt",      { "1) Upgrade level   2) Hire worker   3) Change crop   0) Cancel\nChoice: ", "1) 升级等级   2) 雇佣工人   3) 更换作物   0) 取消\n选择: " } },
         { "crop_picker_header",      { "\n-- Choose a Crop --\n", "\n-- 选择作物 --\n" } },
         { "crop_switch_cost_prefix", { "Switching crops costs $", "切换作物需要花费 $" } },
@@ -524,6 +561,46 @@ namespace {
         { "minigame_result_suffix", { ".", "。" } },
         { "mining_title",           { "Mining", "挖矿" } },
         { "mining_catch_button",    { "Mine!", "挖掘!" } },
+        // 2026-08-12 ("矿场和金矿这两个可以不用和渔场的一样吗,做一个别的
+        // 小游戏" -- give Mine/Gold Mine their own minigame instead of
+        // reusing Fishing Dock's): the 3-strike combo minigame, see
+        // GameWorld.h's own comment on the mining combo state and
+        // GameWorld::drawMiningMinigameOverlay.
+        { "mining_hint",            { "Three strikes in a row -- press Space (or click Mine!) when the marker's in the zone. Each strike is faster and narrower than the last.",
+                                       "连续挖三下——指针进入高亮区域时按空格键(或点击\"挖掘!\")。一下比一下快,区域也一下比一下窄。" } },
+        { "mining_round_prefix",    { "Strike ", "第 " } },
+        { "mining_round_suffix",    { " of 3", " 下" } },
+        { "mining_hits_prefix",     { "Hits: ", "命中: " } },
+
+        // 2026-08-12 batch ("你看下其他的还有什么小游戏可以加" -- what
+        // else could get its own minigame): 4 more mechanics -- see each
+        // one's own state comment in GameWorld.h for the design reasoning.
+        { "powermix_title",        { "Power-Mix", "蓄力配比" } },
+        { "powermix_hint",         { "Hold Space to charge -- release exactly as the wobbling zone passes over the bar. Charging all the way releases automatically.",
+                                      "按住空格蓄力——在晃动的目标区域正好经过时松开。蓄满会自动放开。" } },
+        { "powermix_status_charging", { "Charging...", "蓄力中……" } },
+        { "powermix_status_idle",     { "Hold Space to begin.", "按住空格开始。" } },
+
+        { "herding_title",         { "Herding", "追踪安抚" } },
+        { "herding_hint",          { "Steer with {MOVE} to keep your ring over the wandering target -- reward depends on your total time caught, not one lucky moment.",
+                                      "用 {MOVE} 控制光圈贴住到处乱飘的目标——奖励看的是累计贴住的时间,不是某一下运气。" } },
+        { "herding_caught_prefix", { "Caught: ", "贴住时间: " } },
+        { "herding_caught_suffix", { "s", " 秒" } },
+
+        { "tilereveal_title",       { "Tile Reveal", "翻牌寻宝" } },
+        { "tilereveal_hint",        { "Pick any 3 tiles to flip -- no timer, no reflexes, just see what's underneath.",
+                                       "任选 3 张牌翻开——没有时间限制,不考验手速,翻开看看运气。" } },
+        { "tilereveal_picks_prefix",{ "Picks left: ", "剩余次数: " } },
+        { "tilereveal_bonus_mark",  { "*", "*" } },
+        { "tilereveal_empty_mark",  { "-", "-" } },
+
+        { "rhythmtap_title",        { "Rhythm Tap", "节拍打击" } },
+        { "rhythmtap_hint",         { "Press Space (or click Tap!) the instant each marker reaches the gold line.",
+                                       "每个标记压到金线时按空格键(或点击\"打击!\")。" } },
+        { "rhythmtap_button",       { "Tap!", "打击!" } },
+        { "rhythm_result_hits_prefix",   { "Hit ", "命中 " } },
+        { "rhythm_result_earned_prefix", { " beats, +", " 拍,获得 +" } },
+
         { "chopping_title",          { "Chopping", "伐木" } },
         { "chopping_hint",           { "Mash Space (or click Chop!) to reach the target before time runs out.", "在时间用完之前狂按空格键(或点击\"砍伐!\")达到目标次数。" } },
         { "chopping_progress_prefix", { "Chops: ", "砍伐次数: " } },

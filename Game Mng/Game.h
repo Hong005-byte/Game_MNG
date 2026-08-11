@@ -43,6 +43,15 @@ struct BusinessInfo {
     double workerCost = 0.0; // cost of the next worker, 0 if already at the cap
     std::string cropId;      // only meaningful for "farm" -- its currently-active CropType id
     bool seasonBonusActive = false; // only meaningful for "farm" -- true if cropId's favorite season is current
+    // 2026-08-11 ("在每个商店的右下角加一个显示当前数量" / the manual
+    // pause request -- see Business::autoProcessPaused's own comment):
+    // `outputStock` is the live warehouse stock of this business's own
+    // output good (0 for Storefront, whose output is cash not a good) --
+    // a UI reading BusinessInfo no longer has to separately look the good
+    // up in goodInfos() just to show "how much have I actually made".
+    // `paused` mirrors Business::autoProcessPaused for the same UI.
+    double outputStock = 0.0;
+    bool paused = false;
 };
 
 // Read-only snapshot of a business's first-build construction state (see
@@ -503,6 +512,16 @@ public:
     ActionResult trySetStorefrontAutoSell(const std::string& goodId, double threshold);
     static constexpr int kAutoSellMaxLevel = 5;
     double autoSellCapacityForLevel(int level) const;
+
+    // ---- Manual production pause (see Business::autoProcessPaused's own
+    // comment). A paused business is skipped entirely by simulateElapsed's
+    // Pass 1/2 -- it neither consumes its input nor produces its output --
+    // while everything else about it (level, workers, upgrades) is
+    // untouched. Meant for freeing up a shared raw good for something else
+    // (e.g. pausing the Sawmill so Wood stops being drawn into Planks)
+    // rather than as a way to "save" production for later -- paused time
+    // just doesn't produce, it isn't banked. ----
+    ActionResult trySetBusinessPaused(const std::string& businessId, bool paused);
     // Spends the cash cost (same BusinessType::baseCost as a normal first
     // level) plus every required material from the warehouse, then starts
     // the countdown -- level stays 0 until simulateElapsed ticks it to
