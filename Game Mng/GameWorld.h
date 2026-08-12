@@ -842,12 +842,18 @@ private:
     // ---- Update check (see UpdateChecker.h): polled once per frame
     // (cheap -- a mutex-guarded flag check, no network on this thread) in
     // run()'s loop; once it reports an update, a small dismissible banner
-    // stays up for the rest of the session offering to open the release
-    // page in the player's browser. Never downloads/installs anything itself. ----
+    // stays up for the rest of the session offering either a one-click
+    // download-and-launch-the-installer button (2026-08-12, "我不需要每次
+    // 都要跑到github去重新下载了" -- stop needing to manually go to GitHub
+    // and re-download every time; only shown when updateInstallerUrl_ isn't
+    // empty, i.e. this release actually published an installer, see
+    // UpdateChecker::Result::installerUrl) or opening the release page in
+    // the player's browser (the original, still-available fallback). ----
     bool updateAvailable_ = false;
     bool updateBannerDismissed_ = false;
     std::string updateLatestVersion_;
     std::string updateReleaseUrl_;
+    std::string updateInstallerUrl_;
     void drawUpdateBanner(sf::RenderWindow& window);
 
     // ---- Window/video mode (see Settings::resolutionIndex/fullscreen):

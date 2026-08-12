@@ -16,6 +16,14 @@ namespace {
         { "update_banner_prefix",         { "New version available: v", "发现新版本: v" } },
         { "update_banner_open_button",    { "Get it", "去下载" } },
         { "update_banner_dismiss_button", { "X", "X" } },
+        // 2026-08-12 ("我不需要每次都要跑到github去重新下载了" -- stop
+        // needing to manually go to GitHub and re-download every time) --
+        // see UpdateChecker::downloadAndRunInstaller and drawUpdateBanner's
+        // own comments for the whole one-click-update flow this covers.
+        { "update_banner_auto_button",    { "Update Now", "一键更新" } },
+        { "update_banner_downloading",    { "Downloading update...", "正在下载更新……" } },
+        { "update_banner_launch_failed",  { "Download failed -- try \"Get it\" instead.", "下载失败——试试用\"去下载\"手动打开。" } },
+        { "update_banner_launched",       { "Installer launched -- follow its prompts to finish.", "安装程序已启动——按提示完成更新即可。" } },
 
         // Save-slot picker (runs after language selection, before mode selection)
         { "save_select_title",   { "Select a Save:", "选择存档:" } },
