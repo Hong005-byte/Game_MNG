@@ -51,16 +51,13 @@ namespace {
     sf::Color shade3d(sf::Color c, int delta) {
         return sf::Color(clamp8_3d(c.r + delta), clamp8_3d(c.g + delta), clamp8_3d(c.b + delta), c.a);
     }
-    // Desaturate + darken toward flat gray -- the 3D equivalent of the 2D
-    // world's drawLockOverlay dimming rectangle (see draw3DZone's building
-    // loop), applied to the wall/roof color directly instead of an overlay
-    // quad since there's no cheap way to draw a translucent box over an
-    // already-lit 3D box without a second full geometry pass.
-    sf::Color dimForLock3d(sf::Color c) {
-        int avg = (c.r + c.g + c.b) / 3;
-        auto mix = [&](std::uint8_t v) { return clamp8_3d(static_cast<int>((v + avg) * 0.5f * 0.55f)); };
-        return sf::Color(mix(c.r), mix(c.g), mix(c.b), c.a);
-    }
+    // Used to desaturate+darken a locked business's wall/roof color toward
+    // flat gray (the 3D equivalent of the 2D world's drawLockOverlay
+    // dimming rectangle) -- removed 2026-08-12 once locked businesses
+    // stopped rendering as a dimmed box+roof at all (see draw3DZone's
+    // building loop and its own "一个色块方块在那边很丑" comment) in favor
+    // of the same natural-clearing look unstarted-but-buildable plots use,
+    // plus a padlock signpost.
 
     // sf::String's implicit conversion from std::string assumes the local
     // ANSI code page, which mangles UTF-8-encoded Chinese text -- same
@@ -144,6 +141,28 @@ namespace {
         Vec3 pos;
         Vec3 color;
         float intensity;
+        // 2026-08-12 ("现在每个门口前面都有一个圆形的光环了...路灯为自己
+        // 一个的物体" -- every doorway now has a circular glow ring, only
+        // street lamps should get one): true means the bloom pass (see
+        // draw3DZone's own loop) also draws a visible glow billboard at
+        // this light's position; false means it only contributes shading to
+        // nearby surfaces (see litColor), same as before the bloom pass's
+        // centering got fixed -- until that fix (see addGlowBillboard's own
+        // comment) EVERY light's bloom quad rendered offset upward by half
+        // its own size, which for the generic per-building "approximate a
+        // lit window" light (see the building loop below) happened to land
+        // it well clear of the door/ground area rather than centered right
+        // on top of it -- so this bug had been quietly hiding a second,
+        // separate problem: that light was never meant to be its own
+        // visible glow at all, since every building already bakes its OWN
+        // hand-placed window/chimney/hearth glow billboards into its
+        // bespoke shape (addGlowBillboard, called throughout this file's
+        // addXBuilding functions) -- the generic per-building light's whole
+        // job is background fill-light shading for buildings whose bespoke
+        // shape doesn't happen to place one there itself, not a second
+        // visible light source layered on top of those. Only actual light
+        // FIXTURES the player can see (street lamps) still bloom.
+        bool bloom = true;
     };
 
     struct LightingContext {
@@ -585,9 +604,29 @@ namespace {
     // renders into, via the billboard cache, so it's visually consistent
     // with every other glow in the game rather than a second, different-
     // looking implementation.
+    //
+    // 2026-08-12 fix ("我觉得全部给我的感觉就是蒙蒙的,而且路灯的光出现在
+    // 路灯的头上" -- everything looks hazy, and the lamp's light appears
+    // above the lamp head): `pos` is meant to be the CENTER of the glow --
+    // every call site passes something like a light's own position, a
+    // window's center, a hearth's center, etc. But addBillboard's own `base`
+    // param is a BOTTOM anchor (the quad extends upward by `height` from
+    // it, see its own comment) -- passing `pos` straight through as `base`
+    // put every glow's actual visual center `size/2` ABOVE `pos` instead of
+    // ON it. Harmless for a small 12-20 unit prop glow (chimney smoke, a
+    // hearth fire) where that offset is barely noticeable, but the bloom
+    // pass's per-light glow (see draw3DZone's own loop, `glowSize` up to
+    // 46+70=116) made it obvious: a big soft halo floating well above
+    // whatever it was supposed to be marking, and with THAT many oversized,
+    // wrongly-centered halos stacked across a whole lit-up night zone (every
+    // window + every lamp), the general "everything looks hazy" read follows
+    // directly from the same bug. Shifting `base` down by half the glow's
+    // own size re-centers it on `pos` without touching any of the ~70 call
+    // sites' own position math.
     void addGlowBillboard(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize,
         Vec3 billboardRight, Vec3 pos, float size, const sf::Texture& glowTex, sf::Color tint) {
-        addBillboard(out, viewProj, windowSize, billboardRight, pos, size, size, glowTex, tint, /*additive=*/true);
+        Vec3 base(pos.x, pos.y - size * 0.5f, pos.z);
+        addBillboard(out, viewProj, windowSize, billboardRight, base, size, size, glowTex, tint, /*additive=*/true);
     }
 
     // Ground/decoration quads (the grass plane, paths, water, sand, every
@@ -6218,9 +6257,10 @@ void GameWorld::draw3DZone(sf::RenderWindow& window) {
     // One warm point light per building (approximating a lit window on its
     // south/front face) and one per lamp post -- built before the geometry
     // loop below since every face needs the whole light list. Skipped for a
-    // locked business (its full shape is dimmed, not "in use" -- see
-    // dimForLock3d below) and for one still at the bare-plot/construction-
-    // site stage (nothing built yet to have a lit window).
+    // locked business (renders as a natural clearing + padlock signpost
+    // now, not a building at all -- see draw3DZone's building loop) and
+    // for one still at the bare-plot/construction-site stage (nothing
+    // built yet to have a lit window).
     for (const auto& b : z.buildings) {
         bool locked = game_.isBusinessLocked(b.id);
         ConstructionInfo ci = locked ? ConstructionInfo{} : game_.businessConstructionInfo(b.id);
@@ -6233,6 +6273,7 @@ void GameWorld::draw3DZone(sf::RenderWindow& window) {
         light.pos = Vec3(b.position.x + b.size.x * 0.5f, kBuildingHeight * 0.45f, b.position.y + b.size.y + 22.f);
         light.color = Vec3(1.f, 0.78f, 0.43f);
         light.intensity = 48.f * lightBoost; // 30->40->48, 2026-08-10 "夜晚的灯有点暗" follow-up
+        light.bloom = false; // shading only -- see PointLight3D's own comment on why this one doesn't also get a visible glow ring
         lc.lights.push_back(light);
     }
     for (const auto& d : z.decorations) {
@@ -6241,6 +6282,8 @@ void GameWorld::draw3DZone(sf::RenderWindow& window) {
         light.pos = Vec3(d.position.x, 34.f, d.position.y);
         light.color = Vec3(1.f, 0.75f, 0.43f);
         light.intensity = 44.f * lightBoost; // 28->36->44, 2026-08-10 "夜晚的灯有点暗" follow-up
+        // bloom stays true (default) -- an actual visible lamp fixture,
+        // this IS the light the ring is supposed to mark.
         lc.lights.push_back(light);
     }
 
@@ -6253,7 +6296,14 @@ void GameWorld::draw3DZone(sf::RenderWindow& window) {
         [&](sf::RenderTexture& rt) { drawTree(rt, sf::Vector2f(24.f, 44.f)); });
     const sf::Texture& bushTex = getBillboard3D("bush_" + season, sf::Vector2u(34, 30),
         [&](sf::RenderTexture& rt) { drawBush(rt, sf::Vector2f(4.f, 4.f)); });
-    const sf::Texture& lampTex = getBillboard3D("lamp", sf::Vector2u(30, 78),
+    // 2026-08-12: bumped 78 -> 84 tall -- drawLamp's own pole reaches down
+    // to pos.y + 34 = 84 (drawGroundShadow's anchor, the lowest thing it
+    // draws), so the old 78-tall canvas clipped the bottom ~6px of the pole
+    // off before it ever reached this texture's own bottom edge (world
+    // billboard height stays 78 at the call site below, so this just gives
+    // the bake itself enough room to not clip -- the sprite lands very
+    // slightly more compressed, not stretched).
+    const sf::Texture& lampTex = getBillboard3D("lamp", sf::Vector2u(30, 84),
         [&](sf::RenderTexture& rt) { drawLamp(rt, sf::Vector2f(15.f, 50.f)); });
     // Forageable (Highlands' berry pickups) -- same 3-dot cluster
     // drawForageable draws in 2D, baked once into a small billboard.
@@ -7540,6 +7590,33 @@ void GameWorld::draw3DZone(sf::RenderWindow& window) {
         addGroundQuad(quads, viewProj, windowSize_, eye, d.position.x, d.position.y, d.size.x, d.size.y, 0.4f, groundColor, lc);
     }
 
+    // Locked-business padlock badge (2026-08-12, "那些还没有解锁产业的...
+    // 一个色块方块在那边很丑" -- locked businesses looking like an ugly
+    // flat-colored block): same gold-lock look the 2D world's drawLockOverlay
+    // used (body + circular shackle outline), baked to a small billboard
+    // texture -- see the building loop below for how it replaces the old
+    // "just desaturate the box toward gray" treatment entirely.
+    const sf::Texture& lockTex = getBillboard3D("locked_padlock", sf::Vector2u(32, 40), [&](sf::RenderTexture& rt) {
+        sf::Color goldColor(225, 205, 110);
+        sf::Color darkColor(40, 30, 10);
+        sf::CircleShape shackle(9.f);
+        shackle.setPosition(sf::Vector2f(7.f, 2.f));
+        shackle.setFillColor(sf::Color::Transparent);
+        shackle.setOutlineThickness(3.5f);
+        shackle.setOutlineColor(goldColor);
+        rt.draw(shackle);
+        sf::RectangleShape body(sf::Vector2f(24.f, 20.f));
+        body.setPosition(sf::Vector2f(4.f, 18.f));
+        body.setFillColor(goldColor);
+        body.setOutlineThickness(1.5f);
+        body.setOutlineColor(darkColor);
+        rt.draw(body);
+        sf::CircleShape keyhole(3.f);
+        keyhole.setPosition(sf::Vector2f(13.f, 24.f));
+        keyhole.setFillColor(darkColor);
+        rt.draw(keyhole);
+        });
+
     // Buildings: walls + a real pitched roof. Wall/roof colors come from
     // the same labelColor the 2D drawCottageShape/etc. already derive from.
     // Mirrors drawBuilding's 2D state machine (see its own comment) for
@@ -7548,7 +7625,29 @@ void GameWorld::draw3DZone(sf::RenderWindow& window) {
     // follow-up.
     for (const auto& b : z.buildings) {
         bool locked = game_.isBusinessLocked(b.id);
-        ConstructionInfo ci = locked ? ConstructionInfo{} : game_.businessConstructionInfo(b.id);
+        // 2026-08-12 ("那些还没有解锁产业的...一个色块方块在那边很丑" --
+        // locked businesses looking like an ugly flat-colored block): used
+        // to fall all the way through this loop to the generic dimmed
+        // box+roof at the bottom (just a desaturated/darkened version of
+        // whatever labelColor the business would normally use -- still the
+        // same BOX SHAPE as a built one, just grayer, which is exactly what
+        // read as "ugly"). A locked business hasn't even unlocked the ability to
+        // start building here yet, which is arguably less "claimed" than an
+        // unstarted-but-buildable plot (state 1/3 below, addUndevelopedPlot)
+        // -- so it gets that exact same natural-clearing treatment (no
+        // building shape at all, just scattered rocks/sapling/flowers over
+        // the zone's own grass) instead, plus one thing state 1 doesn't
+        // need: a small padlock-topped signpost, so "buildable now, just
+        // haven't started" and "still locked" stay visually distinct from
+        // each other rather than looking identical.
+        if (locked) {
+            addUndevelopedPlot(quads, viewProj, windowSize_, eye, b, lc, billboardRight, treeTex, bushTex, flowerTex, herbTuftTex, billboardDayNight);
+            Vec3 postBase(b.position.x + b.size.x * 0.5f, 0.f, b.position.y + b.size.y * 0.5f);
+            addBox(quads, viewProj, windowSize_, eye, postBase, Vec3(3.f, 22.f, 3.f), sf::Color(94, 62, 32), lc);
+            addBillboard(quads, viewProj, windowSize_, billboardRight, postBase + Vec3(0.f, 22.f, 0.f), 20.f, 24.f, lockTex, sf::Color::White);
+            continue;
+        }
+        ConstructionInfo ci = game_.businessConstructionInfo(b.id);
         if (ci.requiresConstruction) {
             if (!ci.inProgress) {
                 // State 1/3, "未开发的土地" (2026-08-07, see addUndevelopedPlot's
@@ -7569,12 +7668,11 @@ void GameWorld::draw3DZone(sf::RenderWindow& window) {
         }
         // Bespoke shapes (see the anon-namespace addFarmProps/addMineProps/
         // etc above, and this file's header comment) -- mirrors drawBuilding's
-        // 2D id dispatch for the same 9 archetypes + Cottage. Skipped while
-        // locked: dimForLock3d only has a wall/roof color to work with, so a
-        // locked one of these falls through to the generic dimmed box below
-        // instead of a dimmed bespoke shape (2D dims the full bespoke shape
-        // via an overlay; there's no equivalent cheap overlay pass in 3D --
-        // see dimForLock3d's own comment).
+        // 2D id dispatch for the same 9 archetypes + Cottage. `locked` is
+        // always false down here now (see this loop's own early `continue`
+        // above) -- kept as an explicit guard rather than removed, since
+        // stripping it would mean re-indenting this entire ~40-business
+        // dispatch block for no behavior change.
         if (!locked) {
             if (b.id == "farm") { addFarmProps(quads, viewProj, windowSize_, eye, b, lc, billboardRight, glowTex, chickenTex, pigTex, veggieTex, flowerTex, forageTex, cabbageTex, game_.farmCropId()); continue; }
             if (b.id == "mine") { addMineProps(quads, viewProj, windowSize_, eye, b, lc, billboardRight, glowTex, sf::Color(114, 106, 100)); continue; }
@@ -7650,12 +7748,12 @@ void GameWorld::draw3DZone(sf::RenderWindow& window) {
             if (b.id == "island_ferry") { addIslandFerryProps(quads, viewProj, windowSize_, eye, b, lc, billboardRight, glowTex); continue; }
         }
 
+        // `locked` never reaches here (this loop's own early `continue`
+        // above handles it with the natural-clearing + padlock signpost
+        // treatment instead) -- this generic box+roof is purely the
+        // fallback for any built-but-not-yet-hero-shaped business.
         sf::Color wallColor = shade3d(b.labelColor, -70);
         sf::Color roofColor = shade3d(b.labelColor, -110);
-        if (locked) {
-            wallColor = dimForLock3d(wallColor);
-            roofColor = dimForLock3d(roofColor);
-        }
         Vec3 basePos(b.position.x, 0.f, b.position.y);
         Vec3 size(b.size.x, kBuildingHeight, b.size.y);
         addBandedBox(quads, viewProj, windowSize_, eye, basePos, size, wallColor, lc);
@@ -7689,14 +7787,17 @@ void GameWorld::draw3DZone(sf::RenderWindow& window) {
         Vec3(playerPos_.x + kPlayerBoxSize / 2.f, 0.f, playerPos_.y + kPlayerBoxSize / 2.f), 40.f, 50.f,
         getPersonTex(sf::Color(255, 214, 90)), billboardDayNight);
 
-    // Bloom pass: one additive glow billboard per point light (lamp heads +
-    // each building's approximated window light), so a lit light actually
-    // reads as a glowing source instead of only ever brightening whatever
-    // surface it happens to shine on via litColor(). Skipped near-entirely
-    // by day (intensity already carries lightBoost's day/night scaling) --
-    // the `< 0.02f` cutoff just avoids pushing a fully-transparent quad
-    // (and its draw-call/batch-flush cost) for every light all day long.
+    // Bloom pass: one additive glow billboard per BLOOM-marked point light
+    // (street lamps -- see PointLight3D's own comment on why the generic
+    // per-building shading light is excluded, 2026-08-12), so a lit light
+    // actually reads as a glowing source instead of only ever brightening
+    // whatever surface it happens to shine on via litColor(). Skipped
+    // near-entirely by day (intensity already carries lightBoost's
+    // day/night scaling) -- the `< 0.02f` cutoff just avoids pushing a
+    // fully-transparent quad (and its draw-call/batch-flush cost) for every
+    // light all day long.
     for (const auto& light : lc.lights) {
+        if (!light.bloom) continue;
         float strength = std::clamp(light.intensity / 46.f, 0.f, 1.f); // 46 ~= the un-boosted intensity both light sources above are scaled from (48/44)
         if (strength < 0.02f) continue;
         // 2026-08-10, 2nd lighting-strengthen follow-up ("夜晚的灯有点暗" --
@@ -7771,7 +7872,8 @@ void GameWorld::draw3DZone(sf::RenderWindow& window) {
             bool locked = game_.isBusinessLocked(b.id);
             ConstructionInfo ci = locked ? ConstructionInfo{} : game_.businessConstructionInfo(b.id);
             float labelY;
-            if (ci.requiresConstruction) labelY = ci.inProgress ? (kBuildingHeight + kRoofRise + 20.f) : 34.f; // in-progress sites now have a real truss/wall (see addConstructionSiteProps) reaching wallH+roofRise -- clear of that instead of the old flat lot's low 34
+            if (locked) labelY = 52.f; // 2026-08-12: locked businesses no longer render as a box+roof (see the building loop's own comment above) -- clears the padlock signpost's own top (post height 22 + billboard height 24 = 46), same "flat-plot archetype" clearance idea as the 48/54 values below
+            else if (ci.requiresConstruction) labelY = ci.inProgress ? (kBuildingHeight + kRoofRise + 20.f) : 34.f; // in-progress sites now have a real truss/wall (see addConstructionSiteProps) reaching wallH+roofRise -- clear of that instead of the old flat lot's low 34
             else if (!locked && (b.id == "mine" || b.id == "goldmine")) labelY = 74.f; // above the mound's own 62-high apex
             else if (!locked && (b.id == "farm" || b.id == "lumber" || b.id == "quarry" || b.id == "sheep" ||
                 b.id == "orchard" || b.id == "herbgarden" || b.id == "vineyard" || b.id == "dairyfarm" ||

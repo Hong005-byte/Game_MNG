@@ -147,6 +147,24 @@ struct WelcomeBackInfo {
     // away from actually dying, so this needs to be surfaced loudly rather
     // than buried in the eventLog.
     bool nearFatalWhileAway = false;
+    // 2026-08-12 ("那个季节变化能不能做成就是用户挂机很久了回来也会显示"
+    // -- can the season-change transition also show for a player who was
+    // away a long time, not just live in-session): true if currentSeason()
+    // at the end of this catch-up differs from what it was right before it
+    // ran (see startSession()) -- an offline stretch long enough to cross a
+    // season boundary silently used to just never show the same color-wash
+    // transition/particle switch a LIVE season change gets (GameWorld's own
+    // tick loop only compares consecutive frames, and by the time GameWorld
+    // even exists this catch-up has already happened). `seasonBecame` is
+    // whichever season it ended up as -- GameWorld plays the same
+    // transition it would for a live change, targeting this. Naturally
+    // fires at most once per real season boundary (whenever this next
+    // differs from the season recorded at the START of the next
+    // startSession() call), which is the "once a year per season" the
+    // request asked for -- nothing extra needs tracking/persisting for that
+    // on top of what currentSeason() already derives from ageDays.
+    bool seasonChangedWhileAway = false;
+    Season seasonBecame = Season::Spring;
 };
 
 // A signed price-lock contract: `lockedPrice` was the good's market price at

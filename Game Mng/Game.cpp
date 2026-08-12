@@ -2348,6 +2348,7 @@ void Game::startSession() {
     long long elapsed = std::max<long long>(0, now - lastTickEpoch_);
     if (elapsed > 0) {
         double moneyBefore = money_;
+        Season seasonBefore = currentSeason(); // see WelcomeBackInfo::seasonChangedWhileAway's own comment
         std::vector<std::string> log;
         // allowDeath = false: offline neglect is capped, not fatal outright
         // -- see simulateElapsed's doc comment / kOfflineSafetyMarginDays.
@@ -2366,6 +2367,8 @@ void Game::startSession() {
             life_.sickDays >= Life::kSicknessDeathDays - kOfflineSafetyMarginDays - 1e-6 ||
             life_.starvingDays >= Life::kStarvationDeathDays - kOfflineSafetyMarginDays - 1e-6;
         if (lastWelcomeBack_.nearFatalWhileAway) std::cout << Localization::t("welcome_back_near_fatal");
+        lastWelcomeBack_.seasonBecame = currentSeason();
+        lastWelcomeBack_.seasonChangedWhileAway = (lastWelcomeBack_.seasonBecame != seasonBefore);
         if (died) handleDeath(); // allowDeath=false above means this can't actually happen anymore, but keep the plumbing honest
         else lastTickEpoch_ = now;
     } else {
