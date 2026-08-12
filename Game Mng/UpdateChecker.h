@@ -35,16 +35,31 @@ namespace UpdateChecker {
     // safe to call from both the console and graphical startup paths.
     void startCheck();
 
-    // Non-blocking poll for the graphical loop: returns true (and fills
-    // `out`) exactly once, the first call after the background check
-    // finishes -- every other call (not finished yet, or already consumed)
-    // returns false. Call this once per frame; it's cheap.
-    bool pollResult(Result& out);
-
     // Blocking poll for the console path, which doesn't have a per-frame
     // loop to check in on: waits up to `timeoutMs` for the check to finish
-    // (returns immediately once it does), then behaves like pollResult.
+    // (returns immediately once it does), then reports the same way
+    // currentResult() below does.
     bool waitForResult(int timeoutMs, Result& out);
+
+    // 2026-08-12 ("我觉得...在游戏里面的设置可以加一个检查版本更新,就不
+    // 需要玩家每次登入等待有没有新版本" -- add a manual "check for
+    // updates" to Settings, so players aren't only ever finding out via
+    // the passive automatic check on login): startCheck() above only ever
+    // runs once per process (std::call_once), which is right for "check
+    // quietly at startup" but wrong for a button the player can press
+    // again whenever they want -- startManualCheck() below is the same
+    // background worker with that restriction lifted, guarded instead by
+    // isChecking() so mashing the button can't stack up overlapping
+    // requests. Both this and the automatic startCheck() feed the SAME
+    // underlying result, readable via currentResult() below (a plain,
+    // repeatable peek -- unlike the old one-shot pollResult this replaces,
+    // reading it doesn't consume/invalidate it, so both the always-on
+    // update banner and a Settings status line can read it independently
+    // without racing each other over who gets to see it).
+    void startManualCheck();
+    bool isChecking();       // true while EITHER the automatic or a manual check is in flight
+    bool hasCheckedOnce();   // true once at least one check (automatic or manual) has ever finished
+    Result currentResult();  // last known result -- Result{} (updateAvailable false) if hasCheckedOnce() is still false
 
     // How the one-click update (see downloadAndRunInstaller) is going, so a
     // UI can show "Downloading..." and disable its own button rather than

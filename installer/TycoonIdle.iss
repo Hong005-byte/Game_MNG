@@ -5,16 +5,22 @@
 ; touch that folder or the zip -- this is an alternative distribution
 ; format alongside it, not a replacement.
 ;
-; Build with (from this installer/ folder, or any cwd -- paths below are
-; relative to THIS SCRIPT's own location):
+; Preferred build (2026-08-12, "我觉得可以统一一下" -- one source of truth
+; for the version number instead of two files to bump by hand): run
+;   installer\build.ps1
+; which reads Version::kGameVersion straight out of Game Mng/Version.h and
+; passes it through, so bumping Version.h alone is enough -- this script
+; itself never needs a manual edit for a version bump again. Falls back to
+; the hardcoded MyAppVersion below (#ifndef-guarded) if MyAppVersion isn't
+; supplied on the command line, so running ISCC.exe on this file directly
+; still works (just needs that fallback bumped by hand in that fallback-only
+; case) instead of failing outright.
 ;   "C:\Program Files\Inno Setup 7\ISCC.exe" TycoonIdle.iss
 ; Output lands in dist\TycoonIdle-Setup-<version>.exe, next to the zip.
-;
-; MyAppVersion has no single source of truth to read from automatically
-; (Version.h is C++, not something Inno Setup's preprocessor can include) --
-; bump it here by hand alongside every Version.h bump.
 #define MyAppName "Tycoon Idle"
-#define MyAppVersion "1.5.1"
+#ifndef MyAppVersion
+  #define MyAppVersion "1.5.1"
+#endif
 #define MyAppPublisher "Hong005-byte"
 #define MyAppURL "https://github.com/Hong005-byte/Game_MNG"
 #define MyAppExeName "Game Mng.exe"
