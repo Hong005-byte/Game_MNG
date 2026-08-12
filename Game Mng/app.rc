@@ -1,0 +1,9 @@
+// Windows resource script -- gives the built exe its own icon (app.ico,
+// see its own generation script/notes) instead of the generic default
+// Windows assigns an icon-less console app. Windows Explorer/the taskbar
+// always use whichever ICON resource appears FIRST in this file as the
+// exe's own icon, which is also why there's only ever meant to be one here.
+// Plain numeric resource ID (101) rather than a symbolic one -- symbolic
+// IDs need a resource.h defining them, which this project has no other use
+// for; a bare number is all a single-icon resource script actually needs.
+101 ICON "app.ico"

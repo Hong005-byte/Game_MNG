@@ -207,6 +207,13 @@
     <ClInclude Include="Version.h" />
     <ClInclude Include="UpdateChecker.h" />
   </ItemGroup>
+  <ItemGroup>
+    <!-- Gives the built exe its own icon, see app.rc's own comment. -->
+    <ResourceCompile Include="app.rc" />
+  </ItemGroup>
+  <ItemGroup>
+    <Image Include="app.ico" />
+  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>

@@ -3992,7 +3992,18 @@ void GameWorld::drawAchievementsButton(sf::RenderWindow& window) {
 void GameWorld::drawUpdateBanner(sf::RenderWindow& window) {
     if (!updateAvailable_ || updateBannerDismissed_) return;
 
-    sf::Vector2f pos(10.f, static_cast<float>(windowSize_.y) - 54.f - 44.f), size(420.f, 36.f);
+    // 2026-08-12 ("我不需要每次都要跑到github去重新下载了" -- stop needing
+    // to manually go to GitHub and re-download every time): a one-click
+    // "Update Now" button alongside the original "open the release page"
+    // fallback, only shown when this release actually published an
+    // installer asset for UpdateChecker to have found (updateInstallerUrl_
+    // non-empty -- every release before this one only ever had the
+    // portable zip, so an old release still only offers the browser link).
+    // Wider banner to fit the extra button/status text.
+    bool hasInstaller = !updateInstallerUrl_.empty();
+    UpdateChecker::DownloadState dlState = UpdateChecker::downloadState();
+    sf::Vector2f pos(10.f, static_cast<float>(windowSize_.y) - 54.f - 44.f);
+    sf::Vector2f size(hasInstaller ? 560.f : 420.f, 36.f);
     sf::RectangleShape bg(size);
     bg.setPosition(pos);
     bg.setFillColor(sf::Color(60, 90, 60, 235));
@@ -4000,10 +4011,19 @@ void GameWorld::drawUpdateBanner(sf::RenderWindow& window) {
     bg.setOutlineColor(sf::Color(150, 220, 150));
     window.draw(bg);
 
-    uiText(window, { pos.x + 10.f, pos.y + 9.f },
-        Localization::t("update_banner_prefix") + updateLatestVersion_, 13, sf::Color(220, 250, 220));
+    std::string statusLine = Localization::t("update_banner_prefix") + updateLatestVersion_;
+    if (hasInstaller) {
+        if (dlState == UpdateChecker::DownloadState::Downloading) statusLine = Localization::t("update_banner_downloading");
+        else if (dlState == UpdateChecker::DownloadState::Failed) statusLine = Localization::t("update_banner_launch_failed");
+        else if (dlState == UpdateChecker::DownloadState::LaunchedInstaller) statusLine = Localization::t("update_banner_launched");
+    }
+    uiText(window, { pos.x + 10.f, pos.y + 9.f }, statusLine, 13, sf::Color(220, 250, 220));
 
-    uiButton(window, { pos.x + size.x - 170.f, pos.y + 3.f }, { 100.f, 30.f }, Localization::t("update_banner_open_button"),
+    float bx = pos.x + size.x - 62.f; // running from the right edge, dismiss stays rightmost regardless of layout
+    uiButton(window, { bx, pos.y + 3.f }, { 52.f, 30.f }, Localization::t("update_banner_dismiss_button"),
+        [this]() { updateBannerDismissed_ = true; });
+    bx -= 108.f;
+    uiButton(window, { bx, pos.y + 3.f }, { 100.f, 30.f }, Localization::t("update_banner_open_button"),
         [this]() {
 #ifdef _WIN32
             if (!updateReleaseUrl_.empty()) {
@@ -4011,8 +4031,16 @@ void GameWorld::drawUpdateBanner(sf::RenderWindow& window) {
             }
 #endif
         });
-    uiButton(window, { pos.x + size.x - 62.f, pos.y + 3.f }, { 52.f, 30.f }, Localization::t("update_banner_dismiss_button"),
-        [this]() { updateBannerDismissed_ = true; });
+    if (hasInstaller) {
+        bx -= 118.f;
+        // Disabled (no click handler) while a download is already running,
+        // so clicking it repeatedly can't stack up multiple installer
+        // launches -- see UpdateChecker::downloadAndRunInstaller's own
+        // no-op guard for the same reasoning from the other side.
+        bool busy = dlState == UpdateChecker::DownloadState::Downloading;
+        uiButton(window, { bx, pos.y + 3.f }, { 110.f, 30.f }, Localization::t("update_banner_auto_button"),
+            [this]() { UpdateChecker::downloadAndRunInstaller(updateInstallerUrl_); }, !busy);
+    }
 }
 
 void GameWorld::drawHowToPlayButton(sf::RenderWindow& window) {
@@ -8177,6 +8205,7 @@ void GameWorld::run() {
                 updateAvailable_ = true;
                 updateLatestVersion_ = r.latestVersion;
                 updateReleaseUrl_ = r.releaseUrl;
+                updateInstallerUrl_ = r.installerUrl;
             }
         }
 
