@@ -6,7 +6,12 @@
 
 ## 下载
 
-去 [Releases](https://github.com/Hong005-byte/Game_MNG/releases) 页面下载最新的 `TycoonIdle-vX.X.X-win64.zip`,解压后直接运行 `Game Mng.exe`——是免安装的便携版,不需要额外装任何运行库。游戏内建了自动更新检测,有新版本时会提示。
+去 [Releases](https://github.com/Hong005-byte/Game_MNG/releases) 页面下载最新版本,两种方式二选一:
+
+- **安装程序**(推荐):下载 `TycoonIdle-Setup-X.X.X.exe`,一路下一步装好,自动加开始菜单快捷方式(可选桌面图标),卸载时不会动你的存档。
+- **免安装便携版**:下载 `TycoonIdle-vX.X.X-win64.zip`,解压后直接运行 `Game Mng.exe`,不需要额外装任何运行库。
+
+游戏内建自动更新检测——启动时会自动查一次,也可以在暂停菜单的设置面板里随时点"版本更新 → 现在检查"手动查。查到新版本会在右下角弹出提示条,点"一键更新"会自动下载安装包、关掉游戏、装好后再重新打开;也保留了"在浏览器打开"作为手动下载的备用选项。
 
 仅支持 Windows。
 
@@ -48,7 +53,8 @@ vcpkg install --triplet x64-windows --x-manifest-root="Game Mng"
 - `Business.h/.cpp`、`Market.h/.cpp`、`Staff.h/.cpp`、`Life.h/.cpp`、`Events.h/.cpp`、`Achievements.h/.cpp` —— 各自独立的子系统
 - `Localization.h/.cpp` —— 中英文字符串表
 - `SaveManager.h/.cpp`、`Settings.h/.cpp` —— 存档(按角色)与玩家偏好(音量/按键/分辨率,跨存档共用)的持久化
-- `UpdateChecker.h/.cpp`、`Version.h` —— 启动时后台查询 GitHub Releases 是否有新版本
+- `UpdateChecker.h/.cpp`、`Version.h` —— 后台查询 GitHub Releases 是否有新版本(启动时自动查,也可在设置里手动查)、一键更新下载安装
+- `installer/` —— Inno Setup 打包脚本(`build.ps1` 会自动从 `Version.h` 读取版本号,一份脚本同时生成安装程序和免安装 zip)
 
 ## 截图
 
