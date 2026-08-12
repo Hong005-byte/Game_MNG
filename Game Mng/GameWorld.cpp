@@ -80,8 +80,26 @@ namespace {
     // resolutionIndex) -- all share the logical 1280x820 canvas's ~1.561
     // aspect ratio, so the letterbox view (see GameWorld::applyVideoMode)
     // never has to add bars around a windowed mode, only around Fullscreen.
-    const sf::Vector2u kResolutionPresets[] = { {1280u, 820u}, {1600u, 1025u}, {1920u, 1230u} };
-    constexpr int kResolutionPresetCount = 3;
+    // 2026-08-12 ("屏幕大小调整还能往小的调吗" -- can the window be made
+    // smaller too): added 960x615 (0.75x of the base 1280x820 canvas) and,
+    // on the immediate "还有再小的吗" follow-up, 800x513 (0.625x) too, both
+    // same ~1.561 aspect ratio -- appended at the END rather than inserted
+    // before 1280x820, so an existing settings.cfg's saved resolutionIndex
+    // (persisted across launches) keeps meaning whichever resolution it
+    // always meant instead of silently shrinking everyone's window the next
+    // time they open the game. Works with zero other changes since every
+    // drawing coordinate in this file is in the fixed 1280x820 logical
+    // space regardless of the real window size (see windowSize_'s own
+    // comment in GameWorld.h) -- applyVideoMode's letterbox view just
+    // scales that logical canvas into whatever real size is picked, so a
+    // smaller preset only makes everything render smaller, it can't break
+    // any click region or layout math. Didn't go smaller than 800x513 --
+    // this game's smallest body text renders at 11-12px in the 1280-wide
+    // logical space, which at 800/1280 = 0.625 scale is already down to
+    // ~7px of real screen space; going smaller risks text nobody can
+    // actually read rather than a genuinely useful smaller window.
+    const sf::Vector2u kResolutionPresets[] = { {1280u, 820u}, {1600u, 1025u}, {1920u, 1230u}, {960u, 615u}, {800u, 513u} };
+    constexpr int kResolutionPresetCount = 5;
 
     sf::Color darken(sf::Color c, float factor) {
         return sf::Color(
@@ -3349,7 +3367,20 @@ void GameWorld::drawMinimap(sf::RenderWindow& window) {
 }
 
 void GameWorld::drawHud(sf::RenderWindow& window) {
-    sf::Vector2u winSize = window.getSize();
+    // 2026-08-12 ("那个显示我们那个第几代的那栏黑色框好像没有跟着游戏大小
+    // 变化" -- the black HUD bar doesn't track the window size): this used
+    // to size/position itself off `window.getSize()`, the REAL window pixel
+    // size -- but everything is drawn through gameView_, the fixed
+    // 1280x820 logical view letterboxed into whatever the real window size
+    // is (see applyVideoMode), so a position expressed in real pixels only
+    // ever lined up by coincidence at exactly the 1280x820 preset (real ==
+    // logical there). At any other resolution the mismatch sent it off the
+    // bottom of the logical canvas entirely (bigger real window -> larger
+    // "winSize.y - 54" -> past logical y=820, invisible) or partway up the
+    // middle of it (smaller real window -> smaller winSize.y). Every other
+    // overlay/HUD element in this file positions itself in windowSize_ (the
+    // fixed logical size) instead, which this now matches.
+    sf::Vector2u winSize = windowSize_;
     sf::RectangleShape bg(sf::Vector2f(static_cast<float>(winSize.x), 54.f));
     bg.setPosition(sf::Vector2f(0.f, static_cast<float>(winSize.y) - 54.f));
     bg.setFillColor(sf::Color(0, 0, 0, 150));
@@ -4025,7 +4056,12 @@ void GameWorld::drawTutorial(sf::RenderWindow& window) {
         return;
     }
 
-    sf::Vector2u winSize = window.getSize();
+    // Same window.getSize()-vs-logical-windowSize_ mismatch as drawHud's own
+    // 2026-08-12 fix (see its comment) -- this screen runs after
+    // applyVideoMode has already set gameView_ as the active view, so
+    // positions here need to be in that same fixed 1280x820 logical space
+    // too, not real window pixels.
+    sf::Vector2u winSize = windowSize_;
 
     // Measure the body text before sizing the panel -- its length varies a
     // lot between languages (and whenever the copy grows), so a panel with a
@@ -7751,6 +7787,21 @@ void GameWorld::run() {
     // Baseline so a mid-cycle load doesn't fire a spurious transition on the
     // very first frame the season is actually checked (see the tick loop below).
     lastSeason_ = game_.currentSeason();
+    // 2026-08-12 ("那个季节变化能不能做成就是用户挂机很久了回来也会显示"
+    // -- show the season transition for a long-AFK player too, not just a
+    // live in-session change): startSession()'s own offline catch-up (see
+    // WelcomeBackInfo::seasonChangedWhileAway's comment) already knows
+    // whether the season actually moved on while the player was away --
+    // play the exact same transition a live change would here, once, right
+    // as the world opens (lastSeason_ above already equals the season this
+    // targets, so the live tick loop's own comparison won't immediately
+    // re-fire a duplicate).
+    if (game_.lastWelcomeBack().seasonChangedWhileAway) {
+        seasonTransitionTo_ = game_.lastWelcomeBack().seasonBecame;
+        seasonTransitionActive_ = true;
+        seasonTransitionTimer_ = 0.f;
+        playMusicForSeason(seasonTransitionTo_);
+    }
 
     while (window.isOpen() && showingTutorial_) {
         while (const std::optional event = window.pollEvent()) {
