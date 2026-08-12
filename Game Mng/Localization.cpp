@@ -1004,6 +1004,14 @@ namespace {
         { "settings_fullscreen_label", { "Fullscreen", "全屏" } },
         { "toggle_on",  { "On", "开" } },
         { "toggle_off", { "Off", "关" } },
+        // 2026-08-12 ("在游戏里面的设置可以加一个检查版本更新,就不需要
+        // 玩家每次登入等待有没有新版本" -- add a manual "check for
+        // updates" to Settings) -- see drawSettingsOverlay's own comment.
+        { "settings_check_update_label",        { "Updates", "版本更新" } },
+        { "settings_check_update_button",       { "Check Now", "现在检查" } },
+        { "settings_check_update_checking",     { "Checking...", "检查中……" } },
+        { "settings_check_update_current",      { "Up to date", "已是最新版本" } },
+        { "settings_check_update_found_prefix", { "Update found: v", "发现新版本: v" } },
         { "settings_keybinds_label",   { "Key Bindings", "按键绑定" } },
         { "settings_rebind_button",    { "Rebind", "重新绑定" } },
         { "settings_rebind_waiting",   { "Press a key... (Esc to cancel)", "请按下新按键...(Esc 取消)" } },

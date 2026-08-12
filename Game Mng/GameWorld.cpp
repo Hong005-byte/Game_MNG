@@ -5951,7 +5951,11 @@ void GameWorld::drawPauseOverlay(sf::RenderWindow& window) {
 }
 
 void GameWorld::drawSettingsOverlay(sf::RenderWindow& window) {
-    sf::Vector2f pos(180.f, 40.f), size(920.f, 740.f);
+    // Grown 740 -> 795 (2026-08-12) for the new "check for updates" row
+    // below the Fullscreen toggle -- the key-bindings list right after it
+    // already ran the panel almost exactly to its old bottom edge, no
+    // spare room to add a row without this.
+    sf::Vector2f pos(180.f, 40.f), size(920.f, 795.f);
     uiPanelBg(window, pos, size);
     uiText(window, { pos.x + 24.f, pos.y + 16.f }, Localization::t("settings_title"), 20, sf::Color(232, 212, 120), true);
     uiButton(window, { pos.x + size.x - 130.f, pos.y + 14.f }, { 110.f, 36.f }, Localization::t("settings_back_button"),
@@ -6029,6 +6033,28 @@ void GameWorld::drawSettingsOverlay(sf::RenderWindow& window) {
             applyVideoMode(window);
             SettingsManager::save(settings_);
         });
+    y += rowH;
+
+    // ---- Check for updates (2026-08-12, "在游戏里面的设置可以加一个检查
+    // 版本更新,就不需要玩家每次登入等待有没有新版本" -- add a manual
+    // check to Settings instead of only ever finding out via the passive
+    // automatic one on login): startManualCheck() shares its result with
+    // that same automatic check (see UpdateChecker::currentResult's own
+    // comment) -- finding an update here makes the usual bottom-left
+    // banner (with its own "Update Now"/"Get it" buttons) appear too,
+    // this row is just status text + a way to ask "right now, not just at
+    // login". ----
+    uiText(window, { labelX, y + 8.f }, Localization::t("settings_check_update_label"), 15, sf::Color(200, 200, 200));
+    std::string updateStatus;
+    if (UpdateChecker::isChecking()) updateStatus = Localization::t("settings_check_update_checking");
+    else if (UpdateChecker::hasCheckedOnce()) {
+        updateStatus = UpdateChecker::currentResult().updateAvailable
+            ? Localization::t("settings_check_update_found_prefix") + UpdateChecker::currentResult().latestVersion
+            : Localization::t("settings_check_update_current");
+    }
+    if (!updateStatus.empty()) uiText(window, { valueX, y + 8.f }, updateStatus, 14, sf::Color(200, 220, 200));
+    uiButton(window, { ctrlX, y }, { 140.f, 36.f }, Localization::t("settings_check_update_button"),
+        [this]() { UpdateChecker::startManualCheck(); }, !UpdateChecker::isChecking());
     y += rowH + 10.f;
 
     // ---- Key bindings: click "Rebind", then press any key to bind it to
@@ -8199,9 +8225,17 @@ void GameWorld::run() {
             if (overlayFeedbackTimer_ <= 0.f) overlayFeedback_.clear();
         }
 
-        if (!updateAvailable_) { // cheap mutex check, not the network call itself -- fine every frame
-            UpdateChecker::Result r;
-            if (UpdateChecker::pollResult(r)) {
+        // 2026-08-12: switched from the old one-shot pollResult (consumed
+        // the result, so only the very first caller each session ever saw
+        // it) to the non-consuming currentResult() -- this same check now
+        // also picks up a result from a manual re-check fired from Settings
+        // (see drawSettingsOverlay's own "check for updates" button), not
+        // just the automatic startup one, with no extra plumbing needed:
+        // once hasCheckedOnce() flips true, whichever check that was just
+        // shows up here on the very next frame either way.
+        if (!updateAvailable_ && UpdateChecker::hasCheckedOnce()) {
+            UpdateChecker::Result r = UpdateChecker::currentResult();
+            if (r.updateAvailable) {
                 updateAvailable_ = true;
                 updateLatestVersion_ = r.latestVersion;
                 updateReleaseUrl_ = r.releaseUrl;

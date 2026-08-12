@@ -20,7 +20,9 @@ namespace {
     std::once_flag g_startFlag;
     std::mutex g_mutex;
     std::optional<UpdateChecker::Result> g_result; // set once the background thread finishes
-    std::atomic<bool> g_consumed{ false };          // pollResult only ever returns true once
+    std::atomic<bool> g_consumed{ false };          // waitForResult only ever returns true once
+    std::atomic<bool> g_checking{ false };          // true while a check (automatic or manual) is in flight -- see isChecking()
+    std::atomic<bool> g_hasCheckedOnce{ false };    // true once ANY check has ever finished -- see hasCheckedOnce()
     std::atomic<UpdateChecker::DownloadState> g_downloadState{ UpdateChecker::DownloadState::Idle };
 
 #ifdef _WIN32
@@ -172,8 +174,12 @@ namespace {
             }
         }
 #endif
-        std::lock_guard<std::mutex> lock(g_mutex);
-        g_result = result; // set even when no update/network failed -- an "already checked, nothing found" result, not left unset
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            g_result = result; // set even when no update/network failed -- an "already checked, nothing found" result, not left unset
+        }
+        g_hasCheckedOnce.store(true);
+        g_checking.store(false); // shared end-of-check point for both startCheck's automatic run and startManualCheck's
     }
 
 #ifdef _WIN32
@@ -239,17 +245,32 @@ namespace {
 
 void UpdateChecker::startCheck() {
     std::call_once(g_startFlag, []() {
+        g_checking.store(true);
         std::thread(runCheck).detach();
     });
 }
 
-bool UpdateChecker::pollResult(Result& out) {
-    if (g_consumed.load()) return false;
+void UpdateChecker::startManualCheck() {
+    // If startCheck() hasn't even run yet (shouldn't normally happen --
+    // every entry point calls it before anything could reach a Settings
+    // button -- but a defensive no-op guard here is cheap), this just
+    // folds into the automatic check instead of racing a second one.
+    bool expected = false;
+    if (!g_checking.compare_exchange_strong(expected, true)) return; // already checking, ignore
+    std::thread(runCheck).detach();
+}
+
+bool UpdateChecker::isChecking() {
+    return g_checking.load();
+}
+
+bool UpdateChecker::hasCheckedOnce() {
+    return g_hasCheckedOnce.load();
+}
+
+UpdateChecker::Result UpdateChecker::currentResult() {
     std::lock_guard<std::mutex> lock(g_mutex);
-    if (!g_result.has_value()) return false;
-    out = *g_result;
-    g_consumed.store(true);
-    return out.updateAvailable;
+    return g_result.value_or(Result{});
 }
 
 bool UpdateChecker::waitForResult(int timeoutMs, Result& out) {
