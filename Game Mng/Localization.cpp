@@ -75,6 +75,8 @@ namespace {
         { "recipebook_button", { "Recipes", "配方图鉴" } },
         { "recipebook_header", { "Recipe Book -- click an item to see what it takes", "配方图鉴——点击物品查看所需材料" } },
         { "recipebook_made_at_prefix", { "Made at: ", "制作地点: " } },
+        { "recipebook_locked_entry", { "???", "???" } },
+        { "recipebook_locked_hint", { "Not unlocked yet -- unlock this industry first to see its recipe.", "还没解锁——先解锁对应产业才能查看配方。" } },
         { "back_button", { "Back", "返回" } },
         { "howtoplay_title",  { "How to Play", "游戏玩法" } },
         { "howtoplay_body",

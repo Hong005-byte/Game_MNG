@@ -6460,11 +6460,16 @@ void GameWorld::drawRecipeBookOverlay(sf::RenderWindow& window) {
         // Every processed good -- the output of a business that itself has
         // at least one input. Raw materials (wheat/wood/stone/ore/...) have
         // no recipe and aren't listed here at all.
-        struct Entry { std::string goodId; sf::Color color; };
+        // `locked` mirrors BusinessInfo::locked for whichever business makes
+        // this good -- 2026-08-12 (user request): a not-yet-unlocked
+        // industry's product shouldn't be freely browsable here, it should
+        // read as a mystery entry with a padlock until the player actually
+        // unlocks the production line that makes it.
+        struct Entry { std::string goodId; sf::Color color; bool locked; };
         std::vector<Entry> entries;
         for (const auto& info : infos) {
             if (info.inputGoodId.empty() || info.outputGoodId.empty()) continue;
-            entries.push_back({ info.outputGoodId, accentFor(info.id).color });
+            entries.push_back({ info.outputGoodId, accentFor(info.id).color, info.locked });
         }
 
         constexpr int perRow = 3;
@@ -6484,13 +6489,43 @@ void GameWorld::drawRecipeBookOverlay(sf::RenderWindow& window) {
             float cellY = startY + static_cast<float>(row) * cellH - overlayScrollOffset_;
             if (cellY < startY - cellH || cellY > gridBottom) continue;
 
-            drawGoodIcon(window, entries[i].goodId, sf::Vector2f(cellX, cellY), iconSize, entries[i].color);
+            bool locked = entries[i].locked;
+            drawGoodIcon(window, entries[i].goodId, sf::Vector2f(cellX, cellY), iconSize, locked ? sf::Color(90, 90, 100) : entries[i].color);
+
+            if (locked) {
+                // Dim the card and stamp a small padlock over it (same gold-
+                // on-dark padlock as drawLockOverlay uses on locked
+                // buildings in the 3D world, redrawn here in flat screen
+                // space since this panel isn't behind the 3D camera
+                // transform) -- a not-yet-unlocked good should read as
+                // "known to exist, not yet revealed", not freely inspectable.
+                sf::RectangleShape dim(sf::Vector2f(iconSize, iconSize));
+                dim.setPosition(sf::Vector2f(cellX, cellY));
+                dim.setFillColor(sf::Color(10, 10, 15, 150));
+                window.draw(dim);
+
+                sf::Vector2f lockCenter(cellX + iconSize / 2.f, cellY + iconSize / 2.f);
+                sf::RectangleShape lockBody(sf::Vector2f(16.f, 13.f));
+                lockBody.setPosition(sf::Vector2f(lockCenter.x - 8.f, lockCenter.y - 2.f));
+                lockBody.setFillColor(sf::Color(225, 205, 110));
+                lockBody.setOutlineThickness(1.5f);
+                lockBody.setOutlineColor(sf::Color(40, 30, 10));
+                window.draw(lockBody);
+
+                sf::CircleShape shackle(6.f);
+                shackle.setFillColor(sf::Color::Transparent);
+                shackle.setOutlineThickness(2.5f);
+                shackle.setOutlineColor(sf::Color(225, 205, 110));
+                shackle.setPosition(sf::Vector2f(lockCenter.x - 6.f, lockCenter.y - 15.f));
+                window.draw(shackle);
+            }
 
             if (fontLoaded_) {
-                sf::Text label(font_, toSfString(Localization::t(entries[i].goodId)), 13);
+                std::string labelText = locked ? Localization::t("recipebook_locked_entry") : Localization::t(entries[i].goodId);
+                sf::Text label(font_, toSfString(labelText), 13);
                 sf::FloatRect b = label.getLocalBounds();
                 label.setPosition(sf::Vector2f(cellX + iconSize / 2.f - b.size.x / 2.f - b.position.x, cellY + iconSize + 6.f));
-                label.setFillColor(sf::Color::White);
+                label.setFillColor(locked ? sf::Color(140, 140, 150) : sf::Color::White);
                 window.draw(label);
             }
 
@@ -6499,10 +6534,20 @@ void GameWorld::drawRecipeBookOverlay(sf::RenderWindow& window) {
             // clicks over the sliver that's now clipped away (see beginClip).
             float top = std::max(cellY, startY), bottom = std::min(cellY + iconSize + 26.f, gridBottom);
             if (bottom > top) {
-                std::string goodId = entries[i].goodId;
-                overlayClickRegions_.push_back(ClickRegion{
-                    sf::FloatRect(sf::Vector2f(cellX, top), sf::Vector2f(iconSize, bottom - top)),
-                    [this, goodId]() { recipeBookSelectedGoodId_ = goodId; overlayScrollOffset_ = 0.f; } });
+                if (locked) {
+                    // Clicking a locked entry doesn't open the detail view
+                    // (there's nothing to reveal yet) -- it just repeats the
+                    // same "go unlock it first" hint the 3D world gives when
+                    // clicking a locked building (see world_locked_hint).
+                    overlayClickRegions_.push_back(ClickRegion{
+                        sf::FloatRect(sf::Vector2f(cellX, top), sf::Vector2f(iconSize, bottom - top)),
+                        [this]() { setFeedback(Localization::t("recipebook_locked_hint"), false); } });
+                } else {
+                    std::string goodId = entries[i].goodId;
+                    overlayClickRegions_.push_back(ClickRegion{
+                        sf::FloatRect(sf::Vector2f(cellX, top), sf::Vector2f(iconSize, bottom - top)),
+                        [this, goodId]() { recipeBookSelectedGoodId_ = goodId; overlayScrollOffset_ = 0.f; } });
+                }
             }
         }
         endClip(window);
@@ -6522,7 +6567,13 @@ void GameWorld::drawRecipeBookOverlay(sf::RenderWindow& window) {
             [this]() { recipeBookSelectedGoodId_.clear(); });
         uiText(window, { pos.x + 140.f, pos.y + 20.f }, Localization::t(recipeBookSelectedGoodId_), 22, sf::Color(232, 212, 120), true);
 
-        if (info) {
+        if (info && info->locked) {
+            // Not reachable in practice (the grid above routes clicks on a
+            // locked entry to setFeedback instead of selecting it) -- kept
+            // as a fallback the same way the Businesses overlay's own
+            // info->locked check is, in case that assumption ever changes.
+            uiText(window, { pos.x + 24.f, pos.y + 90.f }, Localization::t("locked_label"), 16, sf::Color(180, 120, 120));
+        } else if (info) {
             float y = pos.y + 90.f;
             uiText(window, { pos.x + 24.f, y }, Localization::t("recipebook_made_at_prefix") + Localization::t(info->id), 15, sf::Color(200, 200, 200));
             y += 40.f;
