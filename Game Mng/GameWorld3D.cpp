@@ -226,6 +226,13 @@ namespace {
         float sortDepth;
         const sf::Texture* texture = nullptr;
         bool additive = false; // true for glow billboards (see addGlowBillboard) -- drawn with BlendAdd instead of the default alpha blend
+        // True for ground-layer geometry (grass plane, path/water/sand/
+        // grass-patch decorations, every flat-plot archetype's ground fill)
+        // -- see addGroundQuad's own comment (2026-08-13) for why this
+        // replaced a numeric depth bias. Used by the final sort to put every
+        // ground quad strictly before every non-ground quad, instead of
+        // faking that with an added constant.
+        bool ground = false;
     };
 
     struct Projected {
@@ -648,46 +655,101 @@ namespace {
     // for a blanket guarantee instead of chasing each new occurrence one
     // building at a time ("把这种土地的图层直接set在最低层,层度全部低于角
     // 色,屋子等等" -- just force every ground-layer quad to the very back,
-    // always, below the player/every building, full stop). `kGroundDepthBias`
-    // is added (not overwritten) to each slice's own already-computed
-    // sortDepth -- large enough that even the single nearest ground slice
-    // in any zone still outranks (sorts as farther than) the single
-    // farthest non-ground quad, so ground can never again erase anything,
-    // while still preserving each slice's own correct depth *relative to
-    // other ground quads* (a Farm's own brown fill still draws over the
-    // base grass beneath it, a closer ground slice still literally is
-    // "more biased forward" than a farther one, etc.) since the same
-    // constant offset doesn't change their relative ordering among
-    // themselves -- only guarantees they can never outrank real geometry.
+    // always, below the player/every building, full stop).
+    //
+    // 2026-08-07's original fix for that added a huge constant
+    // (`kGroundDepthBias`, 1.0e6f) to each ground slice's own already-
+    // computed sortDepth, on the reasoning that adding the *same* constant to
+    // every ground quad can't change their order relative to each other --
+    // true in real-number math, false in float32. `sortDepth` here is
+    // view-space depth (`cw` from projectPoint, roughly this renderer's
+    // camera-to-point distance in world units), typically only a few hundred
+    // to ~2000 for anything actually in frame. A decoration slice (Water/
+    // Sand/Path/GrassPatch, y=0.4-0.6) and the plain grass slice directly
+    // beneath it (y=0.0) differ in depth by only a tiny fraction of that
+    // 0.4-0.6 world-unit height gap -- often well under 0.1. Once both get
+    // +1.0e6f added, they land around 1,000,xxx, where a float32's ~23-bit
+    // mantissa only has about 0.12 of resolution left (ULP at that
+    // magnitude) -- smaller depth differences than that get rounded to the
+    // *same* representable float, so `std::sort`'s `>` comparator (not
+    // stable) could arbitrarily place either quad first. This quietly broke
+    // the very thing the paragraph above claims it preserves ("each slice's
+    // own correct depth *relative to other ground quads*") -- reported
+    // 2026-08-13 ("现在海边的水的图层不见了,包括海岛的" -- the Harbor
+    // shoreline's and Fisher's Isle's water reading as plain grass, with only
+    // thin slivers of the right blue color showing at the water/sand slice
+    // seams, right where the decoration and base-grass slice boundaries
+    // don't line up 1:1 and the rounding happened to go the other way).
+    // Shrinking the constant helps but is the same class of fix with the
+    // same class of failure mode at some other camera distance/zoom --
+    // there's no single constant that's simultaneously "big enough to always
+    // beat real geometry" and "small enough to never swallow a sub-1-unit
+    // ground-layer height gap" for every camera position this free-zoom
+    // renderer allows.
+    //
+    // Replaced with a structural fix instead of a numeric one: ground quads
+    // no longer get their sortDepth altered at all (so their relative order
+    // is exactly as precise as any other quad-vs-quad comparison in this
+    // renderer) -- they're marked via `ScreenQuad::ground` instead, and the
+    // final sort (this function's own draw3DZone call site) puts every
+    // ground quad strictly before every non-ground one, full stop, instead
+    // of faking that ordering with a number.
     constexpr float kGroundSliceZ = 60.f;
-    constexpr float kGroundDepthBias = 1.0e6f; // real clip-space w values in this renderer never get anywhere close to this
     // `applyGroundBias` (2026-08-07, "后面的部分是透明的,可以看到我自己
     //还有树" -- a direct, previously-unforeseen consequence of the
-    // kGroundDepthBias fix above): that fix's own guarantee -- ground can
-    // never outrank real geometry -- assumed every caller was *actual
-    // ground-level terrain*, where "nothing legitimately needs to occlude
-    // from behind the ground plane" is a safe bet. Clinic's flat roof deck
-    // reuses this same function (see addFlatRoof, needed the exact same
-    // Z-slicing this function already does) but is NOT ground-level -- it's
-    // an elevated surface a tree or the player standing north of the
-    // building absolutely can and should be hidden behind, from the right
-    // camera angle. Forcing it to "always sort as farthest" (the bias) means
-    // it can now never win a depth fight against ANYTHING, including things
-    // that are genuinely farther away and ought to be occluded by it --
-    // which is exactly what let the player's own sprite and a tree show
-    // through the roof once the camera panned far enough to expose it.
-    // Defaults to true (every pre-existing ground/terrain call is
+    // ground-always-sorts-first guarantee above): that guarantee assumed
+    // every caller was *actual ground-level terrain*, where "nothing
+    // legitimately needs to occlude from behind the ground plane" is a safe
+    // bet. Clinic's flat roof deck reuses this same function (see
+    // addFlatRoof, needed the exact same Z-slicing this function already
+    // does) but is NOT ground-level -- it's an elevated surface a tree or
+    // the player standing north of the building absolutely can and should be
+    // hidden behind, from the right camera angle. Marking it `ground` (same
+    // idea as the old bias) would mean it can never win a depth fight
+    // against ANYTHING, including things that are genuinely farther away and
+    // ought to be occluded by it -- which is exactly what let the player's
+    // own sprite and a tree show through the roof once the camera panned far
+    // enough to expose it. Defaults to true (every pre-existing ground/terrain call is
     // unaffected); only addFlatRoof's own roof-deck call passes false.
     void addGroundQuad(std::vector<ScreenQuad>& out, const Mat4& viewProj, sf::Vector2u windowSize, Vec3 eye,
         float x0, float z0, float sizeX, float sizeZ, float y, sf::Color color, const LightingContext& lc, bool applyGroundBias = true) {
-        int slices = std::max(1, static_cast<int>(std::ceil(sizeZ / kGroundSliceZ)));
-        float sliceZ = sizeZ / static_cast<float>(slices);
-        for (int i = 0; i < slices; ++i) {
-            float zi = z0 + sliceZ * static_cast<float>(i);
-            Vec3 p0(x0, y, zi), p1(x0 + sizeX, y, zi), p2(x0 + sizeX, y, zi + sliceZ), p3(x0, y, zi + sliceZ);
+        // 2026-08-13 follow-up to the `ground` flag above -- that fix made
+        // ground-vs-real-geometry exact, but a debug dump of the Harbor
+        // zone's own numbers (temporary logging, since removed) showed
+        // ground-vs-ground could *still* pick the wrong winner: the Water
+        // decoration's first slice logged sortDepth=701.214, but the base
+        // grass plane's own slice directly beneath most of it logged
+        // sortDepth=699.725 -- grass "farther" than water by the sort's own
+        // math, so grass painted over it. Root cause: the old code picked
+        // each quad's own slice width independently (`sizeZ / slices`, sized
+        // to fit that quad's own extent with no leftover sliver) -- the base
+        // grass plane (sizeZ=820) got ~58.57-wide slices, Water here
+        // (sizeZ=120) got exactly 60-wide slices, so their slice boundaries
+        // essentially never lined up. A decoration slice was really being
+        // compared against whichever *nearby* grass slice happened to end up
+        // close, offset by up to half a slice width (~29 world units) in Z
+        // -- more than enough to swamp the deliberate 0.4-unit `y` raise
+        // (see this function's call sites) that's supposed to be the
+        // tiebreaker, and flip which one the sort thinks is closer.
+        //
+        // Fixed by slicing every ground quad against the SAME fixed global
+        // grid (multiples of kGroundSliceZ measured from world Z=0) instead
+        // of each quad fitting slices to its own extent -- any two ground
+        // quads that actually overlap in Z now share the same slice
+        // boundaries wherever they overlap, so the 4-corner depth average
+        // being compared really is "this decoration vs the grass right
+        // beneath it" again, and the small Y-based raise is a real,
+        // reliable tiebreaker instead of a coin flip against an unrelated
+        // few dozen units of Z offset.
+        float z1 = z0 + sizeZ;
+        float gridStart = std::floor(z0 / kGroundSliceZ) * kGroundSliceZ;
+        for (float zi = gridStart; zi < z1; zi += kGroundSliceZ) {
+            float sliceZ0 = std::max(zi, z0), sliceZ1 = std::min(zi + kGroundSliceZ, z1);
+            if (sliceZ1 <= sliceZ0) continue; // grid cell doesn't actually overlap [z0,z1) -- can happen at the very first iteration
+            Vec3 p0(x0, y, sliceZ0), p1(x0 + sizeX, y, sliceZ0), p2(x0 + sizeX, y, sliceZ1), p3(x0, y, sliceZ1);
             std::size_t before = out.size();
             addFace(out, viewProj, windowSize, eye, p0, p1, p2, p3, Vec3(0.f, 1.f, 0.f), color, lc);
-            if (applyGroundBias && out.size() > before) out.back().sortDepth += kGroundDepthBias; // only if addFace actually pushed one (it can silently skip a back-facing slice)
+            if (applyGroundBias && out.size() > before) out.back().ground = true; // only if addFace actually pushed one (it can silently skip a back-facing slice)
         }
     }
 
@@ -7824,7 +7886,19 @@ void GameWorld::draw3DZone(sf::RenderWindow& window) {
     // a building actually get occluded instead of always drawing on top of
     // it (which a separate "draw all geometry, then all billboards after"
     // pass would do wrong).
+    //
+    // `ground` quads (see addGroundQuad's own comment, 2026-08-13) are the
+    // one deliberate exception: every one of them sorts before every
+    // non-ground quad regardless of actual depth, full stop -- structurally
+    // guaranteeing "ground never occludes real geometry" without leaning on
+    // a numeric bias that used to eat the precision needed to tell a
+    // decoration slice (Water/Sand/...) apart from the plain grass slice
+    // directly beneath it. That plain `sortDepth` comparison among ground
+    // quads themselves (the `else` branch below) is exactly as precise as
+    // the one every non-ground quad already uses -- ground-vs-ground gets no
+    // special handling anymore, it doesn't need any.
     std::sort(quads.begin(), quads.end(), [](const ScreenQuad& a, const ScreenQuad& b) {
+        if (a.ground != b.ground) return a.ground;
         return a.sortDepth > b.sortDepth;
     });
 
